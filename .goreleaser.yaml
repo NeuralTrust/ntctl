@@ -1,0 +1,51 @@
+version: 2
+project_name: ntctl
+
+builds:
+  - id: ntctl
+    main: ./cmd/ntctl
+    binary: ntctl
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/NeuralTrust/ntctl/internal/version.Version={{ .Version }}
+      - -X github.com/NeuralTrust/ntctl/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/NeuralTrust/ntctl/internal/version.BuildDate={{ .Date }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# Version-free names keep releases/latest/download/<file> stable for install.sh.
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+# Keyless: the signature binds checksums.txt to this repository's release
+# workflow through its GitHub OIDC identity. There is no key to manage.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+
+# The release and its notes are created by the auto-release workflow; this
+# only adds the binaries to it.
+release:
+  github:
+    owner: NeuralTrust
+    name: ntctl
+  mode: keep-existing
+
+changelog:
+  disable: true

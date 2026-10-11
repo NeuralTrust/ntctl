@@ -1,0 +1,24 @@
+# On every push to main an AI-chosen semver bump creates the tag and GitHub
+# Release; release.yml then attaches the signed binaries.
+
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/**'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: NeuralTrust/workflows/.github/workflows/ai-release-bump.yml@main
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
