@@ -32,7 +32,8 @@ go install github.com/NeuralTrust/ntctl/cmd/ntctl@latest
 You need:
 
 - a Kubernetes cluster your kubeconfig points at;
-- the tokens for your products, from the NeuralTrust console;
+- the tokens for your products: sign in with `ntctl login`, or copy them from
+  the NeuralTrust console;
 - either the registry key file NeuralTrust sent you, or your own registry with
   the images mirrored into it.
 
@@ -51,7 +52,7 @@ default, so pressing Enter takes a working choice:
 | Where images come from | the NeuralTrust registry, with your key file | your own registry: its address, and either a username and password or the nodes' own identity (ECR, Artifact Registry, ACR) |
 | PostgreSQL | run it in the cluster | your own, as a connection string `postgres://user:password@host:5432/database?sslmode=require` |
 | Redis | run it in the cluster | your own, as `redis://:password@host:6379`, or `rediss://` for TLS |
-| Console tokens | | asked for each product you install |
+| Console tokens | from the console, when signed in | asked for each product you install |
 
 Passwords, tokens and connection strings are typed with input hidden. They are
 stored only in Kubernetes Secrets in the install namespace: never in a file, a
@@ -102,6 +103,34 @@ database user and one Redis. In external mode every service has its own
 database user: configure that with `-f`, following
 `values-managed-datastores.yaml.example` in the chart repository.
 
+### Signed in to the console
+
+`ntctl login` signs you in to the NeuralTrust console in the browser, where you
+also choose the organization. After that `ntctl install` gets the TrustGate and
+TrustGuard tokens itself, so the console UI is not needed:
+
+```sh
+ntctl login                 # --region us for app.us.neuraltrust.ai
+ntctl install
+```
+
+For each product, `install` offers the organization's existing private
+instances or creates a new one, after you confirm the install. It then records
+the instance's endpoint in the console. To choose without questions, name the
+instance:
+
+```sh
+ntctl install --yes --domain platform.example.com --trustgate-instance edge-1
+```
+
+The tokens go straight into the Kubernetes Secrets, as when you type them in.
+The sign-in is saved in `~/.config/ntctl/credentials.json`, which only you can
+read. It is renewed as needed until it expires or you run `ntctl logout`. Tokens
+in the environment still take precedence.
+
+This needs a console that offers CLI sign-in. Without one, `ntctl login` says so
+and everything else works as described above.
+
 ## Commands
 
 | Command | What it does |
@@ -112,6 +141,11 @@ database user: configure that with `-f`, following
 | `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`) |
 | `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values |
 | `ntctl version` | The `ntctl` version and the latest chart version |
+| `ntctl login` / `logout` | Sign in to the console in the browser, or sign out and end the session |
+| `ntctl auth status` | Who is signed in, to which console, and the selected organization |
+| `ntctl orgs list` | The organizations you belong to |
+| `ntctl config get` / `set org` / `set region` | Show or change the organization and region |
+| `ntctl trustgate list` / `create <name>` | The organization's private TrustGate instances (`trustguard` for TrustGuard) |
 
 Flags every command accepts:
 

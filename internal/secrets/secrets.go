@@ -42,6 +42,8 @@ type Spec struct {
 	// question asked when it is unset.
 	Env    string
 	Prompt string
+	// Product is the product the token belongs to: trustgate or trustguard.
+	Product string
 }
 
 // TokenSpecs lists the token Secrets the enabled products need.
@@ -49,13 +51,13 @@ func TokenSpecs(products []string) []Spec {
 	var out []Spec
 	if has(products, "trustgate") {
 		out = append(out,
-			Spec{values.TrustGateConfigSync, values.ConfigSyncKey, "NT_TRUSTGATE_CONFIG_SYNC_TOKEN", "TrustGate config-sync token"},
-			Spec{values.TrustGateEnrolment, values.EnrolmentKey, "NT_TRUSTGATE_ENROLMENT_TOKEN", "TrustGate DataAgent enrolment token"})
+			Spec{values.TrustGateConfigSync, values.ConfigSyncKey, "NT_TRUSTGATE_CONFIG_SYNC_TOKEN", "TrustGate config-sync token", "trustgate"},
+			Spec{values.TrustGateEnrolment, values.EnrolmentKey, "NT_TRUSTGATE_ENROLMENT_TOKEN", "TrustGate DataAgent enrolment token", "trustgate"})
 	}
 	if has(products, "trustguard") {
 		out = append(out,
-			Spec{values.TrustGuardConfigSync, values.ConfigSyncKey, "NT_TRUSTGUARD_CONFIG_SYNC_TOKEN", "TrustGuard config-sync token"},
-			Spec{values.TrustGuardEnrolment, values.EnrolmentKey, "NT_TRUSTGUARD_ENROLMENT_TOKEN", "TrustGuard DataAgent enrolment token"})
+			Spec{values.TrustGuardConfigSync, values.ConfigSyncKey, "NT_TRUSTGUARD_CONFIG_SYNC_TOKEN", "TrustGuard config-sync token", "trustguard"},
+			Spec{values.TrustGuardEnrolment, values.EnrolmentKey, "NT_TRUSTGUARD_ENROLMENT_TOKEN", "TrustGuard DataAgent enrolment token", "trustguard"})
 	}
 	return out
 }
