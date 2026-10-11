@@ -15,11 +15,10 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/secrets"
 )
 
-// Secret names and keys ntctl uses for external datastores.
-//
-//nolint:gosec // G101: these are Secret and key names, not credentials.
+// Secret names and keys ntctl uses for external datastores. They are names,
+// not credentials.
 const (
-	PostgresSecret = "ntctl-postgresql"
+	PostgresSecret = "ntctl-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
 	RedisSecret    = "ntctl-redis"
 )
