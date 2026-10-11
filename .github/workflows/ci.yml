@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+  security-events: write
+  actions: read
+  id-token: write
+
+jobs:
+  unit-tests:
+    uses: NeuralTrust/workflows/.github/workflows/tests.yml@main
+    with:
+      language: go
+      language_version: '1.27'
+      lint_enabled: true
+      coverage_enabled: true
+      test_command: |
+        go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+  security:
+    uses: NeuralTrust/workflows/.github/workflows/sast.yml@main
+    with:
+      gitleaks_enabled: false
+      gosec_enabled: true
+      gosec_args: '-severity high ./...'
+      govulncheck_enabled: true
+
+  release-config:
+    name: goreleaser check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: check

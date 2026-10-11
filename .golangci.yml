@@ -1,0 +1,33 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - gosec
+    - staticcheck
+    - unused
+    - misspell
+    - ineffassign
+    - unconvert
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # Terminal output: a failed write to stdout has nowhere better to go.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
