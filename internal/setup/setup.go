@@ -17,7 +17,7 @@ import (
 
 // Secret names and keys ntctl uses for external datastores.
 //
-//nolint:gosec // G101: these are Secret and key names, not credentials.
+// #nosec G101 -- these are Secret and key names, not credentials
 const (
 	PostgresSecret = "ntctl-postgresql"
 	PostgresKey    = "POSTGRES_PASSWORD"
