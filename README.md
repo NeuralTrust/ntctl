@@ -136,8 +136,13 @@ and everything else works as described above.
 | Command | What it does |
 |---|---|
 | `ntctl install` | Asks what it needs, checks the cluster, creates the Secrets, installs, and prints the DNS records |
-| `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the values the install was made with; rolls back if it does not become ready |
+| `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the install's values: shows the release notes and every change first, stops on unsafe ones, rolls back if it does not become ready |
+| `ntctl rollback` | Returns an install to an earlier revision (`--to N`), showing what changes first |
+| `ntctl history` | The revisions of an install |
+| `ntctl adopt` | Checks that an install made with plain `helm` can be managed with ntctl, changing nothing |
 | `ntctl status` | Workload readiness, pods that need attention, and DNS records |
+| `ntctl doctor` | Says what is wrong with an install and how to fix it (`--output json`) |
+| `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
 | `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`) |
 | `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values |
 | `ntctl version` | The `ntctl` version and the latest chart version |
@@ -163,6 +168,98 @@ explicit flags such as `--domain`.
 
 Run `ntctl <command> -h` for every flag.
 
+## Upgrading
+
+```sh
+ntctl upgrade --dry-run     # what would change, then stop
+ntctl upgrade
+```
+
+`upgrade` keeps the values the install was made with. Before it changes
+anything:
+
+1. It runs the preflight checks.
+2. It shows the chart's release notes between your version and the target, and
+   flags releases to read before upgrading.
+3. It asks the cluster to render the upgrade in a dry run, and lists every
+   resource that is added, changed or removed (`--show-diff` for the full
+   diff). Secret values are compared but never shown.
+
+It stops, changing nothing, when the upgrade would need something Kubernetes
+cannot do in place:
+
+- a new selector on a Deployment, DaemonSet or StatefulSet;
+- a new StatefulSet service name or volume template;
+- a new storage class or access mode on a volume;
+- removing a Secret, a volume or a StatefulSet;
+- removing a key from a Secret.
+
+Pass `--allow-breaking` only when you accept that those resources are deleted
+and recreated. If the upgrade does not become ready, the last working revision
+is restored.
+
+To go back later:
+
+```sh
+ntctl history
+ntctl rollback            # the newest earlier revision that worked
+ntctl rollback --to 3
+```
+
+An install made with plain `helm` needs no migration. `ntctl adopt` checks that
+it re-renders exactly as deployed, then writes its values, without anything that
+looks like a secret, to `neuraltrust-values.yaml`. It changes nothing in the
+cluster, and later upgrades keep the release's own values and Secret names.
+
+## When something is wrong
+
+```sh
+ntctl doctor
+```
+
+`doctor` works on any install, including one made with plain `helm`. It checks
+the release against the cluster: storage, ingress, and every Secret the deployed
+manifest reads. Then it looks at what is failing at runtime, and gives a code
+and a fix for each finding:
+
+| Code | Finding |
+|---|---|
+| `NT-DR-001` | The release failed, or an install or upgrade was interrupted |
+| `NT-DR-010` | Images do not pull, grouped by cause: credentials refused, image or tag missing, registry unreachable |
+| `NT-DR-011` | A container cannot start because a Secret or ConfigMap is missing |
+| `NT-DR-012` | A container keeps crashing; its last log lines are shown |
+| `NT-DR-013` | Pods cannot be scheduled, with the scheduler's reason |
+| `NT-DR-014` | A container was killed for exceeding its memory limit |
+| `NT-DR-020` | A volume is not bound |
+| `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
+| `NT-DR-022` | Ingresses have no address yet |
+| `NT-PF-*` | The preflight checks, against what is deployed |
+
+If you need help, send NeuralTrust support a bundle:
+
+```sh
+ntctl support-bundle
+```
+
+The bundle is a `.tar.gz` holding:
+
+- the doctor report and versions;
+- the release's values, manifest and history;
+- the namespace's resources and events;
+- node capacity;
+- the last 500 lines of each container's log (`--log-lines`).
+
+It never includes a Secret's value; only Secret and key names. Passwords,
+tokens, keys, connection strings and JWTs are replaced with `[REDACTED]` in
+values, ConfigMaps, environment variables and logs. Any text equal to a
+credential stored in a Secret of the namespace is masked wherever it appears.
+The `README.md` inside lists every rule. Look through the archive before
+sending it:
+
+```sh
+tar -tzf ntctl-support-*.tar.gz
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -170,7 +267,7 @@ Run `ntctl <command> -h` for every flag.
 | 0 | Success |
 | 1 | Error |
 | 2 | Unknown command |
-| 3 | Preflight checks failed; nothing was changed |
+| 3 | Checks failed (`preflight` or `doctor`); nothing was changed |
 
 ## Building
 
@@ -178,6 +275,14 @@ Run `ntctl <command> -h` for every flag.
 make build   # bin/ntctl
 make test
 make lint
+```
+
+`make test-e2e` installs on a real cluster, such as a local
+[kind](https://kind.sigs.k8s.io/) cluster, against an in-memory console:
+
+```sh
+kind get kubeconfig --name kind > /tmp/kind.kubeconfig
+NTCTL_E2E_KUBECONFIG=/tmp/kind.kubeconfig make test-e2e
 ```
 
 ## License

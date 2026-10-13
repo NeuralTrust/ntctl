@@ -23,8 +23,14 @@ Usage:
 
 Commands:
   install     Check the cluster, create the Secrets, install, and print the DNS records to create
-  upgrade     Upgrade an existing install, keeping its values; rolls back if it does not become ready
+  upgrade     Upgrade an existing install, keeping its values: shows release notes and every
+              change first, stops on unsafe ones, rolls back if it does not become ready
+  rollback    Return an install to an earlier revision, showing what changes first
+  history     Show the revisions of an install
+  adopt       Check that a plain-Helm install can be managed with ntctl, changing nothing
   status      Show readiness, problem pods and DNS records for an install
+  doctor      Diagnose an install and say how to fix what is wrong
+  support-bundle  Write a redacted .tar.gz for NeuralTrust support
   preflight   Check a cluster against what an install needs, without changing anything
   render      Print the manifests an install would apply (same output as helm template)
   version     Print the ntctl version and the latest chart version
@@ -70,6 +76,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runPreflight(ctx, args[1:], stdout)
 	case "status":
 		err = runStatus(ctx, args[1:], stdout)
+	case "rollback":
+		err = runRollback(ctx, args[1:], stdin, stdout)
+	case "history":
+		err = runHistory(ctx, args[1:], stdout)
+	case "adopt":
+		err = runAdopt(ctx, args[1:], stdout)
+	case "doctor":
+		err = runDoctor(ctx, args[1:], stdout)
+	case "support-bundle":
+		err = runSupportBundle(ctx, args[1:], stdout)
 	case "install":
 		err = runInstall(ctx, args[1:], stdin, stdout)
 	case "upgrade":

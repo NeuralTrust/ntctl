@@ -31,6 +31,9 @@ type Result struct {
 	Severity Severity `json:"severity"`
 	Message  string   `json:"message"`
 	Fix      string   `json:"fix,omitempty"`
+	// Detail holds supporting lines, such as a crashing container's last log
+	// lines.
+	Detail []string `json:"detail,omitempty"`
 }
 
 // Mode says which operation the checks are for.
@@ -277,8 +280,11 @@ func Print(w io.Writer, rs []Result, asJSON bool) error {
 	}
 	for _, r := range rs {
 		fmt.Fprintf(w, "%-4s  %-9s %s\n", r.Severity, r.Check, r.Message)
+		for _, d := range r.Detail {
+			fmt.Fprintf(w, "      %-9s | %s\n", "", d)
+		}
 		if r.Fix != "" {
-			fmt.Fprintf(w, "      %-9s fix: %s\n", "", r.Fix)
+			fmt.Fprintf(w, "      %-9s fix (%s): %s\n", "", r.Code, r.Fix)
 		}
 	}
 	return nil

@@ -418,57 +418,6 @@ func index(list []string, s string) int {
 	return len(list) - 1
 }
 
-const upgradeSummary = `Upgrade an existing install to a new chart version, keeping the values it
-was installed with. -f files and flags are layered on top. If the upgrade does
-not become ready, it is rolled back.`
-
-func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
-	var o opts
-	var yes bool
-	var timeout time.Duration
-	fs := newFlags("upgrade", upgradeSummary, out, &o, true)
-	fs.BoolVar(&yes, "yes", false, "do not ask for confirmation")
-	fs.DurationVar(&timeout, "timeout", helm.DefaultTimeout, "how long to wait before rolling back")
-	if err := parse(fs, args); err != nil {
-		return err
-	}
-	fmt.Fprintln(out, "Checking the cluster…")
-	p, err := o.prepare(ctx, preflight.ForUpgrade, nil)
-	if err != nil {
-		return err
-	}
-	if err := preflight.Print(out, p.results, false); err != nil {
-		return err
-	}
-	if preflight.Failed(p.results) {
-		return errPreflight
-	}
-	fmt.Fprintf(out, "\nReady to upgrade %q in namespace %q from chart %s to %s\non %s.\n",
-		o.release, o.kube.Namespace, p.current.Chart.Metadata.Version, p.chart.Version, o.kube.Target())
-	if !yes {
-		if err := prompt.New(stdin, out, true).Confirm("Continue?"); err != nil {
-			return err
-		}
-	}
-	fmt.Fprintf(out, "Upgrading… waiting up to %s; if it does not become ready, the last working revision is restored.\n", timeout)
-	res, upErr := helm.Upgrade(ctx, p.cfg, p.chart, p.values, o.release, o.kube.Namespace, timeout)
-	if st, err := report.Collect(ctx, p.cs, o.kube.Namespace); err == nil {
-		fmt.Fprintln(out)
-		st.Print(out)
-	}
-	switch {
-	case upErr == nil:
-	case res.RolledBackTo > 0 && res.RollbackReady:
-		return fmt.Errorf("upgrade failed (%w) and was rolled back to revision %d, which is running again", upErr, res.RolledBackTo)
-	case res.RolledBackTo > 0:
-		return fmt.Errorf("upgrade failed (%w); it was rolled back to revision %d, but that is not ready either. Run `ntctl status`", upErr, res.RolledBackTo)
-	default:
-		return fmt.Errorf("upgrade failed (%w); there was no earlier working revision to roll back to, so it was left in place. Run `ntctl status`, fix the cause, and upgrade again", upErr)
-	}
-	fmt.Fprintln(out, "\nUpgraded.")
-	return nil
-}
-
 // referenced reports whether the values point a product at the named Secret,
 // i.e. whether ntctl is the one expected to create it.
 func referenced(vals map[string]any, name string) bool {

@@ -1,0 +1,175 @@
+package diff
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/NeuralTrust/ntctl/internal/manifest"
+)
+
+const base = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  labels:
+    helm.sh/chart: neuraltrust-platform-3.0.2
+    app.kubernetes.io/version: "3.0.2"
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: proxy}
+  template:
+    metadata:
+      annotations:
+        checksum/config: aaa
+    spec:
+      containers:
+      - name: proxy
+        image: registry.example.com/proxy:1.0.0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tokens
+stringData:
+  TOKEN: CANARY-old
+  OTHER: same
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  selector:
+    matchLabels: {app: db}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  storageClassName: standard
+  accessModes: [ReadWriteOnce]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+data:
+  level: info
+`
+
+func parse(t *testing.T, s string) []manifest.Object {
+	t.Helper()
+	objs, err := manifest.Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return objs
+}
+
+func compare(t *testing.T, to string) Result {
+	t.Helper()
+	return Compare(parse(t, base), parse(t, to))
+}
+
+func TestNothingMeaningfulChanged(t *testing.T) {
+	// A new chart version and new checksums alone are not changes.
+	to := strings.NewReplacer("neuraltrust-platform-3.0.2", "neuraltrust-platform-3.0.3", `"3.0.2"`, `"3.0.3"`, "checksum/config: aaa", "checksum/config: bbb").Replace(base)
+	if r := compare(t, to); !r.Empty() {
+		t.Fatalf("volatile labels and checksums should not count: %+v", r.Changes)
+	}
+}
+
+func TestSafeChanges(t *testing.T) {
+	to := strings.NewReplacer("replicas: 2", "replicas: 3", "proxy:1.0.0", "proxy:1.1.0", "level: info", "level: debug").Replace(base) +
+		"---\napiVersion: v1\nkind: Service\nmetadata:\n  name: new\n"
+	r := compare(t, to)
+	if len(r.Blocking()) != 0 {
+		t.Fatalf("replicas, image and ConfigMap changes are safe: %+v", r.Blocking())
+	}
+	ops := map[string]Op{}
+	for _, c := range r.Changes {
+		ops[c.Kind+"/"+c.Name] = c.Op
+	}
+	if ops["Deployment/proxy"] != Changed || ops["ConfigMap/settings"] != Changed || ops["Service/new"] != Added {
+		t.Fatalf("ops = %v", ops)
+	}
+}
+
+func TestBlockingChanges(t *testing.T) {
+	cases := map[string]struct{ from, to, want string }{
+		"deployment selector": {"matchLabels: {app: proxy}", "matchLabels: {app: gateway}", "spec.selector is immutable"},
+		"statefulset service": {"serviceName: db", "serviceName: db-headless", "spec.serviceName is immutable"},
+		"pvc class":           {"storageClassName: standard", "storageClassName: fast", "spec.storageClassName is immutable"},
+		"pvc access":          {"accessModes: [ReadWriteOnce]", "accessModes: [ReadWriteMany]", "spec.accessModes is immutable"},
+		"secret key removed":  {"  OTHER: same\n", "", "removes Secret keys OTHER"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := compare(t, strings.Replace(base, c.from, c.to, 1))
+			b := r.Blocking()
+			if len(b) != 1 || !strings.Contains(strings.Join(b[0].Blocking, ";"), c.want) {
+				t.Fatalf("blocking = %+v, want %q", b, c.want)
+			}
+		})
+	}
+}
+
+func TestRemovingDataKindsBlocks(t *testing.T) {
+	without := func(kind string) string {
+		var keep []string
+		for _, doc := range strings.Split(base, "---\n") {
+			if !strings.Contains(doc, "kind: "+kind+"\n") {
+				keep = append(keep, doc)
+			}
+		}
+		return strings.Join(keep, "---\n")
+	}
+	for _, kind := range []string{"Secret", "StatefulSet", "PersistentVolumeClaim"} {
+		if b := compare(t, without(kind)).Blocking(); len(b) != 1 || b[0].Op != Removed {
+			t.Errorf("removing a %s should block: %+v", kind, b)
+		}
+	}
+	if b := compare(t, without("ConfigMap")).Blocking(); len(b) != 0 {
+		t.Errorf("removing a ConfigMap is safe: %+v", b)
+	}
+}
+
+func TestSecretValuesNeverShown(t *testing.T) {
+	r := compare(t, strings.Replace(base, "TOKEN: CANARY-old", "TOKEN: CANARY-new", 1))
+	if len(r.Changes) != 1 || r.Changes[0].SecretKeys == nil || r.Changes[0].SecretKeys.Changed[0] != "TOKEN" {
+		t.Fatalf("a new Secret value should be reported by key: %+v", r.Changes)
+	}
+	var out bytes.Buffer
+	r.Print(&out, true)
+	if strings.Contains(out.String(), "CANARY") {
+		t.Fatalf("a Secret value was printed:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "new values: TOKEN") {
+		t.Fatalf("output should name the key:\n%s", out.String())
+	}
+}
+
+func TestSecretDataAndStringDataAgree(t *testing.T) {
+	// The same value as base64 data and as stringData is not a change.
+	to := strings.Replace(base, "stringData:\n  TOKEN: CANARY-old\n  OTHER: same", "data:\n  TOKEN: Q0FOQVJZLW9sZA==\n  OTHER: c2FtZQ==", 1)
+	r := compare(t, to)
+	for _, c := range r.Changes {
+		if c.SecretKeys != nil {
+			t.Fatalf("equal values in data and stringData reported as changed: %+v", c.SecretKeys)
+		}
+	}
+}
+
+func TestPrintShowsDiff(t *testing.T) {
+	var out bytes.Buffer
+	compare(t, strings.Replace(base, "replicas: 2", "replicas: 3", 1)).Print(&out, true)
+	for _, want := range []string{"0 added, 1 changed, 0 removed", "~ Deployment/proxy", "-  replicas: 2", "+  replicas: 3"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, out.String())
+		}
+	}
+}

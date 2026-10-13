@@ -8,20 +8,26 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"helm.sh/helm/v4/pkg/action"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/api"
+	"github.com/NeuralTrust/ntctl/internal/chart"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/kube"
 	"github.com/NeuralTrust/ntctl/internal/values"
@@ -189,4 +195,223 @@ func TestE2EInstallRecordsTheEndpoint(t *testing.T) {
 	if _, err := cs.CoreV1().ConfigMaps(ns).Get(ctx, "e2e", metav1.GetOptions{}); err != nil {
 		t.Fatalf("the chart was not installed: %v", err)
 	}
+}
+
+// TestE2EDoctorAndSupportBundle installs the chart with tokens that cannot
+// work and a registry key that cannot pull, then checks doctor says why, and
+// the support bundle holds the evidence but none of the tokens.
+func TestE2EDoctorAndSupportBundle(t *testing.T) {
+	const ns = "ntctl-e2e-doctor"
+	cluster(t, ns)
+	t.Setenv("NTCTL_CONFIG_DIR", t.TempDir())
+	for _, env := range []string{"NT_TRUSTGATE_CONFIG_SYNC_TOKEN", "NT_TRUSTGATE_ENROLMENT_TOKEN"} {
+		t.Setenv(env, "CANARY-"+strings.ToLower(env)+"-x9f3k2m8q7w1z5r4t6")
+	}
+	dir := t.TempDir()
+	key := filepath.Join(dir, "registry-key.json")
+	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"CANARY-registry-key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ntctl(t, 1, "install", "--yes", "--namespace", ns, "--domain", "doctor.example.com",
+		"--products", "trustgate", "--registry-key", key, "--save-values", "", "--timeout", "30s")
+
+	out := ntctl(t, 3, "doctor", "--namespace", ns)
+	for _, want := range []string{"NT-DR-001", "release neuraltrust-platform revision 1", "workloads cannot pull their images: the registry refused the credentials", "gcr-secret", "fix (NT-DR-010)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("doctor output lacks %q:\n%s", want, out)
+		}
+	}
+	if js := ntctl(t, 3, "doctor", "--namespace", ns, "--output", "json"); !strings.HasPrefix(strings.TrimSpace(js), "[") {
+		t.Errorf("doctor --output json is not JSON:\n%s", js)
+	}
+
+	file := filepath.Join(dir, "bundle.tar.gz")
+	out = ntctl(t, 0, "support-bundle", "--namespace", ns, "--output-file", file)
+	if !strings.Contains(out, "Wrote "+file) {
+		t.Fatalf("support-bundle output:\n%s", out)
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	names := map[string]bool{}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names[h.Name] = true
+		if strings.Contains(string(b), "CANARY") {
+			t.Errorf("%s in the bundle holds a secret", h.Name)
+		}
+	}
+	for _, want := range []string{"README.md", "doctor.txt", "secrets.yaml", "release/values.yaml", "release/manifest.yaml", "resources/pods.yaml", "resources/events.yaml", "nodes.yaml"} {
+		if !names[want] {
+			t.Errorf("the bundle lacks %s", want)
+		}
+	}
+}
+
+// tinyChart writes a chart that becomes ready at once: a pause Deployment, a
+// ConfigMap and a Secret. selector and level vary between versions.
+func tinyChart(t *testing.T, version, selector, level string) string {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"Chart.yaml": "apiVersion: v2\nname: neuraltrust-platform\nversion: " + version + "\n",
+		"templates/app.yaml": `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tiny
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ` + selector + `}
+  template:
+    metadata:
+      labels: {app: ` + selector + `}
+    spec:
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tiny
+data:
+  level: ` + level + `
+  domain: {{ .Values.global.domain | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tiny
+stringData:
+  password: {{ .Values.extra.password | quote }}
+`,
+	}
+	for name, body := range files {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestE2EAdoptUpgradeRollback takes a release installed with plain Helm through
+// adopt, a safe upgrade, a refused unsafe upgrade, and a rollback.
+func TestE2EAdoptUpgradeRollback(t *testing.T) {
+	const ns = "ntctl-e2e-upgrade"
+	cs := cluster(t, ns)
+	t.Setenv("NTCTL_CONFIG_DIR", t.TempDir())
+	ctx := context.Background()
+	k := kube.Options{Kubeconfig: os.Getenv("NTCTL_E2E_KUBECONFIG"), Namespace: ns}
+	cfg, err := k.Helm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	v1, err := chart.Load(k.Settings(), chart.Source{Path: tinyChart(t, "3.0.0", "tiny", "info")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vals := map[string]any{"global": map[string]any{"domain": "upgrade.example.com"}, "extra": map[string]any{"password": "CANARY-pw"}}
+	if _, err := helm.Install(ctx, cfg, v1, vals, "neuraltrust-platform", ns, 2*time.Minute); err != nil {
+		t.Fatalf("plain install: %v", err)
+	}
+
+	// adopt changes nothing and writes the values without the password.
+	before := versions(t, cs, ns)
+	file := filepath.Join(t.TempDir(), "values.yaml")
+	out := ntctl(t, 0, "adopt", "--namespace", ns, "--values-file", file)
+	if !strings.Contains(out, "re-renders exactly as deployed") || !strings.Contains(out, "extra.password") {
+		t.Fatalf("adopt output:\n%s", out)
+	}
+	noCanary(t, file)
+	if after := versions(t, cs, ns); !reflect.DeepEqual(before, after) {
+		t.Fatalf("adopt changed the cluster: %v -> %v", before, after)
+	}
+
+	// A safe change is shown, then applied.
+	v2 := tinyChart(t, "3.0.1", "tiny", "debug")
+	out = ntctl(t, 0, "upgrade", "--namespace", ns, "--chart", v2, "--dry-run")
+	if !strings.Contains(out, "~ ConfigMap/tiny") || !strings.Contains(out, "Dry run: nothing was changed") {
+		t.Fatalf("dry run:\n%s", out)
+	}
+	out = ntctl(t, 0, "upgrade", "--namespace", ns, "--chart", v2, "--yes", "--timeout", "2m")
+	if !strings.Contains(out, "Upgraded.") {
+		t.Fatalf("upgrade:\n%s", out)
+	}
+	if cm, _ := cs.CoreV1().ConfigMaps(ns).Get(ctx, "tiny", metav1.GetOptions{}); cm.Data["level"] != "debug" {
+		t.Fatalf("level = %q after the upgrade", cm.Data["level"])
+	}
+	if s, _ := cs.CoreV1().Secrets(ns).Get(ctx, "tiny", metav1.GetOptions{}); string(s.Data["password"]) != "CANARY-pw" {
+		t.Fatal("the upgrade lost the release's values")
+	}
+
+	// A new selector is refused, and nothing changes.
+	before = versions(t, cs, ns)
+	out = ntctl(t, 3, "upgrade", "--namespace", ns, "--chart", tinyChart(t, "3.0.2", "tiny-v2", "debug"), "--yes")
+	if !strings.Contains(out, "spec.selector is immutable") || !strings.Contains(out, "Stopped: nothing was changed") {
+		t.Fatalf("unsafe upgrade:\n%s", out)
+	}
+	if after := versions(t, cs, ns); !reflect.DeepEqual(before, after) {
+		t.Fatalf("a refused upgrade changed the cluster: %v -> %v", before, after)
+	}
+
+	// History, then back to revision 1.
+	out = ntctl(t, 0, "history", "--namespace", ns)
+	if !strings.Contains(out, "3.0.0") || !strings.Contains(out, "3.0.1") {
+		t.Fatalf("history:\n%s", out)
+	}
+	out = ntctl(t, 0, "rollback", "--namespace", ns, "--to", "1", "--yes", "--timeout", "2m")
+	if !strings.Contains(out, "~ ConfigMap/tiny") || !strings.Contains(out, "Rolled back: the new revision 3 runs what revision 1 ran") {
+		t.Fatalf("rollback:\n%s", out)
+	}
+	if cm, _ := cs.CoreV1().ConfigMaps(ns).Get(ctx, "tiny", metav1.GetOptions{}); cm.Data["level"] != "info" {
+		t.Fatalf("level = %q after the rollback", cm.Data["level"])
+	}
+}
+
+// versions returns the resourceVersion of every object the tiny chart makes.
+func versions(t *testing.T, cs kubernetes.Interface, ns string) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+	out := map[string]string{}
+	d, err := cs.AppsV1().Deployments(ns).Get(ctx, "tiny", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out["deployment"] = d.ResourceVersion
+	c, err := cs.CoreV1().ConfigMaps(ns).Get(ctx, "tiny", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out["configmap"] = c.ResourceVersion
+	s, err := cs.CoreV1().Secrets(ns).Get(ctx, "tiny", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out["secret"] = s.ResourceVersion
+	return out
 }
