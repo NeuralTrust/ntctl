@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/NeuralTrust/ntctl/internal/api"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 )
 
@@ -27,6 +28,18 @@ Commands:
   preflight   Check a cluster against what an install needs, without changing anything
   render      Print the manifests an install would apply (same output as helm template)
   version     Print the ntctl version and the latest chart version
+
+Console:
+  login       Sign in to the NeuralTrust console in the browser and choose an organization
+  logout      Sign out and forget the saved tokens
+  auth status Show who is signed in, and the selected organization
+  orgs list   List the organizations you belong to
+  config      Show or set the region and organization
+  trustgate   List or create private TrustGate instances
+  trustguard  List or create private TrustGuard instances
+
+Signed in, install creates or reuses the private instances and fetches their
+tokens itself.
 
 Run "ntctl <command> -h" for the flags of a command.
 `
@@ -61,6 +74,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runInstall(ctx, args[1:], stdin, stdout)
 	case "upgrade":
 		err = runUpgrade(ctx, args[1:], stdin, stdout)
+	case "login":
+		err = runLogin(ctx, args[1:], stdout)
+	case "logout":
+		err = runLogout(ctx, args[1:], stdout)
+	case "auth":
+		err = runAuth(ctx, args[1:], stdout)
+	case "orgs":
+		err = runOrgs(ctx, args[1:], stdout)
+	case "config":
+		err = runConfig(ctx, args[1:], stdout)
+	case "trustgate":
+		err = runInstances(api.TrustGate)(ctx, args[1:], stdout)
+	case "trustguard":
+		err = runInstances(api.TrustGuard)(ctx, args[1:], stdout)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
 		return 2

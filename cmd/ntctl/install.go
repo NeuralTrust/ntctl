@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/NeuralTrust/ntctl/internal/api"
+	"github.com/NeuralTrust/ntctl/internal/auth"
 	"github.com/NeuralTrust/ntctl/internal/detect"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
@@ -31,7 +34,11 @@ Credentials are read from the environment, or asked for with input hidden:
   NT_POSTGRES_URL   postgres://user:password@host:5432/database?sslmode=require
   NT_REDIS_URL      redis://:password@host:6379 (rediss:// for TLS)
   NT_REGISTRY_USERNAME / NT_REGISTRY_PASSWORD   for --image-registry
-They are written only to Kubernetes Secrets in the install namespace.`
+They are written only to Kubernetes Secrets in the install namespace.
+
+Signed in with ntctl login, the TrustGate and TrustGuard tokens come from the
+console instead: install creates a private instance for each product, or uses
+the one named with --trustgate-instance / --trustguard-instance.`
 
 var platforms = []string{"aws", "gcp", "azure", "openshift", "kubernetes"}
 
@@ -44,11 +51,14 @@ type installFlags struct {
 	replace       bool
 	yes           bool
 	timeout       time.Duration
+	org           string
+	instances     map[api.Product]string
 }
 
 func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
 	var o opts
-	var f installFlags
+	f := installFlags{instances: map[api.Product]string{}}
+	var gate, guard string
 	fs := newFlags("install", installSummary, out, &o, true)
 	fs.StringVar(&f.registryKey, "registry-key", os.Getenv("NT_REGISTRY_KEY_FILE"), "registry key file from NeuralTrust (env NT_REGISTRY_KEY_FILE)")
 	fs.StringVar(&f.imageRegistry, "image-registry", "", "pull every image from this registry instead, e.g. registry.example.com/neuraltrust")
@@ -57,10 +67,21 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.BoolVar(&f.replace, "replace-secrets", false, "overwrite Secrets that already exist with different content")
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
+	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
+	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to install (default: create one)")
+	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to install (default: create one)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+	f.instances[api.TrustGate], f.instances[api.TrustGuard] = gate, guard
 	in := prompt.New(stdin, out, !f.yes)
+	sess, err := openSession()
+	switch {
+	case errors.Is(err, auth.ErrNotLoggedIn):
+		sess = nil
+	case err != nil:
+		return err
+	}
 	ns := o.kube.Namespace
 
 	cs, err := o.kube.Clientset()
@@ -82,6 +103,10 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return err
 	}
 	o.extra = answers.Values()
+	// The chart reaches the console's region; signed in, that is known.
+	if sess != nil && sess.cfg.Region != "" && values.Get(files, "global", "saasRegion") == nil {
+		o.extra = values.Merge(o.extra, map[string]any{"global": map[string]any{"saasRegion": sess.cfg.Region}})
+	}
 
 	// Everything to create, gathered before anything changes.
 	create, err := answers.Secrets(ns)
@@ -92,6 +117,10 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
+	// Tokens come from the environment, else from the console when signed
+	// in, else from the operator.
+	need := map[api.Product][]secrets.Spec{}
+	willCreate := map[string][]string{}
 	for _, spec := range secrets.TokenSpecs(enabledProducts(vals)) {
 		if !referenced(vals, spec.Name) {
 			continue
@@ -102,14 +131,36 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 			continue
 		}
 		v := strings.TrimSpace(os.Getenv(spec.Env))
+		if v == "" && sess != nil {
+			need[api.Product(spec.Product)] = append(need[api.Product(spec.Product)], spec)
+			willCreate[spec.Name] = append(willCreate[spec.Name], spec.Key)
+			continue
+		}
 		if v == "" {
 			if v, err = in.Secret(spec.Prompt + " (from the console)"); err != nil {
-				return fmt.Errorf("%w; set %s", err, spec.Env)
+				return fmt.Errorf("%w; set %s, or sign in with `ntctl login`", err, spec.Env)
 			}
 		}
 		create = append(create, secrets.Token(ns, spec, v))
 	}
-	willCreate := map[string][]string{}
+	var org, orgName string
+	var consoles []*consoleInstance
+	if len(need) > 0 {
+		if org, err = sess.org(f.org); err != nil {
+			return err
+		}
+		orgName = org
+		if org == sess.cfg.OrgID && sess.cfg.OrgName != "" {
+			orgName = sess.cfg.OrgName
+		}
+		defaultName, _ := values.Get(vals, "global", "domain").(string)
+		if defaultName == "" {
+			defaultName = o.release
+		}
+		if consoles, err = chooseInstances(ctx, in, out, sess, org, need, f.instances, defaultName); err != nil {
+			return err
+		}
+	}
 	for _, s := range create {
 		for k := range s.Data {
 			willCreate[s.Name] = append(willCreate[s.Name], k)
@@ -136,6 +187,9 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	for _, line := range answers.Summary() {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
+	for _, c := range consoles {
+		fmt.Fprintf(out, "  %s\n", c.describe(orgName))
+	}
 	if !f.yes {
 		if err := in.Confirm("Continue?"); err != nil {
 			return err
@@ -146,6 +200,13 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return err
 	} else if created {
 		fmt.Fprintf(out, "Created namespace %s\n", ns)
+	}
+	for _, c := range consoles {
+		list, err := c.issue(ctx, out, sess, org, ns)
+		if err != nil {
+			return err
+		}
+		create = append(create, list...)
 	}
 	done, err := secrets.Apply(ctx, p.cs, create, f.replace)
 	for _, d := range done {
@@ -170,7 +231,11 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if installErr != nil {
 		return fmt.Errorf("install did not complete: %w\nThe resources were kept so you can see what failed; run `ntctl status`, fix the cause, then `ntctl upgrade`", installErr)
 	}
-	fmt.Fprintln(out, "\nInstalled. Create the DNS records above, then finish the setup in the NeuralTrust console.")
+	fmt.Fprintln(out)
+	for _, c := range consoles {
+		c.finalize(ctx, out, sess, org, p.values)
+	}
+	fmt.Fprintln(out, "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console.")
 	return nil
 }
 

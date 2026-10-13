@@ -1,0 +1,192 @@
+//go:build e2e
+
+// End-to-end tests against a real cluster, signed in to the fake console.
+// Run with `make test-e2e` against a local kind cluster:
+//
+//	kind get kubeconfig --name kind > /tmp/kind.kubeconfig
+//	NTCTL_E2E_KUBECONFIG=/tmp/kind.kubeconfig make test-e2e
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"helm.sh/helm/v4/pkg/action"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/NeuralTrust/ntctl/internal/api"
+	"github.com/NeuralTrust/ntctl/internal/helm"
+	"github.com/NeuralTrust/ntctl/internal/kube"
+	"github.com/NeuralTrust/ntctl/internal/values"
+)
+
+// cluster points ntctl at the e2e cluster and removes the namespace, and the
+// release in it, when the test ends.
+func cluster(t *testing.T, ns string) kubernetes.Interface {
+	t.Helper()
+	kc := os.Getenv("NTCTL_E2E_KUBECONFIG")
+	if kc == "" {
+		t.Skip("NTCTL_E2E_KUBECONFIG is not set")
+	}
+	t.Setenv("KUBECONFIG", kc)
+	k := kube.Options{Kubeconfig: kc, Namespace: ns}
+	cs, err := k.Clientset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cfg, err := k.Helm(); err == nil {
+			_, _ = action.NewUninstall(cfg).Run("neuraltrust-platform") // absent when the install never started
+		}
+		ctx := context.Background()
+		if err := cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			t.Errorf("deleting namespace %s: %v", ns, err)
+		}
+	})
+	return cs
+}
+
+// secretValue reads one key of a Secret.
+func secretValue(t *testing.T, cs kubernetes.Interface, ns, name, key string) string {
+	t.Helper()
+	s, err := cs.CoreV1().Secrets(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Secret %s: %v", name, err)
+	}
+	return string(s.Data[key])
+}
+
+// noCanary fails when a file holds a token.
+func noCanary(t *testing.T, path string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "CANARY") {
+		t.Fatalf("%s holds a token", path)
+	}
+}
+
+// TestE2EInstallWithTheChart installs the published chart signed in: ntctl
+// creates both private instances and fills the Secrets the chart reads with
+// their tokens. Images cannot be pulled without a real key, so the install is
+// expected not to become ready, and nothing is recorded in the console.
+func TestE2EInstallWithTheChart(t *testing.T) {
+	const ns = "ntctl-e2e-chart"
+	cs := cluster(t, ns)
+	srv := console(t)
+	ntctl(t, 0, "login", "--app-url", srv.URL)
+
+	dir := t.TempDir()
+	key := filepath.Join(dir, "registry-key.json")
+	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"not-a-real-key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	saved := filepath.Join(dir, "values.yaml")
+	out := ntctl(t, 1, "install", "--yes", "--namespace", ns, "--domain", "e2e.example.com",
+		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved, "--timeout", "45s")
+	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`, "install did not complete"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	noCanary(t, saved)
+
+	issued := srv.Issued()
+	if len(issued) != 2 {
+		t.Fatalf("issued = %d install configs, want 2", len(issued))
+	}
+	names := map[string][2]string{
+		"trustgate":  {values.TrustGateConfigSync, values.TrustGateEnrolment},
+		"trustguard": {values.TrustGuardConfigSync, values.TrustGuardEnrolment},
+	}
+	for _, is := range issued {
+		n := names[is.Product]
+		if got := secretValue(t, cs, ns, n[0], values.ConfigSyncKey); got != is.Config.ConfigSyncToken {
+			t.Errorf("%s does not hold the issued config-sync token", n[0])
+		}
+		if got := secretValue(t, cs, ns, n[1], values.EnrolmentKey); got != is.Config.EnrolmentToken {
+			t.Errorf("%s does not hold the issued enrolment token", n[1])
+		}
+		if is.Rotate {
+			t.Errorf("install must not rotate %s's credentials", is.ID)
+		}
+		if ep := srv.Finalized(is.ID); ep != "" {
+			t.Errorf("an install that is not ready recorded %s for %s", ep, is.ID)
+		}
+	}
+
+	// The tokens reach the Secrets only, never the Helm release.
+	cfg, err := kube.Options{Kubeconfig: os.Getenv("NTCTL_E2E_KUBECONFIG"), Namespace: ns}.Helm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := helm.Current(cfg, "neuraltrust-platform")
+	if err != nil || rel == nil {
+		t.Fatalf("reading the release: %v", err)
+	}
+	if strings.Contains(rel.Manifest, "CANARY") || strings.Contains(fmt.Sprint(rel.Config), "CANARY") {
+		t.Fatal("the Helm release holds a token")
+	}
+
+	// A second install keeps the Secrets, so it asks the console for nothing.
+	ntctl(t, 3, "install", "--yes", "--namespace", ns, "--domain", "e2e.example.com",
+		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", "")
+	if got := len(srv.Issued()); got != 2 {
+		t.Fatalf("a refused second install issued tokens (%d configs)", got)
+	}
+}
+
+// TestE2EInstallRecordsTheEndpoint installs a chart that is ready at once,
+// into an existing instance named on the command line, and checks the
+// endpoint is recorded in the console.
+func TestE2EInstallRecordsTheEndpoint(t *testing.T) {
+	const ns = "ntctl-e2e-ready"
+	cs := cluster(t, ns)
+	srv := console(t)
+	srv.AddInstance(api.TrustGate, "org-1", api.Instance{ID: "gw-e2e", Name: "edge-1"})
+	ntctl(t, 0, "login", "--app-url", srv.URL)
+
+	chart := t.TempDir()
+	files := map[string]string{
+		"Chart.yaml":            "apiVersion: v2\nname: neuraltrust-platform\nversion: 3.0.0\n",
+		"templates/config.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: e2e\ndata:\n  domain: {{ .Values.global.domain | quote }}\n",
+	}
+	for name, body := range files {
+		p := filepath.Join(chart, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := ntctl(t, 0, "install", "--yes", "--namespace", ns, "--chart", chart, "--domain", "ready.example.com",
+		"--products", "trustgate", "--image-registry", "registry.example.com/nt", "--image-registry-node-auth",
+		"--trustgate-instance", "edge-1", "--save-values", "", "--timeout", "1m")
+	if !strings.Contains(out, "Recorded edge-1 endpoint https://gateway.ready.example.com in the console") {
+		t.Fatalf("output:\n%s", out)
+	}
+	if ep := srv.Finalized("gw-e2e"); ep != "https://gateway.ready.example.com" {
+		t.Fatalf("finalized endpoint = %q", ep)
+	}
+	if got := srv.Instances(api.TrustGate, "org-1"); len(got) != 1 {
+		t.Fatalf("naming an existing instance must not create one: %v", got)
+	}
+	if got := secretValue(t, cs, ns, values.TrustGateConfigSync, values.ConfigSyncKey); got != srv.Issued()[0].Config.ConfigSyncToken {
+		t.Fatal("the config-sync Secret does not hold the issued token")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := cs.CoreV1().ConfigMaps(ns).Get(ctx, "e2e", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the chart was not installed: %v", err)
+	}
+}
