@@ -8,8 +8,11 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,5 +191,73 @@ func TestE2EInstallRecordsTheEndpoint(t *testing.T) {
 	defer cancel()
 	if _, err := cs.CoreV1().ConfigMaps(ns).Get(ctx, "e2e", metav1.GetOptions{}); err != nil {
 		t.Fatalf("the chart was not installed: %v", err)
+	}
+}
+
+// TestE2EDoctorAndSupportBundle installs the chart with tokens that cannot
+// work and a registry key that cannot pull, then checks doctor says why, and
+// the support bundle holds the evidence but none of the tokens.
+func TestE2EDoctorAndSupportBundle(t *testing.T) {
+	const ns = "ntctl-e2e-doctor"
+	cluster(t, ns)
+	t.Setenv("NTCTL_CONFIG_DIR", t.TempDir())
+	for _, env := range []string{"NT_TRUSTGATE_CONFIG_SYNC_TOKEN", "NT_TRUSTGATE_ENROLMENT_TOKEN"} {
+		t.Setenv(env, "CANARY-"+strings.ToLower(env)+"-x9f3k2m8q7w1z5r4t6")
+	}
+	dir := t.TempDir()
+	key := filepath.Join(dir, "registry-key.json")
+	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"CANARY-registry-key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ntctl(t, 1, "install", "--yes", "--namespace", ns, "--domain", "doctor.example.com",
+		"--products", "trustgate", "--registry-key", key, "--save-values", "", "--timeout", "30s")
+
+	out := ntctl(t, 3, "doctor", "--namespace", ns)
+	for _, want := range []string{"NT-DR-001", "release neuraltrust-platform revision 1", "workloads cannot pull their images: the registry refused the credentials", "gcr-secret", "fix (NT-DR-010)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("doctor output lacks %q:\n%s", want, out)
+		}
+	}
+	if js := ntctl(t, 3, "doctor", "--namespace", ns, "--output", "json"); !strings.HasPrefix(strings.TrimSpace(js), "[") {
+		t.Errorf("doctor --output json is not JSON:\n%s", js)
+	}
+
+	file := filepath.Join(dir, "bundle.tar.gz")
+	out = ntctl(t, 0, "support-bundle", "--namespace", ns, "--output-file", file)
+	if !strings.Contains(out, "Wrote "+file) {
+		t.Fatalf("support-bundle output:\n%s", out)
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	names := map[string]bool{}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names[h.Name] = true
+		if strings.Contains(string(b), "CANARY") {
+			t.Errorf("%s in the bundle holds a secret", h.Name)
+		}
+	}
+	for _, want := range []string{"README.md", "doctor.txt", "secrets.yaml", "release/values.yaml", "release/manifest.yaml", "resources/pods.yaml", "resources/events.yaml", "nodes.yaml"} {
+		if !names[want] {
+			t.Errorf("the bundle lacks %s", want)
+		}
 	}
 }
