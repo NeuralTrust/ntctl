@@ -19,7 +19,7 @@ import (
 //
 // #nosec G101 -- these are Secret and key names, not credentials
 const (
-	PostgresSecret = "ntctl-postgresql"
+	PostgresSecret = "ntctl-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
 	RedisSecret    = "ntctl-redis"
 )
