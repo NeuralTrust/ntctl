@@ -136,7 +136,10 @@ and everything else works as described above.
 | Command | What it does |
 |---|---|
 | `ntctl install` | Asks what it needs, checks the cluster, creates the Secrets, installs, and prints the DNS records |
-| `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the values the install was made with; rolls back if it does not become ready |
+| `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the install's values: shows the release notes and every change first, stops on unsafe ones, rolls back if it does not become ready |
+| `ntctl rollback` | Returns an install to an earlier revision (`--to N`), showing what changes first |
+| `ntctl history` | The revisions of an install |
+| `ntctl adopt` | Checks that an install made with plain `helm` can be managed with ntctl, changing nothing |
 | `ntctl status` | Workload readiness, pods that need attention, and DNS records |
 | `ntctl doctor` | Says what is wrong with an install and how to fix it (`--output json`) |
 | `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
@@ -164,6 +167,49 @@ Values are layered like Helm's: generated defaults, then `-f` files, then
 explicit flags such as `--domain`.
 
 Run `ntctl <command> -h` for every flag.
+
+## Upgrading
+
+```sh
+ntctl upgrade --dry-run     # what would change, then stop
+ntctl upgrade
+```
+
+`upgrade` keeps the values the install was made with. Before it changes
+anything:
+
+1. It runs the preflight checks.
+2. It shows the chart's release notes between your version and the target, and
+   flags releases to read before upgrading.
+3. It asks the cluster to render the upgrade in a dry run, and lists every
+   resource that is added, changed or removed (`--show-diff` for the full
+   diff). Secret values are compared but never shown.
+
+It stops, changing nothing, when the upgrade would need something Kubernetes
+cannot do in place:
+
+- a new selector on a Deployment, DaemonSet or StatefulSet;
+- a new StatefulSet service name or volume template;
+- a new storage class or access mode on a volume;
+- removing a Secret, a volume or a StatefulSet;
+- removing a key from a Secret.
+
+Pass `--allow-breaking` only when you accept that those resources are deleted
+and recreated. If the upgrade does not become ready, the last working revision
+is restored.
+
+To go back later:
+
+```sh
+ntctl history
+ntctl rollback            # the newest earlier revision that worked
+ntctl rollback --to 3
+```
+
+An install made with plain `helm` needs no migration. `ntctl adopt` checks that
+it re-renders exactly as deployed, then writes its values, without anything that
+looks like a secret, to `neuraltrust-values.yaml`. It changes nothing in the
+cluster, and later upgrades keep the release's own values and Secret names.
 
 ## When something is wrong
 

@@ -60,7 +60,7 @@ func TestNoSecretLeaks(t *testing.T) {
 			"agentgateway": map[string]any{"configSync": map[string]any{"token": "CANARY-values-token"}},
 		},
 		Manifest: "---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: platform-secrets\nstringData:\n  SIGNING_KEY: CANARY-manifest\n" +
-			"---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  JWT: eyJhbGciOiJIUzI1NiJ9.eyJDQU5BUlkiOjF9.Q0FOQVJZc2ln\n",
+			"---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\ndata:\n  JWT: " + "eyJ" + "hbGciOiJIUzI1NiJ9.eyJDQU5BUlkiOjF9.Q0FOQVJZc2ln\n",
 	}
 	findings := []preflight.Result{{Code: "NT-DR-012", Check: "crashing", Severity: preflight.Fail, Message: "proxy keeps crashing",
 		Detail: []string{"connecting with token=CANARY-detail"}}}

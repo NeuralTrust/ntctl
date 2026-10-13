@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"helm.sh/helm/v4/pkg/action"
+	chartapi "helm.sh/helm/v4/pkg/chart"
 	"helm.sh/helm/v4/pkg/chart/common"
 	"helm.sh/helm/v4/pkg/kube"
 	ri "helm.sh/helm/v4/pkg/release"
@@ -156,6 +157,50 @@ func Upgrade(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, v
 		res.RollbackReady = after[len(after)-1].Info.Status == rcommon.StatusDeployed
 	}
 	return res, readiness(err)
+}
+
+// Plan returns the manifest an upgrade to ch with vals would apply, without
+// applying anything. The cluster renders it in a server-side dry run, so
+// templates that look up live objects (generated Secrets that are reused, for
+// one) render as the real upgrade would. With reuse, vals are layered on the
+// release's values as `ntctl upgrade` does; without, vals replace them.
+func Plan(ctx context.Context, cfg *action.Configuration, ch chartapi.Charter, vals map[string]any, name, namespace string, reuse bool) (string, error) {
+	up := action.NewUpgrade(cfg)
+	up.Namespace = namespace
+	up.DryRunStrategy = action.DryRunServer
+	up.ReuseValues = reuse
+	up.ResetValues = !reuse
+	up.ServerSideApply = "auto"
+	r, err := up.RunWithContext(ctx, name, ch, vals)
+	if err != nil {
+		return "", err
+	}
+	rel, err := v1(r)
+	if err != nil {
+		return "", err
+	}
+	return rel.Manifest, nil
+}
+
+// Rollback restores revision to of a release and waits, up to timeout, for
+// it to become ready. It applies the way the release was made, as `helm
+// rollback` does.
+func Rollback(cfg *action.Configuration, name string, to int, timeout time.Duration) error {
+	rb := action.NewRollback(cfg)
+	rb.Version = to
+	rb.WaitStrategy = kube.StatusWatcherStrategy
+	rb.Timeout = timeout
+	rb.ServerSideApply = "auto"
+	rb.MaxHistory = 10
+	if err := rb.Run(name); err != nil {
+		return readiness(err)
+	}
+	return nil
+}
+
+// History returns the release's revisions, oldest first.
+func History(cfg *action.Configuration, name string) ([]*release.Release, error) {
+	return history(cfg, name)
 }
 
 // history returns the release's revisions, oldest first.

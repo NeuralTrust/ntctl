@@ -104,3 +104,25 @@ func TestUpgradeKeepsValues(t *testing.T) {
 		t.Fatalf("values after upgrade = %v, want keep=me and v=2", cur.Config)
 	}
 }
+
+func TestRollbackRestoresAnEarlierRevision(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeCluster()
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "2"}, "rel", "ns", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rollback(f.cfg, "rel", 1, time.Minute); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	cur, _ := Current(f.cfg, "rel")
+	if cur.Version != 3 || cur.Config["v"] != "1" {
+		t.Fatalf("after rollback: revision %d values %v, want revision 3 with revision 1's values", cur.Version, cur.Config)
+	}
+	hist, err := History(f.cfg, "rel")
+	if err != nil || len(hist) != 3 {
+		t.Fatalf("history = %d revisions, %v", len(hist), err)
+	}
+}

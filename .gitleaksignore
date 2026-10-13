@@ -1,0 +1,4 @@
+# Fake fixtures in a test file at this commit, since rewritten so they no
+# longer look like a JWT or a private key.
+d844c0ab6b377cb413dcae8fa1348931b5944ad5:internal/redact/redact_test.go:jwt:12
+d844c0ab6b377cb413dcae8fa1348931b5944ad5:internal/redact/redact_test.go:private-key:17
