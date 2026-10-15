@@ -65,6 +65,14 @@ Then `ntctl install`:
 1. Checks the cluster against what this install needs: storage, ingress (or,
    with HTTPRoutes, that the Gateway exists and admits the namespace),
    capacity, and every Secret it reads.
+
+   Capacity counts only the nodes each workload can run on: a GPU pool or a
+   tainted system pool does not count for general workloads, and GPU workers
+   need a node that matches their selector. It also subtracts what pods already
+   running there request. Above 85% of the free capacity it warns, because a
+   rolling upgrade needs room for an extra pod; above 100% it stops. A cluster
+   with Cluster Autoscaler or Karpenter only gets a warning, since it adds
+   nodes when pods are pending.
 2. Shows the cluster and the choices it is about to apply, and asks for
    confirmation.
 3. Creates the Secrets, installs the chart, waits until every workload is
@@ -104,6 +112,30 @@ The PostgreSQL and Redis questions apply to hybrid installs, which share one
 database user and one Redis. In external mode every service has its own
 database user: configure that with `-f`, following
 `values-managed-datastores.yaml.example` in the chart repository.
+
+ntctl names the Secrets it creates for your datastores the way the chart's
+examples do: `external-postgresql` (key `POSTGRES_PASSWORD`) and
+`external-redis` (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`,
+`REDIS_PASSWORD`, `REDIS_TLS`). Installs made by earlier versions keep their
+`ntctl-postgresql` and `ntctl-redis` Secrets, since an upgrade reuses the values
+and renames nothing.
+
+### When only you may create Secrets
+
+With `--secrets-mode print`, `install` asks and checks the cluster as usual,
+then changes nothing. It saves the values and prints the `kubectl` commands
+that create the Secrets, with a `<…>` placeholder for every password, token and
+key. Hosts, ports and user names are printed as they are. Neither the console
+nor you are asked for a token, and the PostgreSQL connection string may leave
+out the password:
+
+```sh
+ntctl install --secrets-mode print --domain platform.example.com
+# run the printed kubectl commands, filling in each placeholder, then:
+ntctl install -f neuraltrust-values.yaml
+```
+
+The second run finds the Secrets in place, keeps them, and installs.
 
 ### Signed in to the console
 
@@ -169,6 +201,8 @@ Flags for `install`, `upgrade`, `preflight` and `render`:
   own `--domain`.
 - `--version`: the chart version.
 - `--chart`: a local chart directory or `.tgz`, for air-gapped clusters.
+- `--ignore-capacity`: install even when the cluster is too small, as on a test
+  cluster. Pods that do not fit stay Pending.
 
 Values are layered like Helm's: generated defaults, then `-f` files, then
 explicit flags such as `--domain`.

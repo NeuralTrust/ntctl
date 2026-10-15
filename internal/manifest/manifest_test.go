@@ -137,3 +137,52 @@ spec:
 		t.Errorf("gateways = %+v; want the two Gateway parents once each, the Service parent left out", n.Gateways)
 	}
 }
+
+func TestAnalyseGroupsByPlacement(t *testing.T) {
+	objs, err := Parse(`apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers: [{name: c, resources: {requests: {cpu: 500m, memory: 1Gi}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker}
+spec:
+  template:
+    spec:
+      nodeSelector: {accelerator: nvidia}
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers: [{name: c, resources: {requests: {cpu: "1", memory: 4Gi}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker2}
+spec:
+  template:
+    spec:
+      nodeSelector: {accelerator: nvidia}
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers: [{name: c, resources: {requests: {cpu: "2", memory: 2Gi}}}]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := Analyse(objs)
+	if len(n.Groups) != 2 {
+		t.Fatalf("groups = %+v, want general and GPU", n.Groups)
+	}
+	g, w := n.Groups[0], n.Groups[1]
+	if g.CPUMilli != 1000 || g.MaxPodCPUMilli != 500 || len(g.Workloads) != 1 {
+		t.Errorf("general group = %+v", g)
+	}
+	if w.CPUMilli != 3000 || w.Memory != 6<<30 || w.MaxPodCPUMilli != 2000 || w.MaxPodMemory != 4<<30 || len(w.Workloads) != 2 {
+		t.Errorf("GPU group = %+v", w)
+	}
+	if w.NodeSelector["accelerator"] != "nvidia" || len(w.Tolerations) != 1 || w.Tolerations[0].Key != "nvidia.com/gpu" {
+		t.Errorf("GPU placement = %+v %+v", w.NodeSelector, w.Tolerations)
+	}
+}

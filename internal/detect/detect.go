@@ -35,6 +35,33 @@ type Cluster struct {
 	// Allocatable on schedulable nodes: CPU in millicores, memory in bytes.
 	CPUMilli int64
 	Memory   int64
+	// NodeList holds each schedulable node, for checks that need to know
+	// which pods can land where. UsageRead is false when the running pods
+	// could not be listed, and every Node.Used is then empty.
+	NodeList  []Node
+	UsageRead bool
+	// Autoscaling is true when the cluster runs Cluster Autoscaler or
+	// Karpenter, so pods that do not fit now make it add nodes.
+	Autoscaling bool
+}
+
+// Node is a schedulable node: what it offers, what it repels, and what the
+// pods already running on it request.
+type Node struct {
+	Name     string
+	Labels   map[string]string
+	Taints   []corev1.Taint
+	CPUMilli int64
+	Memory   int64
+	// Used is what running pods request on this node, by namespace, so an
+	// upgrade can leave out the release's own pods.
+	Used map[string]Usage
+}
+
+// Usage is requested CPU (millicores) and memory (bytes).
+type Usage struct {
+	CPUMilli int64
+	Memory   int64
 }
 
 const (
@@ -60,6 +87,9 @@ func Inspect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface
 	for _, g := range groups.Groups {
 		if g.Name == "route.openshift.io" {
 			c.HasRoutes = true
+		}
+		if g.Name == "karpenter.sh" {
+			c.Autoscaling = true
 		}
 		if g.Name == gatewayapi.Group {
 			for _, v := range g.Versions {
@@ -87,8 +117,18 @@ func Inspect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface
 		c.Nodes++
 		c.CPUMilli += n.Status.Allocatable.Cpu().MilliValue()
 		c.Memory += n.Status.Allocatable.Memory().Value()
+		c.NodeList = append(c.NodeList, Node{
+			Name: n.Name, Labels: n.Labels, Taints: n.Spec.Taints,
+			CPUMilli: n.Status.Allocatable.Cpu().MilliValue(), Memory: n.Status.Allocatable.Memory().Value(),
+			Used: map[string]Usage{},
+		})
 	}
 	c.Platform = platform(c.HasRoutes, nodes.Items)
+	c.UsageRead = usage(ctx, cs, c.NodeList)
+	// Cluster Autoscaler, managed or not, publishes its state here.
+	if _, err := cs.CoreV1().ConfigMaps("kube-system").Get(ctx, "cluster-autoscaler-status", metav1.GetOptions{}); err == nil {
+		c.Autoscaling = true
+	}
 
 	ics, err := cs.NetworkingV1().IngressClasses().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -154,6 +194,34 @@ func platform(hasRoutes bool, nodes []corev1.Node) string {
 
 // schedulable leaves out cordoned and control-plane nodes. Other taints (GPU
 // pools, for example) are kept: workloads that need those nodes tolerate them.
+// usage adds what running pods request to the nodes they run on. A cluster
+// that forbids listing pods everywhere returns false and leaves Used empty.
+func usage(ctx context.Context, cs kubernetes.Interface, nodes []Node) bool {
+	pods, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "status.phase!=Succeeded,status.phase!=Failed"})
+	if err != nil {
+		return false
+	}
+	byName := make(map[string]*Node, len(nodes))
+	for i := range nodes {
+		byName[nodes[i].Name] = &nodes[i]
+	}
+	for _, p := range pods.Items {
+		n := byName[p.Spec.NodeName]
+		if n == nil || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		u := n.Used[p.Namespace]
+		for _, c := range p.Spec.Containers {
+			u.CPUMilli += c.Resources.Requests.Cpu().MilliValue()
+			u.Memory += c.Resources.Requests.Memory().Value()
+		}
+		u.CPUMilli += p.Spec.Overhead.Cpu().MilliValue()
+		u.Memory += p.Spec.Overhead.Memory().Value()
+		n.Used[p.Namespace] = u
+	}
+	return true
+}
+
 func schedulable(n *corev1.Node) bool {
 	if n.Spec.Unschedulable {
 		return false

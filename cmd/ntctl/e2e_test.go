@@ -97,7 +97,7 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := filepath.Join(dir, "values.yaml")
-	out := ntctl(t, 1, "install", "--yes", "--namespace", ns, "--domain", "e2e.example.com",
+	out := ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved, "--timeout", "45s")
 	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`, "install did not complete"} {
 		if !strings.Contains(out, want) {
@@ -144,10 +144,61 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	}
 
 	// A second install keeps the Secrets, so it asks the console for nothing.
-	ntctl(t, 3, "install", "--yes", "--namespace", ns, "--domain", "e2e.example.com",
+	ntctl(t, 3, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", "")
 	if got := len(srv.Issued()); got != 2 {
 		t.Fatalf("a refused second install issued tokens (%d configs)", got)
+	}
+}
+
+// TestE2EInstallPrintsTheSecrets runs an install with --secrets-mode print,
+// signed in: it saves the values and prints the commands, and the cluster and
+// the console are left exactly as they were.
+func TestE2EInstallPrintsTheSecrets(t *testing.T) {
+	const ns = "ntctl-e2e-print"
+	cs := cluster(t, ns)
+	srv := console(t)
+	ntctl(t, 0, "login", "--app-url", srv.URL)
+	t.Setenv("NT_POSTGRES_URL", "postgres://nt@db.example.com:5432/platform")
+	t.Setenv("NT_REDIS_URL", "rediss://default:CANARY-redis@cache.example.com:6380")
+
+	dir := t.TempDir()
+	key := filepath.Join(dir, "registry-key.json")
+	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","private_key":"CANARY-key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	saved := filepath.Join(dir, "values.yaml")
+	out := ntctl(t, 0, "install", "--yes", "--ignore-capacity", "--secrets-mode", "print", "--namespace", ns,
+		"--domain", "print.example.com", "--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved)
+	for _, want := range []string{
+		"Nothing was changed in the cluster",
+		"kubectl create namespace " + ns,
+		"create secret docker-registry gcr-secret",
+		`--docker-password="$(cat '` + key + `')"`,
+		"create secret generic external-postgresql \\\n  --from-literal=POSTGRES_PASSWORD='<POSTGRES_PASSWORD>'",
+		"--from-literal=REDIS_HOST='cache.example.com'",
+		"--from-literal=REDIS_PASSWORD='<REDIS_PASSWORD>'",
+		"create secret generic " + values.TrustGateConfigSync,
+		"create secret generic " + values.TrustGuardEnrolment,
+		"ntctl install -n " + ns + " -f " + saved,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	noCanary(t, saved)
+	b, err := os.ReadFile(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "external-postgresql") || !strings.Contains(string(b), "db.example.com") {
+		t.Errorf("the saved values do not point at the printed Secrets:\n%s", b)
+	}
+	if _, err := cs.CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("print mode created the namespace (err %v)", err)
+	}
+	if n := len(srv.Issued()); n != 0 {
+		t.Errorf("print mode asked the console for %d install configs", n)
 	}
 }
 
@@ -212,7 +263,7 @@ func TestE2EDoctorAndSupportBundle(t *testing.T) {
 	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"CANARY-registry-key"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ntctl(t, 1, "install", "--yes", "--namespace", ns, "--domain", "doctor.example.com",
+	ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "doctor.example.com",
 		"--products", "trustgate", "--registry-key", key, "--save-values", "", "--timeout", "30s")
 
 	out := ntctl(t, 3, "doctor", "--namespace", ns)
@@ -351,6 +402,7 @@ func TestE2EAdoptUpgradeRollback(t *testing.T) {
 	if after := versions(t, cs, ns); !reflect.DeepEqual(before, after) {
 		t.Fatalf("adopt changed the cluster: %v -> %v", before, after)
 	}
+	noNtctlSecrets(t, cs, ns)
 
 	// A safe change is shown, then applied.
 	v2 := tinyChart(t, "3.0.1", "tiny", "debug")
@@ -368,6 +420,7 @@ func TestE2EAdoptUpgradeRollback(t *testing.T) {
 	if s, _ := cs.CoreV1().Secrets(ns).Get(ctx, "tiny", metav1.GetOptions{}); string(s.Data["password"]) != "CANARY-pw" {
 		t.Fatal("the upgrade lost the release's values")
 	}
+	noNtctlSecrets(t, cs, ns)
 
 	// A new selector is refused, and nothing changes.
 	before = versions(t, cs, ns)
@@ -414,4 +467,20 @@ func versions(t *testing.T, cs kubernetes.Interface, ns string) map[string]strin
 	}
 	out["secret"] = s.ResourceVersion
 	return out
+}
+
+// noNtctlSecrets fails when ntctl created a Secret in a release it did not
+// install: adopt and upgrade reuse the release's values, and never add the
+// datastore or token Secrets an ntctl install would.
+func noNtctlSecrets(t *testing.T, cs kubernetes.Interface, ns string) {
+	t.Helper()
+	list, err := cs.CoreV1().Secrets(ns).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range list.Items {
+		if s.Labels["app.kubernetes.io/managed-by"] == "ntctl" || strings.HasPrefix(s.Name, "external-") || strings.HasPrefix(s.Name, "ntctl-") {
+			t.Errorf("Secret %s was created in a release ntctl did not install", s.Name)
+		}
+	}
 }

@@ -3,10 +3,12 @@
 package manifest
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 
@@ -73,6 +75,22 @@ type Needs struct {
 	// Requested CPU (millicores) and memory (bytes), replicas included.
 	CPUMilli int64
 	Memory   int64
+	// Groups split those requests by where the pods may run: workloads with
+	// the same nodeSelector and tolerations share a group.
+	Groups []PodGroup
+}
+
+// PodGroup is the requests of workloads that can run on the same nodes.
+type PodGroup struct {
+	NodeSelector map[string]string
+	Tolerations  []corev1.Toleration
+	Workloads    []string
+	// CPUMilli and Memory are the group's total requests; MaxPodCPUMilli and
+	// MaxPodMemory those of its largest single pod, which must fit one node.
+	CPUMilli       int64
+	Memory         int64
+	MaxPodCPUMilli int64
+	MaxPodMemory   int64
 }
 
 var workloadKinds = map[string]bool{"Deployment": true, "StatefulSet": true, "DaemonSet": true, "Job": true, "CronJob": true}
@@ -91,6 +109,8 @@ func Analyse(objs []Object) Needs {
 	storage := map[string]bool{}
 	ingress := map[string]bool{}
 	gateways := map[gatewayapi.ParentRef]bool{}
+	groups := map[string]*PodGroup{}
+	var groupOrder []string
 
 	for _, o := range objs {
 		kind := o.Kind()
@@ -143,6 +163,7 @@ func Analyse(objs []Object) Needs {
 					replicas = int64(r)
 				}
 			}
+			var podCPU, podMem int64
 			for _, field := range []string{"initContainers", "containers"} {
 				for _, c := range list(pod[field]) {
 					for _, e := range list(dig(c, "env")) {
@@ -157,10 +178,20 @@ func Analyse(objs []Object) Needs {
 						addSecret(secrets, created, name, "", optional, by)
 					}
 					if field == "containers" && kind != "Job" && kind != "CronJob" {
-						n.CPUMilli += replicas * quantity(dig(c, "resources", "requests", "cpu"), true)
-						n.Memory += replicas * quantity(dig(c, "resources", "requests", "memory"), false)
+						podCPU += quantity(dig(c, "resources", "requests", "cpu"), true)
+						podMem += quantity(dig(c, "resources", "requests", "memory"), false)
 					}
 				}
+			}
+			if podCPU+podMem > 0 {
+				n.CPUMilli += replicas * podCPU
+				n.Memory += replicas * podMem
+				g := group(groups, &groupOrder, pod)
+				g.Workloads = append(g.Workloads, by)
+				g.CPUMilli += replicas * podCPU
+				g.Memory += replicas * podMem
+				g.MaxPodCPUMilli = max(g.MaxPodCPUMilli, podCPU)
+				g.MaxPodMemory = max(g.MaxPodMemory, podMem)
 			}
 		}
 	}
@@ -173,6 +204,9 @@ func Analyse(objs []Object) Needs {
 		}
 		return n.Secrets[i].Key < n.Secrets[j].Key
 	})
+	for _, k := range groupOrder {
+		n.Groups = append(n.Groups, *groups[k])
+	}
 	n.PullSecrets = keys(pull)
 	n.StorageClasses = keys(storage)
 	n.IngressClasses = keys(ingress)
@@ -195,6 +229,31 @@ func noteClass(v any, acc map[string]bool, usesDefault *bool) {
 		return
 	}
 	*usesDefault = true
+}
+
+// group returns the PodGroup for a pod's nodeSelector and tolerations,
+// creating it on first use.
+func group(groups map[string]*PodGroup, order *[]string, pod map[string]any) *PodGroup {
+	var g PodGroup
+	if sel, ok := pod["nodeSelector"].(map[string]any); ok && len(sel) > 0 {
+		g.NodeSelector = map[string]string{}
+		for k, v := range sel {
+			g.NodeSelector[k] = fmt.Sprint(v)
+		}
+	}
+	if raw, ok := pod["tolerations"]; ok {
+		if b, err := json.Marshal(raw); err == nil {
+			_ = json.Unmarshal(b, &g.Tolerations) // a malformed toleration is skipped, as the scheduler would reject it
+		}
+	}
+	keyBytes, _ := json.Marshal([]any{g.NodeSelector, g.Tolerations}) // map keys marshal sorted
+	key := string(keyBytes)
+	if existing, ok := groups[key]; ok {
+		return existing
+	}
+	groups[key] = &g
+	*order = append(*order, key)
+	return &g
 }
 
 func podSpec(o Object) map[string]any {

@@ -29,7 +29,7 @@ const ns = "neuraltrust"
 // hide and checks none reaches the bundle, while what support needs stays.
 func TestNoSecretLeaks(t *testing.T) {
 	cs := fake.NewClientset(
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "ntctl-postgresql", Namespace: ns}, Data: map[string][]byte{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "external-postgresql", Namespace: ns}, Data: map[string][]byte{
 			"POSTGRES_PASSWORD": []byte("CANARY-pg-password"),
 			"POSTGRES_USER":     []byte("neuraltrust"),
 			"ODDLY_NAMED":       []byte("CANARYx9f3k2m8q7w1z5r4t6"),
