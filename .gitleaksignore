@@ -2,3 +2,4 @@
 # longer look like a JWT or a private key.
 d844c0ab6b377cb413dcae8fa1348931b5944ad5:internal/redact/redact_test.go:jwt:12
 d844c0ab6b377cb413dcae8fa1348931b5944ad5:internal/redact/redact_test.go:private-key:17
+cedef8e401da4e3916264331e92d40c34ea94b15:internal/diff/diff_test.go:generic-api-key:158

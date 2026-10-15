@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 )
 
 func TestGenerateMatchesValuesRequired(t *testing.T) {
@@ -63,5 +65,22 @@ func TestSaveHasNoTokensAndRoundTrips(t *testing.T) {
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestGenerateGateway(t *testing.T) {
+	out := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "kgateway-system", Name: "internal", SectionName: "https"}})
+	if Get(out, "global", "ingress", "provider") != "gateway-api" {
+		t.Fatalf("provider not set: %v", out)
+	}
+	refs, _ := Get(out, "global", "ingress", "gatewayApi", "parentRefs").([]any)
+	ref, _ := refs[0].(map[string]any)
+	if len(refs) != 1 || ref["namespace"] != "kgateway-system" || ref["name"] != "internal" || ref["sectionName"] != "https" {
+		t.Errorf("parentRefs = %v", refs)
+	}
+	noSection := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "gw", Name: "edge"}})
+	refs, _ = Get(noSection, "global", "ingress", "gatewayApi", "parentRefs").([]any)
+	if _, has := refs[0].(map[string]any)["sectionName"]; has {
+		t.Error("an empty sectionName must be left out, so the route attaches to every listener")
 	}
 }

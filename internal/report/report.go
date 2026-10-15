@@ -11,7 +11,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 )
 
 // Workload is the readiness of one Deployment, StatefulSet or DaemonSet.
@@ -43,8 +46,9 @@ type Status struct {
 	Records   []Record   `json:"dns"`
 }
 
-// Collect reads workloads, pods and ingresses in the namespace.
-func Collect(ctx context.Context, cs kubernetes.Interface, ns string) (*Status, error) {
+// Collect reads workloads, pods, ingresses and, when dyn is not nil, the
+// HTTPRoutes in the namespace.
+func Collect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface, ns string) (*Status, error) {
 	s := &Status{}
 	deps, err := cs.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -104,8 +108,48 @@ func Collect(ctx context.Context, cs kubernetes.Interface, ns string) (*Status, 
 			s.Records = append(s.Records, Record{Host: rule.Host, Type: typ, Target: target})
 		}
 	}
+	if dyn != nil {
+		if err := s.routeRecords(ctx, dyn, ns, seen); err != nil {
+			return nil, err
+		}
+	}
 	sort.Slice(s.Records, func(i, j int) bool { return s.Records[i].Host < s.Records[j].Host })
 	return s, nil
+}
+
+// routeRecords adds a record per HTTPRoute hostname, pointing at the address
+// of the route's first parent Gateway.
+func (s *Status) routeRecords(ctx context.Context, dyn dynamic.Interface, ns string, seen map[string]bool) error {
+	routes, err := gatewayapi.ListRoutes(ctx, dyn, ns)
+	if err != nil {
+		return err
+	}
+	gateways := map[string]*gatewayapi.Gateway{}
+	for _, r := range routes {
+		typ, target := "", ""
+		if len(r.Parents) > 0 {
+			p := r.Parents[0]
+			key := p.Namespace + "/" + p.Name
+			gw, cached := gateways[key]
+			if !cached {
+				// A Gateway that cannot be read leaves the address pending;
+				// doctor says why.
+				gw, _ = gatewayapi.GetGateway(ctx, dyn, p.Namespace, p.Name)
+				gateways[key] = gw
+			}
+			if gw != nil {
+				typ, target = gw.DNS()
+			}
+		}
+		for _, h := range r.Hostnames {
+			if seen[h] {
+				continue
+			}
+			seen[h] = true
+			s.Records = append(s.Records, Record{Host: h, Type: typ, Target: target})
+		}
+	}
+	return nil
 }
 
 // Ready reports whether every workload is fully ready.

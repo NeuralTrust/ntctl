@@ -120,7 +120,7 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	fmt.Fprintf(out, "Upgrading… waiting up to %s; if it does not become ready, the last working revision is restored.\n", f.timeout)
 	result, upErr := helm.Upgrade(ctx, p.cfg, p.chart, p.values, o.release, o.kube.Namespace, f.timeout)
-	if st, err := report.Collect(ctx, p.cs, o.kube.Namespace); err == nil {
+	if st, err := report.Collect(ctx, p.cs, p.dyn, o.kube.Namespace); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
 	}
@@ -258,8 +258,8 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 	}
 	fmt.Fprintf(out, "Rolling back… waiting up to %s.\n", f.timeout)
 	rbErr := helm.Rollback(cfg, o.release, target.Version, f.timeout)
-	if cs, err := o.kube.Clientset(); err == nil {
-		if st, err := report.Collect(ctx, cs, o.kube.Namespace); err == nil {
+	if cs, dyn, err := o.clients(); err == nil {
+		if st, err := report.Collect(ctx, cs, dyn, o.kube.Namespace); err == nil {
 			fmt.Fprintln(out)
 			st.Print(out)
 		}

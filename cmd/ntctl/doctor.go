@@ -9,6 +9,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	release "helm.sh/helm/v4/pkg/release/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/bundle"
@@ -28,6 +29,7 @@ Changes nothing. Works on installs made with plain Helm too.`
 // diagnosis is a doctor run and what it looked at.
 type diagnosis struct {
 	cs       kubernetes.Interface
+	dyn      dynamic.Interface
 	cfg      *action.Configuration
 	cluster  *detect.Cluster
 	current  *release.Release
@@ -35,11 +37,11 @@ type diagnosis struct {
 }
 
 func (o *opts) diagnose(ctx context.Context, logLines int64) (*diagnosis, error) {
-	cs, err := o.kube.Clientset()
+	cs, dyn, err := o.clients()
 	if err != nil {
 		return nil, err
 	}
-	cluster, err := detect.Inspect(ctx, cs)
+	cluster, err := detect.Inspect(ctx, cs, dyn)
 	if err != nil {
 		return nil, fmt.Errorf("cannot use the cluster from your kubeconfig: %w", err)
 	}
@@ -52,12 +54,12 @@ func (o *opts) diagnose(ctx context.Context, logLines int64) (*diagnosis, error)
 		return nil, err
 	}
 	findings, err := doctor.Run(ctx, doctor.Input{
-		Clientset: cs, Namespace: o.kube.Namespace, Release: o.release, Current: current, Cluster: cluster, LogLines: logLines,
+		Clientset: cs, Dynamic: dyn, Namespace: o.kube.Namespace, Release: o.release, Current: current, Cluster: cluster, LogLines: logLines,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &diagnosis{cs: cs, cfg: cfg, cluster: cluster, current: current, findings: findings}, nil
+	return &diagnosis{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, findings: findings}, nil
 }
 
 func runDoctor(ctx context.Context, args []string, out io.Writer) error {
@@ -141,7 +143,7 @@ func runSupportBundle(ctx context.Context, args []string, out io.Writer) error {
 	}
 	fmt.Fprintln(out, "Collecting resources, events and logs…")
 	sum, err := bundle.Write(ctx, f, bundle.Input{
-		Clientset: d.cs, Namespace: o.kube.Namespace, Release: o.release, Current: d.current, History: hist,
+		Clientset: d.cs, Dynamic: d.dyn, Namespace: o.kube.Namespace, Release: o.release, Current: d.current, History: hist,
 		Findings: d.findings, Versions: versions, LogLines: logLines, Now: now,
 	})
 	if cerr := f.Close(); err == nil {

@@ -7,6 +7,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/cli"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -41,6 +42,20 @@ func (o Options) Clientset() (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("creating Kubernetes client: %w", err)
 	}
 	return cs, nil
+}
+
+// Dynamic returns a dynamic client for the selected context, for the Gateway
+// API objects client-go has no typed client for.
+func (o Options) Dynamic() (dynamic.Interface, error) {
+	cfg, err := o.Settings().RESTClientGetter().ToRESTConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("creating Kubernetes client: %w", err)
+	}
+	return dyn, nil
 }
 
 // Target names the kubeconfig context and API server in use, so prompts can

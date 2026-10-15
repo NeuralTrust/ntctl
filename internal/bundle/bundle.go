@@ -21,13 +21,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
 
 	release "helm.sh/helm/v4/pkg/release/v1"
 
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/redact"
 )
@@ -35,6 +39,8 @@ import (
 // Input is what goes into the bundle.
 type Input struct {
 	Clientset kubernetes.Interface
+	// Dynamic reads the Gateway API objects; nil leaves them out.
+	Dynamic   dynamic.Interface
 	Namespace string
 	Release   string
 	// Current and History are the release, nil and empty when there is none.
@@ -132,6 +138,9 @@ func Write(ctx context.Context, w io.Writer, in Input) (*Summary, error) {
 	}
 
 	bw.resources(ctx, cs, ns)
+	if in.Dynamic != nil {
+		bw.gatewayResources(ctx, in.Dynamic, ns)
+	}
 	bw.nodes(ctx, cs)
 	bw.logs(ctx, cs, ns, in.LogLines)
 
@@ -224,6 +233,49 @@ func (b *writer) resources(ctx context.Context, cs kubernetes.Interface, ns stri
 			}
 		}
 		b.yaml("resources/"+k.file+".yaml", redact.Value(items))
+	}
+}
+
+// gatewayResources writes the namespace's HTTPRoutes and the Gateways they
+// attach to. A cluster without the Gateway API writes nothing.
+func (b *writer) gatewayResources(ctx context.Context, dyn dynamic.Interface, ns string) {
+	routes, err := dyn.Resource(gatewayapi.HTTPRoutesGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		b.fail("httproutes", err)
+		return
+	}
+	var items, gateways []any
+	seen := map[string]bool{}
+	for _, r := range routes.Items {
+		tidy(r.Object)
+		items = append(items, r.Object)
+		parents, _, _ := unstructured.NestedSlice(r.Object, "spec", "parentRefs")
+		for _, p := range parents {
+			pm, _ := p.(map[string]any)
+			name, _ := pm["name"].(string)
+			pns, _ := pm["namespace"].(string)
+			if pns == "" {
+				pns = ns
+			}
+			if name == "" || seen[pns+"/"+name] {
+				continue
+			}
+			seen[pns+"/"+name] = true
+			gw, err := dyn.Resource(gatewayapi.GatewaysGVR).Namespace(pns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				b.fail("gateways", err)
+				continue
+			}
+			tidy(gw.Object)
+			gateways = append(gateways, gw.Object)
+		}
+	}
+	b.yaml("resources/httproutes.yaml", redact.Value(items))
+	if len(gateways) > 0 {
+		b.yaml("resources/gateways.yaml", redact.Value(gateways))
 	}
 }
 
@@ -374,7 +426,7 @@ func readme(in Input) string {
 - doctor.txt, doctor.json: the ntctl doctor report
 - secrets.yaml: Secret names, types and key names (no values)
 - release/: the release's values, manifest and history
-- resources/: Deployments, StatefulSets, DaemonSets, Pods, Services, Ingresses, PersistentVolumeClaims, Jobs, ConfigMaps and Events in the namespace
+- resources/: Deployments, StatefulSets, DaemonSets, Pods, Services, Ingresses, HTTPRoutes and their Gateways, PersistentVolumeClaims, Jobs, ConfigMaps and Events in the namespace
 - nodes.yaml: node capacity, conditions and taints
 - logs/: the last lines of each container's log, and of its previous run when it restarted
 - errors.txt: anything that could not be collected

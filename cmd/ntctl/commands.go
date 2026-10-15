@@ -11,6 +11,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	release "helm.sh/helm/v4/pkg/release/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/chart"
@@ -110,7 +111,7 @@ func runStatus(ctx context.Context, args []string, out io.Writer) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	cs, err := o.kube.Clientset()
+	cs, dyn, err := o.clients()
 	if err != nil {
 		return err
 	}
@@ -122,7 +123,7 @@ func runStatus(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	st, err := report.Collect(ctx, cs, o.kube.Namespace)
+	st, err := report.Collect(ctx, cs, dyn, o.kube.Namespace)
 	if err != nil {
 		return err
 	}
@@ -155,6 +156,7 @@ func releaseSummary(rel *release.Release) map[string]any {
 // prepared is everything an install, upgrade or preflight run works from.
 type prepared struct {
 	cs      kubernetes.Interface
+	dyn     dynamic.Interface
 	cfg     *action.Configuration
 	cluster *detect.Cluster
 	current *release.Release
@@ -168,11 +170,11 @@ type prepared struct {
 // prepare reads the cluster, builds the values, renders the chart and runs the
 // preflight checks against what the render needs. It changes nothing.
 func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[string][]string) (*prepared, error) {
-	cs, err := o.kube.Clientset()
+	cs, dyn, err := o.clients()
 	if err != nil {
 		return nil, err
 	}
-	cluster, err := detect.Inspect(ctx, cs)
+	cluster, err := detect.Inspect(ctx, cs, dyn)
 	if err != nil {
 		return nil, fmt.Errorf("cannot use the cluster from your kubeconfig: %w", err)
 	}
@@ -218,9 +220,15 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 		return nil, err
 	}
 	platform, _ := values.Get(renderVals, "global", "platform").(string)
+	provider, _ := values.Get(renderVals, "global", "ingress", "provider").(string)
+	nsLabels, err := detect.NamespaceLabels(ctx, cs, o.kube.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	results, err := preflight.Run(ctx, preflight.Input{
 		Mode: mode, Release: o.release, Namespace: o.kube.Namespace, ReleaseExists: current != nil,
 		Cluster: cluster, Needs: manifest.Analyse(objs), Platform: platform, WillCreate: willCreate,
+		IngressProvider: provider, NamespaceLabels: nsLabels,
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, cs, o.kube.Namespace, name)
 		},
@@ -228,7 +236,20 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	if err != nil {
 		return nil, err
 	}
-	return &prepared{cs: cs, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results}, nil
+	return &prepared{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results}, nil
+}
+
+// clients returns the typed and dynamic clients for the selected context.
+func (o *opts) clients() (kubernetes.Interface, dynamic.Interface, error) {
+	cs, err := o.kube.Clientset()
+	if err != nil {
+		return nil, nil, err
+	}
+	dyn, err := o.kube.Dynamic()
+	if err != nil {
+		return nil, nil, err
+	}
+	return cs, dyn, nil
 }
 
 // managedSecrets are the Secrets `ntctl install` creates for these values:

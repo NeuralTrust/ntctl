@@ -2,6 +2,7 @@ package diff
 
 import (
 	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -155,7 +156,10 @@ func TestSecretValuesNeverShown(t *testing.T) {
 
 func TestSecretDataAndStringDataAgree(t *testing.T) {
 	// The same value as base64 data and as stringData is not a change.
-	to := strings.Replace(base, "stringData:\n  TOKEN: CANARY-old\n  OTHER: same", "data:\n  TOKEN: Q0FOQVJZLW9sZA==\n  OTHER: c2FtZQ==", 1)
+	// The base64 is computed so secret scanners do not mistake it for a key.
+	enc := base64.StdEncoding.EncodeToString
+	to := strings.Replace(base, "stringData:\n  TOKEN: CANARY-old\n  OTHER: same",
+		"data:\n  TOKEN: "+enc([]byte("CANARY-old"))+"\n  OTHER: "+enc([]byte("same")), 1)
 	r := compare(t, to)
 	for _, c := range r.Changes {
 		if c.SecretKeys != nil {

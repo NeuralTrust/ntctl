@@ -14,6 +14,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/api"
 	"github.com/NeuralTrust/ntctl/internal/auth"
 	"github.com/NeuralTrust/ntctl/internal/detect"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/prompt"
@@ -84,11 +85,11 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	ns := o.kube.Namespace
 
-	cs, err := o.kube.Clientset()
+	cs, dyn, err := o.clients()
 	if err != nil {
 		return err
 	}
-	cluster, err := detect.Inspect(ctx, cs)
+	cluster, err := detect.Inspect(ctx, cs, dyn)
 	if err != nil {
 		return fmt.Errorf("cannot use the cluster from your kubeconfig: %w", err)
 	}
@@ -184,6 +185,9 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	domain, _ := values.Get(p.values, "global", "domain").(string)
 	platform, _ := values.Get(p.values, "global", "platform").(string)
 	fmt.Fprintf(out, "  Domain:     %s\n  Platform:   %s\n  Products:   %s\n", domain, platform, strings.Join(enabledProducts(p.values), ", "))
+	if line := exposure(p.values); line != "" {
+		fmt.Fprintf(out, "  Endpoints:  %s\n", line)
+	}
 	for _, line := range answers.Summary() {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
@@ -224,7 +228,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 
 	fmt.Fprintf(out, "Installing… waiting up to %s for every workload to become ready.\n", f.timeout)
 	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout)
-	if st, err := report.Collect(ctx, p.cs, ns); err == nil {
+	if st, err := report.Collect(ctx, p.cs, p.dyn, ns); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
 	}
@@ -258,6 +262,15 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			return a, err
 		}
 		o.platform = platforms[i]
+	}
+	if o.gateway == "" && !set("global", "ingress", "provider") && in.Interactive && len(cluster.Gateways) > 0 {
+		platform := o.platform
+		if platform == "" {
+			platform = cluster.Platform
+		}
+		if o.gateway, err = askExposure(in, cluster, platform); err != nil {
+			return a, err
+		}
 	}
 	if o.products == "" && !set("global", "products") && in.Interactive {
 		for {
@@ -345,6 +358,55 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		}
 	}
 	return a, nil
+}
+
+// askExposure offers the cluster's Gateways next to Ingress and returns the
+// chosen Gateway as namespace/name, or "" for Ingress. A Gateway is the
+// default when the cluster has no IngressClass and is not GKE, whose built-in
+// controller serves Ingresses without one.
+func askExposure(in *prompt.Prompter, cluster *detect.Cluster, platform string) (string, error) {
+	ingress := "Ingresses"
+	if len(cluster.IngressClasses) > 0 {
+		ingress += " (classes: " + strings.Join(cluster.IngressClasses, ", ") + ")"
+	} else if platform != "gcp" {
+		ingress += " (the cluster has no IngressClass)"
+	}
+	options := []string{ingress}
+	for _, g := range cluster.Gateways {
+		opt := "HTTPRoutes on Gateway " + g.Ref()
+		if _, target := g.DNS(); target != "" {
+			opt += " (" + g.Class + ", " + target + ")"
+		}
+		options = append(options, opt)
+	}
+	def := 0
+	if len(cluster.IngressClasses) == 0 && platform != "gcp" {
+		def = 1
+	}
+	i, err := in.Choose("How should the endpoints be exposed?", options, def)
+	if err != nil || i == 0 {
+		return "", err
+	}
+	return cluster.Gateways[i-1].Ref(), nil
+}
+
+// exposure describes Gateway API exposure for the install summary, or "" for
+// Ingress.
+func exposure(vals map[string]any) string {
+	if p, _ := values.Get(vals, "global", "ingress", "provider").(string); p != "gateway-api" {
+		return ""
+	}
+	var refs []string
+	parents, _ := values.Get(vals, "global", "ingress", "gatewayApi", "parentRefs").([]any)
+	for _, p := range parents {
+		m, _ := p.(map[string]any)
+		ref := gatewayapi.ParentRef{}
+		ref.Name, _ = m["name"].(string)
+		ref.Namespace, _ = m["namespace"].(string)
+		ref.SectionName, _ = m["sectionName"].(string)
+		refs = append(refs, ref.String())
+	}
+	return "HTTPRoutes on Gateway " + strings.Join(refs, ", ")
 }
 
 func askMirror(in *prompt.Prompter) (setup.Images, error) {

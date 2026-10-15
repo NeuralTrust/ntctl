@@ -9,6 +9,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/prompt"
 	"github.com/NeuralTrust/ntctl/internal/values"
 )
@@ -91,5 +92,64 @@ func TestAskFromEnvironment(t *testing.T) {
 	}
 	if values.Get(a.Values(), "global", "imagePullSecrets") == nil {
 		t.Error("node identity should set imagePullSecrets: [none]")
+	}
+}
+
+func stgCluster() *detect.Cluster {
+	return &detect.Cluster{Platform: "azure", GatewayAPI: true, GatewaysRead: true, Gateways: []gatewayapi.Gateway{{
+		Namespace: "kgateway-system", Name: "internal", Class: "kgateway",
+		Addresses: []gatewayapi.Address{{Type: "IPAddress", Value: "10.0.6.10"}},
+	}}}
+}
+
+func TestAskOffersGateway(t *testing.T) {
+	// No IngressClass: Enter takes the Gateway.
+	files := map[string]any{"global": map[string]any{
+		"domain": "h1.example.com", "platform": "azure", "products": map[string]any{"trustguard": true},
+		"imageRegistry": "mirror.example.com", "postgresql": map[string]any{"deploy": true}, "redis": map[string]any{"deploy": true},
+	}}
+	var out bytes.Buffer
+	o := opts{}
+	if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader("\n"), &out), &out, fake.NewSimpleClientset(), stgCluster(), &o, installFlags{}, files); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if o.gateway != "kgateway-system/internal" || !strings.Contains(out.String(), "HTTPRoutes on Gateway kgateway-system/internal (kgateway, 10.0.6.10)") {
+		t.Errorf("gateway = %q\n%s", o.gateway, out.String())
+	}
+
+	// With an IngressClass, Ingress stays the default.
+	cluster := stgCluster()
+	cluster.IngressClasses = []string{"nginx"}
+	o = opts{}
+	if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader("\n"), &out), &out, fake.NewSimpleClientset(), cluster, &o, installFlags{}, files); err != nil {
+		t.Fatal(err)
+	}
+	if o.gateway != "" {
+		t.Errorf("chose Gateway %q over an existing IngressClass by default", o.gateway)
+	}
+
+	// A provider in the files is not asked about.
+	withProvider := values.Merge(map[string]any{}, files)
+	withProvider = values.Merge(withProvider, map[string]any{"global": map[string]any{"ingress": map[string]any{"provider": "azure"}}})
+	o = opts{}
+	if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader(""), &out), &out, fake.NewSimpleClientset(), stgCluster(), &o, installFlags{}, withProvider); err != nil {
+		t.Fatalf("asked about exposure the files answer: %v", err)
+	}
+}
+
+func TestGatewayFlag(t *testing.T) {
+	o := opts{gateway: "kgateway-system/internal:https"}
+	vals, err := o.effectiveValues(values.Inputs{Platform: "azure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exposure(vals); got != "HTTPRoutes on Gateway kgateway-system/internal:https" {
+		t.Errorf("exposure = %q (values %v)", got, values.Get(vals, "global", "ingress"))
+	}
+	if _, err := (&opts{gateway: "internal"}).effectiveValues(values.Inputs{}); err == nil {
+		t.Error("accepted --gateway without a namespace")
+	}
+	if exposure(values.Generate(values.Inputs{Platform: "aws"})) != "" {
+		t.Error("an Ingress install described as HTTPRoutes")
 	}
 }

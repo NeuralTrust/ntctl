@@ -9,10 +9,15 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 )
 
 // Object is one rendered document.
 type Object map[string]any
+
+// apiVersion returns the object's apiVersion.
+func apiVersion(o Object) string { s, _ := o["apiVersion"].(string); return s }
 
 // Kind returns the object's kind.
 func (o Object) Kind() string { s, _ := o["kind"].(string); return s }
@@ -60,6 +65,11 @@ type Needs struct {
 	IngressClasses []string
 	DefaultIngress bool
 	Routes         bool
+	// HTTPRoutes is true when the release renders Gateway API HTTPRoutes;
+	// Gateways are the parents they name, with the namespace left empty when
+	// it is the release's own.
+	HTTPRoutes bool
+	Gateways   []gatewayapi.ParentRef
 	// Requested CPU (millicores) and memory (bytes), replicas included.
 	CPUMilli int64
 	Memory   int64
@@ -80,6 +90,7 @@ func Analyse(objs []Object) Needs {
 	pull := map[string]bool{}
 	storage := map[string]bool{}
 	ingress := map[string]bool{}
+	gateways := map[gatewayapi.ParentRef]bool{}
 
 	for _, o := range objs {
 		kind := o.Kind()
@@ -91,6 +102,23 @@ func Analyse(objs []Object) Needs {
 			noteClass(dig(o, "spec", "ingressClassName"), ingress, &n.DefaultIngress)
 		case kind == "Route":
 			n.Routes = true
+		case kind == "HTTPRoute" && strings.HasPrefix(apiVersion(o), gatewayapi.Group+"/"):
+			n.HTTPRoutes = true
+			for _, p := range list(dig(o, "spec", "parentRefs")) {
+				group, _ := dig(p, "group").(string)
+				pk, _ := dig(p, "kind").(string)
+				if (group != "" && group != gatewayapi.Group) || (pk != "" && pk != "Gateway") {
+					continue
+				}
+				ref := gatewayapi.ParentRef{}
+				ref.Name, _ = dig(p, "name").(string)
+				ref.Namespace, _ = dig(p, "namespace").(string)
+				ref.SectionName, _ = dig(p, "sectionName").(string)
+				if !gateways[ref] {
+					gateways[ref] = true
+					n.Gateways = append(n.Gateways, ref)
+				}
+			}
 		case workloadKinds[kind]:
 			pod := podSpec(o)
 			if pod == nil {

@@ -8,8 +8,12 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 )
 
 // Cluster describes what an install can rely on.
@@ -21,7 +25,13 @@ type Cluster struct {
 	StorageClasses      []string
 	DefaultStorageClass string
 	HasRoutes           bool
-	Nodes               int
+	// GatewayAPI is true when the cluster serves gateway.networking.k8s.io/v1.
+	GatewayAPI bool
+	// Gateways in every namespace; GatewaysRead is false when they could not
+	// be listed (no dynamic client, or no permission).
+	Gateways     []gatewayapi.Gateway
+	GatewaysRead bool
+	Nodes        int
 	// Allocatable on schedulable nodes: CPU in millicores, memory in bytes.
 	CPUMilli int64
 	Memory   int64
@@ -33,8 +43,9 @@ const (
 	betaStorageAnnotation    = "storageclass.beta.kubernetes.io/is-default-class"
 )
 
-// Inspect queries the cluster. It needs only read access.
-func Inspect(ctx context.Context, cs kubernetes.Interface) (*Cluster, error) {
+// Inspect queries the cluster. It needs only read access. dyn may be nil; the
+// Gateways are then left unread.
+func Inspect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) (*Cluster, error) {
 	c := &Cluster{}
 	v, err := cs.Discovery().ServerVersion()
 	if err != nil {
@@ -49,6 +60,18 @@ func Inspect(ctx context.Context, cs kubernetes.Interface) (*Cluster, error) {
 	for _, g := range groups.Groups {
 		if g.Name == "route.openshift.io" {
 			c.HasRoutes = true
+		}
+		if g.Name == gatewayapi.Group {
+			for _, v := range g.Versions {
+				c.GatewayAPI = c.GatewayAPI || v.Version == "v1"
+			}
+		}
+	}
+	if c.GatewayAPI && dyn != nil {
+		// A Gateway list forbidden by RBAC leaves GatewaysRead false rather
+		// than failing: the checks that need it say they could not look.
+		if gws, err := gatewayapi.ListGateways(ctx, dyn); err == nil {
+			c.Gateways, c.GatewaysRead = gws, true
 		}
 	}
 
@@ -91,6 +114,24 @@ func Inspect(ctx context.Context, cs kubernetes.Interface) (*Cluster, error) {
 	sort.Strings(c.IngressClasses)
 	sort.Strings(c.StorageClasses)
 	return c, nil
+}
+
+// NamespaceLabels returns a namespace's labels, the ones a Gateway listener's
+// allowedRoutes selector sees. A namespace that does not exist yet gets only
+// the kubernetes.io/metadata.name label the API server adds on creation.
+func NamespaceLabels(ctx context.Context, cs kubernetes.Interface, ns string) (map[string]string, error) {
+	out := map[string]string{"kubernetes.io/metadata.name": ns}
+	n, err := cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading namespace %s: %w", ns, err)
+	}
+	for k, v := range n.Labels {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // platform maps the cluster to the chart's global.platform values.

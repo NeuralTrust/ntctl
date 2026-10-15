@@ -16,12 +16,14 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	release "helm.sh/helm/v4/pkg/release/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/redact"
@@ -31,6 +33,8 @@ import (
 // Input is what the diagnosis looks at.
 type Input struct {
 	Clientset kubernetes.Interface
+	// Dynamic reads Gateway API objects; nil skips those checks.
+	Dynamic   dynamic.Interface
 	Namespace string
 	Release   string
 	// Current is the deployed release, nil when there is none.
@@ -111,9 +115,13 @@ func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 	if g, ok := in.Current.Config["global"].(map[string]any); ok {
 		platform, _ = g["platform"].(string)
 	}
+	nsLabels, err := detect.NamespaceLabels(ctx, in.Clientset, in.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	rs, err := preflight.Run(ctx, preflight.Input{
 		Mode: preflight.ForUpgrade, Release: in.Release, Namespace: in.Namespace, ReleaseExists: true,
-		Cluster: in.Cluster, Needs: manifest.Analyse(objs), Platform: platform,
+		Cluster: in.Cluster, Needs: manifest.Analyse(objs), Platform: platform, NamespaceLabels: nsLabels,
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, in.Clientset, in.Namespace, name)
 		},
@@ -262,6 +270,30 @@ func resourceFindings(ctx context.Context, in Input) ([]preflight.Result, error)
 			Message: fmt.Sprintf("%d of %d ingresses have no address yet: %s", len(pending), len(ings.Items), strings.Join(pending, ", ")),
 			Fix:     "An ingress gets its address from the ingress controller's load balancer. Check the controller is installed and its Service of type LoadBalancer got an address.",
 		})
+	}
+	if in.Dynamic != nil {
+		routes, err := gatewayapi.ListRoutes(ctx, in.Dynamic, in.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		var detail, names []string
+		for _, r := range routes {
+			problems := r.Problems()
+			for _, p := range problems {
+				detail = append(detail, r.Name+": "+p)
+			}
+			if len(problems) > 0 {
+				names = append(names, r.Name)
+			}
+		}
+		if len(names) > 0 {
+			out = append(out, preflight.Result{
+				Code: "NT-DR-023", Check: "ingress", Severity: preflight.Warn,
+				Message: fmt.Sprintf("%d of %d HTTPRoutes are not accepted by their Gateway: %s", len(names), len(routes), strings.Join(names, ", ")),
+				Detail:  detail,
+				Fix:     "The Gateway controller's reason is shown above. Check the parent Gateway exists, its listener admits this namespace, and the backend Services exist.",
+			})
+		}
 	}
 	return out, nil
 }
