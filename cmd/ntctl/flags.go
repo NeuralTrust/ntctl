@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/NeuralTrust/ntctl/internal/chart"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/kube"
 	"github.com/NeuralTrust/ntctl/internal/values"
 )
@@ -30,6 +31,7 @@ type opts struct {
 	domain     string
 	platform   string
 	products   string
+	gateway    string
 	output     string
 	// extra are values from interactive answers, layered like explicit flags.
 	extra map[string]any
@@ -53,6 +55,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
 		fs.StringVar(&o.products, "products", "", "comma-separated products: "+strings.Join(values.Products, ","))
+		fs.StringVar(&o.gateway, "gateway", "", "expose the endpoints as Gateway API HTTPRoutes on this existing Gateway, <namespace>/<name>[:<listener>], instead of Ingresses")
 	}
 	return fs
 }
@@ -113,9 +116,17 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 	if values.Get(files, "global", "domain") != nil {
 		defaults.Domain = ""
 	}
+	var gateway *gatewayapi.ParentRef
+	if o.gateway != "" {
+		ref, err := gatewayapi.ParseRef(o.gateway)
+		if err != nil {
+			return nil, err
+		}
+		gateway = &ref
+	}
 	vals := values.Generate(defaults)
 	vals = values.Merge(vals, files)
-	vals = values.Merge(vals, values.Generate(values.Inputs{Domain: o.domain, Platform: o.platform, Products: products}))
+	vals = values.Merge(vals, values.Generate(values.Inputs{Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway}))
 	if o.extra != nil {
 		vals = values.Merge(vals, copyMap(o.extra))
 	}

@@ -10,6 +10,8 @@ import (
 	"helm.sh/helm/v4/pkg/cli/values"
 	"helm.sh/helm/v4/pkg/getter"
 	"sigs.k8s.io/yaml"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 )
 
 // Products the chart knows, in the order they are reported.
@@ -32,6 +34,9 @@ type Inputs struct {
 	Domain   string
 	Platform string
 	Products []string
+	// Gateway, when set, exposes the endpoints as HTTPRoutes on that Gateway
+	// instead of Ingresses.
+	Gateway *gatewayapi.ParentRef
 }
 
 // Generate returns the values the flags stand for.
@@ -42,6 +47,16 @@ func Generate(in Inputs) map[string]any {
 	}
 	if in.Platform != "" {
 		global["platform"] = in.Platform
+	}
+	if g := in.Gateway; g != nil {
+		ref := map[string]any{"name": g.Name, "namespace": g.Namespace}
+		if g.SectionName != "" {
+			ref["sectionName"] = g.SectionName
+		}
+		global["ingress"] = map[string]any{
+			"provider":   "gateway-api",
+			"gatewayApi": map[string]any{"parentRefs": []any{ref}},
+		}
 	}
 	out := map[string]any{}
 	if len(in.Products) > 0 {

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
 )
 
@@ -59,6 +60,11 @@ type Input struct {
 	Needs         manifest.Needs
 	// Platform is the effective global.platform value.
 	Platform string
+	// IngressProvider is the effective global.ingress.provider value.
+	IngressProvider string
+	// NamespaceLabels are the release namespace's labels, which a Gateway
+	// listener's allowedRoutes selector is matched against.
+	NamespaceLabels map[string]string
 	// WillCreate lists Secrets ntctl creates during install, with their keys.
 	WillCreate map[string][]string
 	Secrets    SecretLookup
@@ -157,6 +163,15 @@ func ingress(in Input) Result {
 		r.Fix = "Use --platform with the cluster's real platform, or set the ingress resourceType to ingress."
 		return r
 	}
+	if in.Needs.HTTPRoutes {
+		return gatewayRoutes(in)
+	}
+	if in.IngressProvider == "gateway-api" && (in.Needs.DefaultIngress || len(in.Needs.IngressClasses) > 0) {
+		r.Severity = Fail
+		r.Message = "global.ingress.provider is gateway-api, but this chart version renders Ingresses: it predates Gateway API support"
+		r.Fix = "Install a chart version with Gateway API support (--version), or drop global.ingress.provider."
+		return r
+	}
 	var missing []string
 	for _, ic := range in.Needs.IngressClasses {
 		if !has(in.Cluster.IngressClasses, ic) {
@@ -175,6 +190,9 @@ func ingress(in Input) Result {
 		r.Severity = Warn
 		r.Message = "the release creates Ingresses, but the cluster has no ingress controller"
 		r.Fix = "Install an ingress controller (for example ingress-nginx) so the endpoints get an address."
+		if len(in.Cluster.Gateways) > 0 {
+			r.Fix = "Expose the endpoints through a Gateway the cluster already has (--gateway " + in.Cluster.Gateways[0].Ref() + "; available: " + gatewayList(in.Cluster.Gateways) + "), or install an ingress controller."
+		}
 	case in.Needs.DefaultIngress && in.Cluster.DefaultIngressClass == "":
 		r.Severity = Warn
 		r.Message = "Ingresses have no class and the cluster has no default IngressClass, so no controller may pick them up"
@@ -185,6 +203,107 @@ func ingress(in Input) Result {
 		r.Message = "ingress controller available"
 	}
 	return r
+}
+
+// gatewayRoutes checks that the Gateways the release's HTTPRoutes name exist
+// and let routes from the release namespace attach.
+func gatewayRoutes(in Input) Result {
+	r := Result{Code: "NT-PF-005", Check: "ingress", Severity: OK}
+	if !in.Cluster.GatewayAPI {
+		r.Severity = Fail
+		r.Message = "the values render Gateway API HTTPRoutes, but this cluster does not serve " + gatewayapi.Group + "/v1"
+		r.Fix = "Install the Gateway API CRDs and an implementation with a Gateway, or drop global.ingress.provider=gateway-api."
+		return r
+	}
+	if !in.Cluster.GatewaysRead {
+		r.Severity = Warn
+		r.Message = "could not list Gateways, so the HTTPRoutes' parents were not checked"
+		r.Fix = "Grant get/list on gateways." + gatewayapi.Group + ", or check by hand that the parent Gateways exist and admit namespace " + in.Namespace + "."
+		return r
+	}
+	labels := in.NamespaceLabels
+	var attached []string
+	for _, p := range in.Needs.Gateways {
+		ref := p.In(in.Namespace)
+		gw := findGateway(in.Cluster.Gateways, ref)
+		if gw == nil {
+			r.Severity = Fail
+			r.Detail = append(r.Detail, fmt.Sprintf("Gateway %s/%s does not exist", ref.Namespace, ref.Name))
+			continue
+		}
+		var listeners []gatewayapi.Listener
+		if ref.SectionName != "" {
+			l, ok := gw.Listener(ref.SectionName)
+			if !ok {
+				r.Severity = worse(r.Severity, Warn)
+				r.Detail = append(r.Detail, fmt.Sprintf("Gateway %s has no listener %q (it has: %s)", gw.Ref(), ref.SectionName, listenerNames(gw)))
+				continue
+			}
+			listeners = []gatewayapi.Listener{l}
+		} else {
+			listeners = gw.Listeners
+		}
+		admitted := false
+		for _, l := range listeners {
+			admitted = admitted || l.Admits(gw.Namespace, in.Namespace, labels)
+		}
+		if !admitted {
+			r.Severity = worse(r.Severity, Warn)
+			r.Detail = append(r.Detail, fmt.Sprintf("Gateway %s does not admit routes from namespace %s (allowedRoutes)", ref, in.Namespace))
+			continue
+		}
+		desc := ref.String()
+		if _, target := gw.DNS(); target != "" {
+			desc += " (" + target + ")"
+		}
+		attached = append(attached, desc)
+	}
+	switch r.Severity {
+	case Fail:
+		r.Message = "HTTPRoutes name a Gateway that does not exist"
+		r.Fix = "Set global.ingress.gatewayApi.parentRefs (or --gateway) to an existing Gateway. Available: " + gatewayList(in.Cluster.Gateways) + "."
+	case Warn:
+		r.Message = "HTTPRoutes may not attach to their Gateway"
+		r.Fix = "Point the parentRefs at a listener that admits namespace " + in.Namespace + ", or widen that listener's allowedRoutes."
+	default:
+		r.Message = "HTTPRoutes attach to Gateway " + strings.Join(attached, ", ")
+	}
+	return r
+}
+
+func findGateway(gws []gatewayapi.Gateway, ref gatewayapi.ParentRef) *gatewayapi.Gateway {
+	for i := range gws {
+		if gws[i].Namespace == ref.Namespace && gws[i].Name == ref.Name {
+			return &gws[i]
+		}
+	}
+	return nil
+}
+
+func listenerNames(g *gatewayapi.Gateway) string {
+	var names []string
+	for _, l := range g.Listeners {
+		names = append(names, l.Name)
+	}
+	return listOrNone(names)
+}
+
+func gatewayList(gws []gatewayapi.Gateway) string {
+	var refs []string
+	for _, g := range gws {
+		refs = append(refs, g.Ref())
+	}
+	return listOrNone(refs)
+}
+
+func worse(a, b Severity) Severity {
+	if a == Fail || b == Fail {
+		return Fail
+	}
+	if a == Warn || b == Warn {
+		return Warn
+	}
+	return OK
 }
 
 func secrets(ctx context.Context, in Input) ([]Result, error) {

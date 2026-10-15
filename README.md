@@ -48,6 +48,7 @@ default, so pressing Enter takes a working choice:
 |---|---|---|
 | Base domain for the endpoints | (required) | |
 | Platform | detected from the cluster | aws, gcp, azure, openshift, kubernetes |
+| How the endpoints are exposed (asked only when the cluster has a Gateway API Gateway) | Ingresses; a Gateway when the cluster has no IngressClass and is not GKE | HTTPRoutes on one of the cluster's Gateways |
 | Products | all | any of `trustgate`, `trustguard`, `dataPlane` |
 | Where images come from | the NeuralTrust registry, with your key file | your own registry: its address, and either a username and password or the nodes' own identity (ECR, Artifact Registry, ACR) |
 | PostgreSQL | run it in the cluster | your own, as a connection string `postgres://user:password@host:5432/database?sslmode=require` |
@@ -61,7 +62,8 @@ database; NeuralTrust creates its tables on first start.
 
 Then `ntctl install`:
 
-1. Checks the cluster against what this install needs: storage, ingress,
+1. Checks the cluster against what this install needs: storage, ingress (or,
+   with HTTPRoutes, that the Gateway exists and admits the namespace),
    capacity, and every Secret it reads.
 2. Shows the cluster and the choices it is about to apply, and asks for
    confirmation.
@@ -160,6 +162,11 @@ Flags for `install`, `upgrade`, `preflight` and `render`:
 
 - `-f values.yaml`: any chart value, as with `helm -f`. Repeat it to layer files.
 - `--domain`, `--platform`, `--products`.
+- `--gateway <namespace>/<name>[:<listener>]`: expose the endpoints as Gateway
+  API HTTPRoutes attached to that existing Gateway instead of Ingresses. The
+  Gateway terminates TLS, and its DNS must cover the domain's names, including
+  `*.llm.` and `*.mcp.`. Several installs can share one Gateway, each with its
+  own `--domain`.
 - `--version`: the chart version.
 - `--chart`: a local chart directory or `.tgz`, for air-gapped clusters.
 
@@ -233,6 +240,7 @@ and a fix for each finding:
 | `NT-DR-020` | A volume is not bound |
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
+| `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
 | `NT-PF-*` | The preflight checks, against what is deployed |
 
 If you need help, send NeuralTrust support a bundle:

@@ -11,6 +11,8 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi/gatewayapitest"
 )
 
 func TestCollect(t *testing.T) {
@@ -32,7 +34,7 @@ func TestCollect(t *testing.T) {
 			Spec:       networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{Host: "mcp.example.com"}}},
 		},
 	)
-	st, err := Collect(context.Background(), cs, "nt")
+	st, err := Collect(context.Background(), cs, nil, "nt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,5 +61,31 @@ func TestSchedulerReason(t *testing.T) {
 	msg := "0/1 nodes are available: 1 Insufficient memory. no new claims to deallocate, preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod."
 	if got := schedulerReason(msg); got != "Insufficient memory" {
 		t.Errorf("schedulerReason = %q", got)
+	}
+}
+
+func TestCollectHTTPRouteRecords(t *testing.T) {
+	parent := map[string]any{"name": "internal", "namespace": "gw", "sectionName": "https"}
+	dyn := gatewayapitest.Client(
+		gatewayapitest.Gateway("gw", "internal", "10.0.6.10", gatewayapitest.Listener("https", 443, map[string]any{"from": "All"})),
+		gatewayapitest.Route("nt", "agentgateway-gateway", []string{"gateway.h1.example.com", "*.llm.h1.example.com"}, []map[string]any{parent}, nil),
+		gatewayapitest.Route("nt", "orphan", []string{"lost.h1.example.com"}, []map[string]any{{"name": "missing"}}, nil),
+	)
+	st, err := Collect(context.Background(), fake.NewSimpleClientset(), dyn, "nt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Record{
+		{Host: "*.llm.h1.example.com", Type: "A", Target: "10.0.6.10"},
+		{Host: "gateway.h1.example.com", Type: "A", Target: "10.0.6.10"},
+		{Host: "lost.h1.example.com"},
+	}
+	if len(st.Records) != len(want) {
+		t.Fatalf("records = %+v", st.Records)
+	}
+	for i := range want {
+		if st.Records[i] != want[i] {
+			t.Errorf("record %d = %+v, want %+v", i, st.Records[i], want[i])
+		}
 	}
 }

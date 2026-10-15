@@ -19,6 +19,7 @@ import (
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	release "helm.sh/helm/v4/pkg/release/v1"
 
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi/gatewayapitest"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 )
 
@@ -127,5 +128,26 @@ func untar(t *testing.T, r io.Reader) map[string]string {
 			t.Fatal(err)
 		}
 		out[h.Name] = string(b)
+	}
+}
+
+func TestGatewayResources(t *testing.T) {
+	parent := map[string]any{"name": "internal", "namespace": "kgateway-system"}
+	dyn := gatewayapitest.Client(
+		gatewayapitest.Gateway("kgateway-system", "internal", "10.0.6.10", gatewayapitest.Listener("https", 443, map[string]any{"from": "All"})),
+		gatewayapitest.Route(ns, "agentgateway-gateway", []string{"gateway.example.com"}, []map[string]any{parent}, nil),
+	)
+	var buf bytes.Buffer
+	if _, err := Write(context.Background(), &buf, Input{
+		Clientset: fake.NewClientset(), Dynamic: dyn, Namespace: ns, Release: "neuraltrust-platform", Now: time.Unix(0, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	files := untar(t, &buf)
+	if !strings.Contains(files["resources/httproutes.yaml"], "gateway.example.com") {
+		t.Errorf("httproutes.yaml:\n%s", files["resources/httproutes.yaml"])
+	}
+	if !strings.Contains(files["resources/gateways.yaml"], "10.0.6.10") {
+		t.Errorf("gateways.yaml should hold the parent Gateway:\n%s", files["resources/gateways.yaml"])
 	}
 }

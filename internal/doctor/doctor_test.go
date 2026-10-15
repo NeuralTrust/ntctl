@@ -17,6 +17,7 @@ import (
 	release "helm.sh/helm/v4/pkg/release/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
+	"github.com/NeuralTrust/ntctl/internal/gatewayapi/gatewayapitest"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 )
 
@@ -210,5 +211,35 @@ func TestPullCauses(t *testing.T) {
 	}
 	if got, _ := pullCauseOf("InvalidImageName", "", p); got != "the image name is invalid" {
 		t.Errorf("InvalidImageName = %q", got)
+	}
+}
+
+func TestHTTPRouteNotAccepted(t *testing.T) {
+	parent := map[string]any{"name": "internal", "namespace": "gw"}
+	dyn := gatewayapitest.Client(
+		gatewayapitest.Route(ns, "app", []string{"app.example.com"}, []map[string]any{parent},
+			[]map[string]any{gatewayapitest.ParentStatus(parent, "Accepted", "True", "Accepted")}),
+		gatewayapitest.Route(ns, "trustguard", []string{"trustguard.example.com"}, []map[string]any{parent},
+			[]map[string]any{gatewayapitest.ParentStatus(parent, "ResolvedRefs", "False", "BackendNotFound")}),
+	)
+	rs, err := Run(context.Background(), Input{
+		Clientset: fake.NewClientset(), Dynamic: dyn, Namespace: ns, Release: "neuraltrust-platform", Current: rel(rcommon.StatusDeployed, ""),
+		Cluster: &detect.Cluster{Version: "v1.34.0", Platform: "kubernetes", Nodes: 1, StorageClasses: []string{"standard"}, DefaultStorageClass: "standard"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *preflight.Result
+	for i := range rs {
+		if rs[i].Code == "NT-DR-023" {
+			found = &rs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no NT-DR-023 for a route the Gateway refused: %+v", rs)
+	}
+	if !strings.Contains(found.Message, "1 of 2 HTTPRoutes") || !strings.Contains(found.Message, "trustguard") ||
+		len(found.Detail) != 1 || !strings.Contains(found.Detail[0], "BackendNotFound") {
+		t.Errorf("finding = %+v", found)
 	}
 }
