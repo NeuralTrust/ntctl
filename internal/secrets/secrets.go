@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/NeuralTrust/ntctl/internal/redact"
 	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
@@ -167,6 +169,76 @@ func Apply(ctx context.Context, cs kubernetes.Interface, list []*corev1.Secret, 
 		}
 	}
 	return done, nil
+}
+
+// Commands returns the kubectl commands that create the Secrets, for an
+// operator whose policy is that only they write Secrets. Values whose key
+// names a credential become <KEY> placeholders; the rest, such as a host or a
+// port, are printed as they are. The NeuralTrust registry key is read from
+// keyFile with $(cat …).
+func Commands(list []*corev1.Secret, keyFile string) string {
+	if keyFile == "" {
+		keyFile = "registry-key.json"
+	}
+	var b strings.Builder
+	for _, s := range list {
+		fmt.Fprintf(&b, "kubectl -n %s create secret ", s.Namespace)
+		if s.Type == corev1.SecretTypeDockerConfigJson {
+			server, user := registryAuth(s)
+			password := quote("<registry password>")
+			if user == "_json_key" {
+				password = `"$(cat ` + quote(keyFile) + `)"`
+			}
+			fmt.Fprintf(&b, "docker-registry %s \\\n  --docker-server=%s \\\n  --docker-username=%s \\\n  --docker-password=%s\n",
+				s.Name, quote(server), quote(user), password)
+			continue
+		}
+		b.WriteString("generic " + s.Name)
+		keys := make([]string, 0, len(s.Data))
+		for k := range s.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := string(s.Data[k])
+			if redact.SensitiveKey(k) {
+				v = "<" + k + ">"
+			}
+			fmt.Fprintf(&b, " \\\n  --from-literal=%s=%s", k, quote(v))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// registryAuth returns the server and username of a docker-registry Secret.
+func registryAuth(s *corev1.Secret) (server, user string) {
+	var cfg struct {
+		Auths map[string]struct{ Username string } `json:"auths"`
+	}
+	if json.Unmarshal(s.Data[corev1.DockerConfigJsonKey], &cfg) == nil {
+		for k, v := range cfg.Auths {
+			return k, v.Username
+		}
+	}
+	return "<registry server>", "<registry username>"
+}
+
+// quote single-quotes a value for a POSIX shell.
+func quote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// HasNamespace reports whether the namespace exists.
+func HasNamespace(ctx context.Context, cs kubernetes.Interface, ns string) (bool, error) {
+	_, err := cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading namespace %s: %w", ns, err)
+	}
+	return true, nil
 }
 
 // Namespace creates the namespace when it does not exist.

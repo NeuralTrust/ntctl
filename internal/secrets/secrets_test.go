@@ -79,3 +79,33 @@ func TestApply(t *testing.T) {
 		t.Fatalf("Keys = %v %v %v", keys, exists, err)
 	}
 }
+
+func TestCommands(t *testing.T) {
+	pull, err := Pull("nt", []byte(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirror, err := DockerRegistry("nt", PullSecret, "registry.example.com", "robot", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Commands([]*corev1.Secret{
+		pull,
+		mirror,
+		Opaque("nt", "external-redis", map[string]string{"REDIS_HOST": "redis.example.com", "REDIS_PASSWORD": "real", "REDIS_USERNAME": "it's"}),
+		Token("nt", Spec{Name: "agentgateway-config-sync", Key: "CONFIG_SYNC_TOKEN"}, ""),
+	}, "/keys/nt key.json")
+	for _, want := range []string{
+		"kubectl -n nt create secret docker-registry gcr-secret \\\n  --docker-server='europe-west1-docker.pkg.dev' \\\n  --docker-username='_json_key' \\\n  --docker-password=\"$(cat '/keys/nt key.json')\"\n",
+		"--docker-server='registry.example.com' \\\n  --docker-username='robot' \\\n  --docker-password='<registry password>'\n",
+		"kubectl -n nt create secret generic external-redis \\\n  --from-literal=REDIS_HOST='redis.example.com' \\\n  --from-literal=REDIS_PASSWORD='<REDIS_PASSWORD>' \\\n  --from-literal=REDIS_USERNAME='it'\\''s'\n",
+		"generic agentgateway-config-sync \\\n  --from-literal=CONFIG_SYNC_TOKEN='<CONFIG_SYNC_TOKEN>'\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing\n%s\nin\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "real") || strings.Contains(got, "PRIVATE KEY") {
+		t.Errorf("a credential was printed:\n%s", got)
+	}
+}

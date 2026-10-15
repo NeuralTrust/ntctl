@@ -228,7 +228,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	results, err := preflight.Run(ctx, preflight.Input{
 		Mode: mode, Release: o.release, Namespace: o.kube.Namespace, ReleaseExists: current != nil,
 		Cluster: cluster, Needs: manifest.Analyse(objs), Platform: platform, WillCreate: willCreate,
-		IngressProvider: provider, NamespaceLabels: nsLabels,
+		IngressProvider: provider, NamespaceLabels: nsLabels, IgnoreCapacity: o.ignoreCapacity,
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, cs, o.kube.Namespace, name)
 		},

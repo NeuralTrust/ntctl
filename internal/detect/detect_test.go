@@ -101,3 +101,46 @@ func TestNamespaceLabels(t *testing.T) {
 		t.Errorf("a namespace not created yet = %v, %v; want only the name label", got, err)
 	}
 }
+
+func TestInspectCountsRunningPods(t *testing.T) {
+	pod := func(ns, name, node, phase string, cpu string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+			Spec: corev1.PodSpec{NodeName: node, Containers: []corev1.Container{{Name: "c", Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse("1Gi")}}}}},
+			Status: corev1.PodStatus{Phase: corev1.PodPhase(phase)},
+		}
+	}
+	cs := fake.NewSimpleClientset(
+		node("w1", "aws:///eu-west-1a/i-1", "4", "16Gi"),
+		pod("kube-system", "ds", "w1", "Running", "250m"),
+		pod("kube-system", "dns", "w1", "Running", "100m"),
+		pod("neuraltrust", "done", "w1", "Succeeded", "2"),
+	)
+	c, err := Inspect(context.Background(), cs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.UsageRead || len(c.NodeList) != 1 {
+		t.Fatalf("usage read = %v, nodes = %d", c.UsageRead, len(c.NodeList))
+	}
+	u := c.NodeList[0].Used
+	if u["kube-system"].CPUMilli != 350 || u["kube-system"].Memory != 2<<30 {
+		t.Errorf("kube-system usage = %+v", u["kube-system"])
+	}
+	if _, ok := u["neuraltrust"]; ok {
+		t.Error("a finished pod must not count")
+	}
+}
+
+func TestInspectDetectsAutoscaler(t *testing.T) {
+	cs := fake.NewSimpleClientset(node("w1", "aws:///eu-west-1a/i-1", "4", "16Gi"))
+	if c, _ := Inspect(context.Background(), cs, nil); c.Autoscaling {
+		t.Fatal("no autoscaler here")
+	}
+	cs = fake.NewSimpleClientset(node("w1", "aws:///eu-west-1a/i-1", "4", "16Gi"),
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cluster-autoscaler-status"}})
+	if c, _ := Inspect(context.Background(), cs, nil); !c.Autoscaling {
+		t.Fatal("cluster-autoscaler-status should mark the cluster as autoscaling")
+	}
+}

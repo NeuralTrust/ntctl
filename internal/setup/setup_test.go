@@ -39,6 +39,16 @@ func TestParsePostgres(t *testing.T) {
 	}
 }
 
+func TestParsePostgresAddress(t *testing.T) {
+	pg, err := ParsePostgresAddress("postgres://nt@db.example.com/platform")
+	if err != nil || pg.User != "nt" || pg.Password != "" || pg.Database != "platform" {
+		t.Fatalf("got %+v %v", pg, err)
+	}
+	if _, err := ParsePostgresAddress("postgres://db.example.com/platform"); err == nil {
+		t.Error("accepted a connection string with no user")
+	}
+}
+
 func TestParseRedis(t *testing.T) {
 	r, err := ParseRedis("rediss://default:pw@cache.example.com:6380")
 	if err != nil {

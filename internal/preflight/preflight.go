@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
@@ -68,6 +71,9 @@ type Input struct {
 	// WillCreate lists Secrets ntctl creates during install, with their keys.
 	WillCreate map[string][]string
 	Secrets    SecretLookup
+	// IgnoreCapacity turns a capacity failure into a warning, for clusters
+	// meant to run short (a test cluster, or capacity added out of band).
+	IgnoreCapacity bool
 }
 
 // Run executes every check.
@@ -377,7 +383,154 @@ func secrets(ctx context.Context, in Input) ([]Result, error) {
 	return []Result{r}, nil
 }
 
+// capacityWarn is the share of free capacity above which requests are too
+// tight to absorb a rolling upgrade's extra pod (as in the chart's sizing guide).
+const capacityWarn = 0.85
+
 func capacity(in Input) Result {
+	if len(in.Cluster.NodeList) == 0 || len(in.Needs.Groups) == 0 {
+		return totalCapacity(in)
+	}
+	r := Result{Code: "NT-PF-008", Check: "capacity", Severity: OK}
+	free := map[string]detect.Usage{}
+	for _, n := range in.Cluster.NodeList {
+		u := detect.Usage{CPUMilli: n.CPUMilli, Memory: n.Memory}
+		for ns, used := range n.Used {
+			// On an upgrade the release's own pods are already running; they
+			// are in the requests below, so they must not count twice.
+			if ns != in.Namespace {
+				u.CPUMilli -= used.CPUMilli
+				u.Memory -= used.Memory
+			}
+		}
+		free[n.Name] = u
+	}
+
+	// Each group can use only the nodes whose taints it tolerates and whose
+	// labels match its nodeSelector. Groups with the same nodes share a pool.
+	// Pools whose nodes overlap without being equal each count the shared
+	// nodes, so the check is optimistic there; the chart's shapes keep them
+	// apart (general workloads on untainted nodes, GPU workers on the GPU pool).
+	type pool struct {
+		nodes      []string
+		label      string
+		need, room detect.Usage
+		maxPod     detect.Usage
+		// bigFree is the most room free on one node now; bigAlloc the most
+		// one node has in total, which bounds any pod whatever else runs.
+		bigFree  detect.Usage
+		bigAlloc detect.Usage
+	}
+	pools := map[string]*pool{}
+	var order []string
+	usable := map[string]bool{}
+	for _, g := range in.Needs.Groups {
+		var nodes []string
+		for _, n := range in.Cluster.NodeList {
+			if tolerates(g.Tolerations, n.Taints) && selects(g.NodeSelector, n.Labels) {
+				nodes = append(nodes, n.Name)
+				usable[n.Name] = true
+			}
+		}
+		if len(nodes) == 0 {
+			r.Severity = Fail
+			r.Message = fmt.Sprintf("no node can run %s: none matches its nodeSelector %v and tolerates the node taints", describeGroup(g), g.NodeSelector)
+			r.Fix = "Add nodes with the labels and taints these workloads expect (for GPU workers, a GPU pool), or change their nodeSelector and tolerations in your values."
+			return r
+		}
+		key := strings.Join(nodes, ",")
+		p, ok := pools[key]
+		if !ok {
+			p = &pool{nodes: nodes, label: describeGroup(g)}
+			for _, name := range nodes {
+				f := free[name]
+				p.room.CPUMilli += f.CPUMilli
+				p.room.Memory += f.Memory
+				p.bigFree.CPUMilli = max(p.bigFree.CPUMilli, f.CPUMilli)
+				p.bigFree.Memory = max(p.bigFree.Memory, f.Memory)
+			}
+			for _, n := range in.Cluster.NodeList {
+				if slices.Contains(nodes, n.Name) {
+					p.bigAlloc.CPUMilli = max(p.bigAlloc.CPUMilli, n.CPUMilli)
+					p.bigAlloc.Memory = max(p.bigAlloc.Memory, n.Memory)
+				}
+			}
+			pools[key] = p
+			order = append(order, key)
+		} else {
+			p.label = "workloads on the same nodes"
+		}
+		p.need.CPUMilli += g.CPUMilli
+		p.need.Memory += g.Memory
+		p.maxPod.CPUMilli = max(p.maxPod.CPUMilli, g.MaxPodCPUMilli)
+		p.maxPod.Memory = max(p.maxPod.Memory, g.MaxPodMemory)
+	}
+
+	worst, binding := 0.0, ""
+	for _, key := range order {
+		p := pools[key]
+		cpu, mem := ratio(p.need.CPUMilli, p.room.CPUMilli), ratio(p.need.Memory, p.room.Memory)
+		r.Detail = append(r.Detail, fmt.Sprintf("%s, on %s: needs %.1f of %.1f vCPU free (%.0f%%) and %.1f of %.1f GiB free (%.0f%%)",
+			p.label, plural(len(p.nodes), "node"), cores(p.need.CPUMilli), cores(p.room.CPUMilli), cpu*100,
+			gib(p.need.Memory), gib(p.room.Memory), mem*100))
+		if cpu > worst {
+			worst, binding = cpu, fmt.Sprintf("CPU for %s needs %.0f%% of the %.1f vCPU free on its %s", p.label, cpu*100, cores(p.room.CPUMilli), plural(len(p.nodes), "node"))
+		}
+		if mem > worst {
+			worst, binding = mem, fmt.Sprintf("memory for %s needs %.0f%% of the %.1f GiB free on its %s", p.label, mem*100, gib(p.room.Memory), plural(len(p.nodes), "node"))
+		}
+		// Larger than any node in total: no node, however empty, can take it.
+		if p.maxPod.CPUMilli > p.bigAlloc.CPUMilli || p.maxPod.Memory > p.bigAlloc.Memory {
+			r.Severity = Fail
+			r.Message = fmt.Sprintf("the largest pod of %s (%.1f vCPU, %.1f GiB) is bigger than any of its nodes (at most %.1f vCPU, %.1f GiB allocatable)",
+				p.label, cores(p.maxPod.CPUMilli), gib(p.maxPod.Memory), cores(p.bigAlloc.CPUMilli), gib(p.bigAlloc.Memory))
+			r.Fix = "Use larger nodes for this pool, or lower that workload's requests in your values."
+			return r
+		}
+		// Larger than any node's free room now: a shortfall like any other.
+		if p.maxPod.CPUMilli > p.bigFree.CPUMilli || p.maxPod.Memory > p.bigFree.Memory {
+			if worst <= 1 {
+				worst = 1.01
+				binding = fmt.Sprintf("the largest pod of %s (%.1f vCPU, %.1f GiB) fits no node's free room (at most %.1f vCPU, %.1f GiB)",
+					p.label, cores(p.maxPod.CPUMilli), gib(p.maxPod.Memory), cores(p.bigFree.CPUMilli), gib(p.bigFree.Memory))
+			}
+		}
+	}
+
+	left := len(in.Cluster.NodeList) - len(usable)
+	note := ""
+	if left > 0 {
+		note = fmt.Sprintf("; %s left out because no workload of the release can run there (taints or labels)", plural(left, "node"))
+	}
+	if !in.Cluster.UsageRead {
+		note += "; pods already running could not be read, so their requests are not subtracted"
+	}
+	switch {
+	case worst > 1 && (in.Cluster.Autoscaling || in.IgnoreCapacity):
+		why := "the cluster autoscaler should add nodes for the pods that do not fit"
+		if !in.Cluster.Autoscaling {
+			why = "--ignore-capacity was given; pods that do not fit stay Pending"
+		}
+		r.Severity = Warn
+		r.Message = "not enough room yet: " + binding + note + "; " + why
+		r.Fix = "Check the autoscaler's node pool maximum allows the extra nodes, or add nodes to that pool."
+	case worst > 1:
+		r.Severity = Fail
+		r.Message = "not enough room: " + binding + note
+		r.Fix = "Add nodes to that pool, or disable products you do not use with --products. Pods that do not fit stay Pending. On a test cluster, --ignore-capacity installs anyway."
+	case worst > capacityWarn:
+		r.Severity = Warn
+		r.Message = fmt.Sprintf("tight: %s, above the %.0f%% that leaves room for a rolling upgrade%s", binding, capacityWarn*100, note)
+		r.Fix = "Add a node to that pool, or enable cluster autoscaling with room for at least one more node."
+	default:
+		r.Message = fmt.Sprintf("fits: the tightest is %s%s", binding, note)
+	}
+	return r
+}
+
+// totalCapacity compares total requests with total allocatable, for when the
+// cluster's nodes or the release's pod groups are not known individually.
+func totalCapacity(in Input) Result {
 	r := Result{Code: "NT-PF-008", Check: "capacity", Severity: OK}
 	have := fmt.Sprintf("%.1f vCPU / %.1f GiB allocatable", float64(in.Cluster.CPUMilli)/1000, float64(in.Cluster.Memory)/(1<<30))
 	need := fmt.Sprintf("%.1f vCPU / %.1f GiB requested", float64(in.Needs.CPUMilli)/1000, float64(in.Needs.Memory)/(1<<30))
@@ -389,6 +542,94 @@ func capacity(in Input) Result {
 	}
 	return r
 }
+
+// tolerates reports whether the tolerations admit every NoSchedule and
+// NoExecute taint of a node, as the scheduler decides.
+func tolerates(tols []corev1.Toleration, taints []corev1.Taint) bool {
+	for _, t := range taints {
+		if t.Effect != corev1.TaintEffectNoSchedule && t.Effect != corev1.TaintEffectNoExecute {
+			continue
+		}
+		ok := false
+		for _, tol := range tols {
+			if tolerationMatches(tol, t) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func tolerationMatches(tol corev1.Toleration, t corev1.Taint) bool {
+	if tol.Effect != "" && tol.Effect != t.Effect {
+		return false
+	}
+	if tol.Key == "" {
+		return tol.Operator == corev1.TolerationOpExists
+	}
+	if tol.Key != t.Key {
+		return false
+	}
+	return tol.Operator == corev1.TolerationOpExists || tol.Value == t.Value
+}
+
+func selects(sel, labels map[string]string) bool {
+	for k, v := range sel {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func describeGroup(g manifest.PodGroup) string {
+	what := "workloads with no node constraints"
+	switch {
+	case len(g.NodeSelector) > 0:
+		var kv []string
+		for k, v := range g.NodeSelector {
+			kv = append(kv, k+"="+v)
+		}
+		sort.Strings(kv)
+		what = "workloads selecting " + strings.Join(kv, ",")
+	case len(g.Tolerations) > 0:
+		var ks []string
+		for _, t := range g.Tolerations {
+			if t.Key != "" {
+				ks = append(ks, t.Key)
+			}
+		}
+		what = "workloads tolerating " + strings.Join(ks, ",")
+	}
+	if len(g.Workloads) <= 2 {
+		return what + " (" + strings.Join(g.Workloads, ", ") + ")"
+	}
+	return fmt.Sprintf("%s (%s)", what, plural(len(g.Workloads), "workload"))
+}
+
+func ratio(need, room int64) float64 {
+	if room <= 0 {
+		if need > 0 {
+			return 2
+		}
+		return 0
+	}
+	return float64(need) / float64(room)
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+func cores(milli int64) float64 { return float64(milli) / 1000 }
+func gib(b int64) float64       { return float64(b) / (1 << 30) }
 
 // Print writes results as a table, or as JSON when asJSON is set.
 func Print(w io.Writer, rs []Result, asJSON bool) error {

@@ -33,6 +33,8 @@ type opts struct {
 	products   string
 	gateway    string
 	output     string
+	// ignoreCapacity turns a capacity failure into a warning.
+	ignoreCapacity bool
 	// extra are values from interactive answers, layered like explicit flags.
 	extra map[string]any
 }
@@ -55,6 +57,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
 		fs.StringVar(&o.products, "products", "", "comma-separated products: "+strings.Join(values.Products, ","))
+		fs.BoolVar(&o.ignoreCapacity, "ignore-capacity", false, "treat too little cluster capacity as a warning, for test clusters (pods that do not fit stay Pending)")
 		fs.StringVar(&o.gateway, "gateway", "", "expose the endpoints as Gateway API HTTPRoutes on this existing Gateway, <namespace>/<name>[:<listener>], instead of Ingresses")
 	}
 	return fs

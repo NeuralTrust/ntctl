@@ -15,13 +15,17 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/secrets"
 )
 
-// Secret names and keys ntctl uses for external datastores.
+// Secret names and keys for a PostgreSQL and Redis the chart does not run.
+// They are the names the chart's examples and docs use, so an install made by
+// ntctl and one made with helm look the same. Installs made by earlier ntctl
+// versions keep their ntctl-postgresql / ntctl-redis Secrets: upgrades reuse
+// the release's values and never rename them.
 //
 // #nosec G101 -- these are Secret and key names, not credentials
 const (
-	PostgresSecret = "ntctl-postgresql" // #nosec G101 -- a Secret name, not a credential
+	PostgresSecret = "external-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
-	RedisSecret    = "ntctl-redis"
+	RedisSecret    = "external-redis"
 )
 
 // Images says where the cluster pulls images from. An empty Registry means
@@ -29,8 +33,10 @@ const (
 type Images struct {
 	Registry    string
 	RegistryKey []byte
-	Username    string
-	Password    string
+	// KeyFile is the file RegistryKey was read from.
+	KeyFile  string
+	Username string
+	Password string
 	// NodeIdentity means the nodes pull with their own cloud identity (ECR,
 	// Artifact Registry, ACR) and no pull Secret is used.
 	NodeIdentity bool
@@ -164,6 +170,16 @@ var sslModes = map[string]bool{"disable": true, "allow": true, "prefer": true, "
 // The port defaults to 5432, the database to "neuraltrust" and sslmode to
 // require, since an external database is reached over the network.
 func ParsePostgres(raw string) (*Postgres, error) {
+	return parsePostgres(raw, true)
+}
+
+// ParsePostgresAddress is ParsePostgres with the password optional, for
+// --secrets-mode print, where the operator puts it in the Secret themselves.
+func ParsePostgresAddress(raw string) (*Postgres, error) {
+	return parsePostgres(raw, false)
+}
+
+func parsePostgres(raw string, needPassword bool) (*Postgres, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
 		return nil, errors.New("expected postgres://user:password@host:5432/database?sslmode=require")
@@ -177,7 +193,7 @@ func ParsePostgres(raw string) (*Postgres, error) {
 	}
 	pg.User = u.User.Username()
 	pg.Password, _ = u.User.Password()
-	if pg.Password == "" {
+	if pg.Password == "" && needPassword {
 		return nil, errors.New("the connection string has no password; IAM authentication is configured with -f values instead")
 	}
 	if p := u.Port(); p != "" {

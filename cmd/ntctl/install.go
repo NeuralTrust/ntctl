@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/api"
@@ -39,7 +40,12 @@ They are written only to Kubernetes Secrets in the install namespace.
 
 Signed in with ntctl login, the TrustGate and TrustGuard tokens come from the
 console instead: install creates a private instance for each product, or uses
-the one named with --trustgate-instance / --trustguard-instance.`
+the one named with --trustgate-instance / --trustguard-instance.
+
+With --secrets-mode print, ntctl asks and checks as usual but changes nothing:
+it saves the values and prints the kubectl commands that create the Secrets,
+with <…> placeholders for every credential. Run them yourself, then run
+install again with -f and the saved values file to install.`
 
 var platforms = []string{"aws", "gcp", "azure", "openshift", "kubernetes"}
 
@@ -50,6 +56,7 @@ type installFlags struct {
 	nodeIdentity  bool
 	saveValues    string
 	replace       bool
+	secretsMode   string
 	yes           bool
 	timeout       time.Duration
 	org           string
@@ -66,6 +73,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.BoolVar(&f.nodeIdentity, "image-registry-node-auth", false, "nodes authenticate to --image-registry with their own identity; no pull Secret")
 	fs.StringVar(&f.saveValues, "save-values", "neuraltrust-values.yaml", "write the values used, without credentials, to this file (empty to skip)")
 	fs.BoolVar(&f.replace, "replace-secrets", false, "overwrite Secrets that already exist with different content")
+	fs.StringVar(&f.secretsMode, "secrets-mode", "kubernetes", "kubernetes: create the Secrets; print: print the kubectl commands that create them, install nothing")
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
 	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
@@ -75,6 +83,14 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return err
 	}
 	f.instances[api.TrustGate], f.instances[api.TrustGuard] = gate, guard
+	switch {
+	case f.secretsMode != "kubernetes" && f.secretsMode != "print":
+		return fmt.Errorf("--secrets-mode must be kubernetes or print, not %q", f.secretsMode)
+	case f.print() && f.saveValues == "":
+		return errors.New("--secrets-mode print needs --save-values: the second run installs from that file")
+	case f.print() && f.replace:
+		return errors.New("--secrets-mode print changes no Secret; replace one yourself instead of passing --replace-secrets")
+	}
 	in := prompt.New(stdin, out, !f.yes)
 	sess, err := openSession()
 	switch {
@@ -132,6 +148,12 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 			continue
 		}
 		v := strings.TrimSpace(os.Getenv(spec.Env))
+		if f.print() {
+			// Printed as a placeholder, so neither the console nor the
+			// operator is asked for it.
+			create = append(create, secrets.Token(ns, spec, ""))
+			continue
+		}
 		if v == "" && sess != nil {
 			need[api.Product(spec.Product)] = append(need[api.Product(spec.Product)], spec)
 			willCreate[spec.Name] = append(willCreate[spec.Name], spec.Key)
@@ -178,6 +200,9 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	if preflight.Failed(p.results) {
 		return errPreflight
+	}
+	if f.print() {
+		return printSecrets(ctx, out, p.cs, ns, create, answers.Images.KeyFile, f.saveValues, p.values)
 	}
 
 	fmt.Fprintf(out, "\nReady to install chart %s %s as release %q in namespace %q\non %s.\n",
@@ -302,7 +327,7 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			}
 		}
 		if choice == 1 {
-			if a.Images, err = askMirror(in); err != nil {
+			if a.Images, err = askMirror(in, f.print()); err != nil {
 				return a, err
 			}
 			break
@@ -325,6 +350,7 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 				return a, err
 			}
 		}
+		a.Images.KeyFile = path
 		if a.Images.RegistryKey, err = os.ReadFile(path); err != nil { // #nosec G304 -- path chosen by the operator
 			return a, fmt.Errorf("reading registry key: %w", err)
 		}
@@ -341,9 +367,11 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		return a, nil
 	}
 	if !set("global", "postgresql") {
-		if a.Postgres, err = askDatastore(in, out, "PostgreSQL", "NT_POSTGRES_URL",
-			"Connection string, postgres://user:password@host:5432/database?sslmode=require",
-			setup.ParsePostgres); err != nil {
+		question, parse := "Connection string, postgres://user:password@host:5432/database?sslmode=require", setup.ParsePostgres
+		if f.print() {
+			question, parse = "Connection string, postgres://user@host:5432/database?sslmode=require (the password goes in the printed command)", setup.ParsePostgresAddress
+		}
+		if a.Postgres, err = askDatastore(in, out, "PostgreSQL", "NT_POSTGRES_URL", question, parse); err != nil {
 			return a, err
 		}
 		if a.Postgres != nil {
@@ -409,7 +437,7 @@ func exposure(vals map[string]any) string {
 	return "HTTPRoutes on Gateway " + strings.Join(refs, ", ")
 }
 
-func askMirror(in *prompt.Prompter) (setup.Images, error) {
+func askMirror(in *prompt.Prompter, print bool) (setup.Images, error) {
 	var img setup.Images
 	var err error
 	if img.Registry, err = in.Text("Registry address, with the path the images are under (e.g. registry.example.com/neuraltrust)", ""); err != nil {
@@ -428,6 +456,9 @@ func askMirror(in *prompt.Prompter) (setup.Images, error) {
 	}
 	if img.Username, err = in.Text("Registry username", ""); err != nil {
 		return img, err
+	}
+	if print {
+		return img, nil
 	}
 	img.Password, err = in.Secret("Registry password or token")
 	return img, err
@@ -490,4 +521,40 @@ func referenced(vals map[string]any, name string) bool {
 		}
 	}
 	return false
+}
+
+func (f installFlags) print() bool { return f.secretsMode == "print" }
+
+// printSecrets is the end of an install with --secrets-mode print: it saves
+// the values and prints the commands that create the Secrets still missing,
+// changing nothing in the cluster.
+func printSecrets(ctx context.Context, out io.Writer, cs kubernetes.Interface, ns string, create []*corev1.Secret, keyFile, file string, vals map[string]any) error {
+	var missing []*corev1.Secret
+	for _, s := range create {
+		keep, err := exists(ctx, cs, ns, s.Name, false)
+		if err != nil {
+			return err
+		}
+		if keep {
+			fmt.Fprintf(out, "Secret %s is already in place.\n", s.Name)
+			continue
+		}
+		missing = append(missing, s)
+	}
+	if err := values.Save(file, vals); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\nSaved the values to %s (no credentials). Nothing was changed in the cluster.\n", file)
+	if len(missing) > 0 {
+		fmt.Fprintln(out, "\nCreate these Secrets, replacing every <…> placeholder with the real value:")
+		fmt.Fprintln(out)
+		if ok, err := secrets.HasNamespace(ctx, cs, ns); err != nil {
+			return err
+		} else if !ok {
+			fmt.Fprintf(out, "kubectl create namespace %s\n", ns)
+		}
+		fmt.Fprint(out, secrets.Commands(missing, keyFile))
+	}
+	fmt.Fprintf(out, "\nThen install with:\n  ntctl install -n %s -f %s\n", ns, file)
+	return nil
 }
