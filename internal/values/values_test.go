@@ -84,3 +84,29 @@ func TestGenerateGateway(t *testing.T) {
 		t.Error("an empty sectionName must be left out, so the route attaches to every listener")
 	}
 }
+
+func TestOperationalTelemetry(t *testing.T) {
+	on, off := true, false
+	if got := Get(Generate(Inputs{OperationalTelemetry: &on}), "global", "observability", "operationalTelemetry"); got != true {
+		t.Errorf("on = %v", got)
+	}
+	if got := Get(Generate(Inputs{OperationalTelemetry: &off}), "global", "observability", "operationalTelemetry"); got != false {
+		t.Errorf("off = %v", got)
+	}
+	if _, set := OperationalTelemetry(Generate(Inputs{Domain: "d"})); set {
+		t.Error("an unset flag recorded a choice")
+	}
+	for _, c := range []struct {
+		vals map[string]any
+		want string
+	}{
+		{map[string]any{}, "off"},
+		{Generate(Inputs{OperationalTelemetry: &on}), "on, sent to NeuralTrust"},
+		{Merge(Generate(Inputs{OperationalTelemetry: &on}), map[string]any{"global": map[string]any{"deploymentMode": "external"}}), "on, sent to your in-cluster collector"},
+		{Merge(Generate(Inputs{OperationalTelemetry: &off}), map[string]any{"global": map[string]any{"deploymentMode": "hybrid"}}), "off"},
+	} {
+		if got := TelemetryState(c.vals); got != c.want {
+			t.Errorf("TelemetryState(%v) = %q, want %q", c.vals, got, c.want)
+		}
+	}
+}

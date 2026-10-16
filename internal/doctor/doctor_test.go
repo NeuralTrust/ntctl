@@ -147,6 +147,17 @@ func TestReleaseStates(t *testing.T) {
 	}
 }
 
+func TestReleaseShowsOperationalTelemetry(t *testing.T) {
+	if r := run(t, rel(rcommon.StatusDeployed, ""))["NT-DR-001"]; !strings.HasSuffix(r.Message, "; operational telemetry off") {
+		t.Errorf("message = %q", r.Message)
+	}
+	on := rel(rcommon.StatusDeployed, "")
+	on.Config = map[string]any{"global": map[string]any{"observability": map[string]any{"operationalTelemetry": true}}}
+	if r := run(t, on)["NT-DR-001"]; !strings.HasSuffix(r.Message, "; operational telemetry on, sent to NeuralTrust") || r.Severity != preflight.OK {
+		t.Errorf("message = %q (%s)", r.Message, r.Severity)
+	}
+}
+
 func TestDeployedSecretGoneMissing(t *testing.T) {
 	manifest := `apiVersion: apps/v1
 kind: Deployment

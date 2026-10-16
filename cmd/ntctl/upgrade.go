@@ -71,7 +71,17 @@ Before changing anything it shows the chart's release notes between the two
 versions and every resource that changes, rendered by the cluster in a dry
 run. Changes Kubernetes cannot apply in place (a new selector, a removed
 Secret or volume) stop the upgrade unless --allow-breaking is given. If the
-upgrade does not become ready, it is rolled back.`
+upgrade does not become ready, it is rolled back.
+
+Operational telemetry (TrustGate and TrustGuard traces and metrics: in hybrid
+installs sent to NeuralTrust, to help support diagnose your gateway; otherwise
+to your in-cluster collector) keeps the install's setting unless
+--operational-telemetry is given. To switch it while troubleshooting, change
+nothing else and stay on the installed chart:
+  ntctl upgrade --operational-telemetry=true --version <installed version>
+  ntctl upgrade --operational-telemetry=false --version <installed version>
+When the install never recorded a choice, ntctl asks once on a terminal, with
+No as the default; with --yes or without a terminal it stays off.`
 
 func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
 	var o opts
@@ -80,6 +90,21 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	f.register(fs, "upgrade")
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	in := prompt.New(stdin, out, !f.yes)
+	if o.telemetry.v == nil && in.Interactive {
+		cfg, err := o.kube.Helm(action.ConfigurationSetLogger(helm.Logger()))
+		if err != nil {
+			return err
+		}
+		// Without a release, prepare below says so.
+		if rel, err := helm.Current(cfg, o.release); err != nil {
+			return err
+		} else if rel != nil {
+			if err := o.upgradeTelemetry(in, out, rel.Config); err != nil {
+				return err
+			}
+		}
 	}
 	fmt.Fprintln(out, "Checking the cluster…")
 	p, err := o.prepare(ctx, preflight.ForUpgrade, nil)
@@ -114,7 +139,7 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return nil
 	}
 	if !f.yes {
-		if err := prompt.New(stdin, out, true).Confirm("Continue?"); err != nil {
+		if err := in.Confirm("Continue?"); err != nil {
 			return err
 		}
 	}

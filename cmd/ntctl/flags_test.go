@@ -1,8 +1,11 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/NeuralTrust/ntctl/internal/values"
@@ -48,5 +51,73 @@ func TestManagedSecretsFollowProducts(t *testing.T) {
 	}
 	if _, ok := got[values.TrustGuardEnrolment]; !ok || !referenced(vals, values.TrustGuardEnrolment) {
 		t.Error("TrustGuard enrolment Secret not planned")
+	}
+}
+
+func TestOperationalTelemetryFlag(t *testing.T) {
+	cases := []struct {
+		args []string
+		want any // nil: the values leave the choice to the chart or the release
+	}{
+		{nil, nil},
+		{[]string{"--operational-telemetry=true"}, true},
+		{[]string{"--operational-telemetry=false"}, false},
+		{[]string{"--operational-telemetry"}, true},
+	}
+	for _, c := range cases {
+		var o opts
+		if err := parse(newFlags("upgrade", "", io.Discard, &o, true), c.args); err != nil {
+			t.Fatalf("%v: %v", c.args, err)
+		}
+		vals, err := o.effectiveValues(values.Inputs{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := values.Get(vals, "global", "observability", "operationalTelemetry"); got != c.want {
+			t.Errorf("%v: operationalTelemetry = %v, want %v", c.args, got, c.want)
+		}
+	}
+	var o opts
+	if err := parse(newFlags("install", "", io.Discard, &o, true), []string{"--operational-telemetry=maybe"}); err == nil {
+		t.Error("accepted --operational-telemetry=maybe")
+	}
+}
+
+func TestInstallRecordsOperationalTelemetry(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "v.yaml")
+	if err := os.WriteFile(file, []byte("global:\n  observability:\n    operationalTelemetry: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	on, off := true, false
+	cases := []struct {
+		name string
+		o    opts
+		want bool
+	}{
+		{"unset is off", opts{}, false},
+		{"flag on", opts{telemetry: optionalBool{v: &on}}, true},
+		{"flag off", opts{telemetry: optionalBool{v: &off}}, false},
+		{"file beats the default", opts{valueFiles: stringList{file}}, true},
+		{"flag beats the file", opts{valueFiles: stringList{file}, telemetry: optionalBool{v: &off}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			vals, err := c.o.effectiveValues(installDefaults("aws"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := filepath.Join(t.TempDir(), "neuraltrust-values.yaml")
+			if err := values.Save(saved, vals); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "operationalTelemetry: " + strconv.FormatBool(c.want)
+			if !strings.Contains(string(b), want) {
+				t.Errorf("saved values do not record %q:\n%s", want, b)
+			}
+		})
 	}
 }

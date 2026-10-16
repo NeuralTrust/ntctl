@@ -28,6 +28,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/redact"
 	"github.com/NeuralTrust/ntctl/internal/secrets"
+	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
 // Input is what the diagnosis looks at.
@@ -101,6 +102,7 @@ func releaseCheck(in Input) preflight.Result {
 	default:
 		r.Severity = preflight.Warn
 	}
+	r.Message += "; operational telemetry " + values.TelemetryState(rel.Config)
 	return r
 }
 
