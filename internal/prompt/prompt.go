@@ -1,5 +1,5 @@
 // Package prompt asks install questions on a terminal: free text with a
-// default, a numbered choice, hidden input, and confirmation.
+// default, a numbered choice, yes or no, hidden input, and confirmation.
 package prompt
 
 import (
@@ -124,6 +124,34 @@ func (p *Prompter) Choose(question string, options []string, def int) (int, erro
 			return n - 1, nil
 		}
 		fmt.Fprintf(p.out, "  Enter a number from 1 to %d.\n", len(options))
+	}
+}
+
+// YesNo asks a yes/no question. Enter keeps def, which is also the answer
+// when not interactive.
+func (p *Prompter) YesNo(question string, def bool) (bool, error) {
+	if !p.Interactive {
+		return def, nil
+	}
+	hint := "y/N"
+	if def {
+		hint = "Y/n"
+	}
+	for {
+		fmt.Fprintf(p.out, "%s [%s]: ", question, hint)
+		line, err := p.line()
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(line) {
+		case "":
+			return def, nil
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		}
+		fmt.Fprintln(p.out, "  Answer y or n.")
 	}
 }
 

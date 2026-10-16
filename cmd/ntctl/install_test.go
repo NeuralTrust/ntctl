@@ -16,10 +16,12 @@ import (
 
 func TestAskInteractive(t *testing.T) {
 	// domain, platform (Enter = detected), products (Enter = all),
+	// operational telemetry (Enter = no),
 	// images: own registry, address, username/password,
 	// PostgreSQL: own + connection string, Redis: in the cluster.
 	script := strings.Join([]string{
 		"platform.example.com",
+		"",
 		"",
 		"",
 		"2",
@@ -53,6 +55,9 @@ func TestAskInteractive(t *testing.T) {
 	if a.Redis != nil {
 		t.Errorf("redis should stay in the cluster: %+v", a.Redis)
 	}
+	if o.telemetry.v == nil || *o.telemetry.v {
+		t.Errorf("operational telemetry = %v, want an explicit off from the default answer", o.telemetry.String())
+	}
 	if strings.Contains(out.String(), "pw@") || strings.Contains(out.String(), "token\n") {
 		t.Errorf("a credential was echoed:\n%s", out.String())
 	}
@@ -62,6 +67,7 @@ func TestAskSkipsWhatFilesSet(t *testing.T) {
 	files := map[string]any{"global": map[string]any{
 		"domain": "f.example.com", "platform": "gcp", "products": map[string]any{"trustguard": true},
 		"imageRegistry": "mirror.example.com", "postgresql": map[string]any{"deploy": true}, "redis": map[string]any{"deploy": true},
+		"observability": map[string]any{"operationalTelemetry": false},
 	}}
 	var out bytes.Buffer
 	// No input at all: any question would fail on EOF.
@@ -107,6 +113,7 @@ func TestAskOffersGateway(t *testing.T) {
 	files := map[string]any{"global": map[string]any{
 		"domain": "h1.example.com", "platform": "azure", "products": map[string]any{"trustguard": true},
 		"imageRegistry": "mirror.example.com", "postgresql": map[string]any{"deploy": true}, "redis": map[string]any{"deploy": true},
+		"observability": map[string]any{"operationalTelemetry": false},
 	}}
 	var out bytes.Buffer
 	o := opts{}
@@ -151,5 +158,73 @@ func TestGatewayFlag(t *testing.T) {
 	}
 	if exposure(values.Generate(values.Inputs{Platform: "aws"})) != "" {
 		t.Error("an Ingress install described as HTTPRoutes")
+	}
+}
+
+// telemetryFiles answer every install question except operational telemetry.
+func telemetryFiles(mode string) map[string]any {
+	global := map[string]any{
+		"domain": "t.example.com", "platform": "aws", "products": map[string]any{"trustgate": true},
+		"imageRegistry": "mirror.example.com", "postgresql": map[string]any{"deploy": true}, "redis": map[string]any{"deploy": true},
+	}
+	if mode != "" {
+		global["deploymentMode"] = mode
+	}
+	return map[string]any{"global": global}
+}
+
+func TestAskOperationalTelemetry(t *testing.T) {
+	cases := []struct {
+		name, mode, input string
+		want              bool
+		where             string
+	}{
+		{"hybrid by default, yes", "", "y\n", true, "to NeuralTrust, to help support diagnose your gateway"},
+		{"hybrid, Enter keeps no", "hybrid", "\n", false, "to NeuralTrust, to help support diagnose your gateway"},
+		{"external, yes", "external", "yes\n", true, "to your own in-cluster collector"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			o := opts{}
+			if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader(c.input), &out), &out,
+				fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, telemetryFiles(c.mode)); err != nil {
+				t.Fatalf("%v\n%s", err, out.String())
+			}
+			if o.telemetry.v == nil || *o.telemetry.v != c.want {
+				t.Errorf("operational telemetry = %q, want %v", o.telemetry.String(), c.want)
+			}
+			for _, s := range []string{c.where, "ntctl upgrade --operational-telemetry=true", "[y/N]"} {
+				if !strings.Contains(out.String(), s) {
+					t.Errorf("question does not say %q:\n%s", s, out.String())
+				}
+			}
+			if c.mode == "external" && strings.Contains(out.String(), "to NeuralTrust") {
+				t.Errorf("an external install was told its telemetry goes to NeuralTrust:\n%s", out.String())
+			}
+		})
+	}
+}
+
+func TestAskTelemetryNotAskedWhenSettled(t *testing.T) {
+	on := true
+	for name, o := range map[string]opts{
+		"flag": {telemetry: optionalBool{v: &on}},
+		"none": {},
+	} {
+		files := telemetryFiles("")
+		var out bytes.Buffer
+		in := prompt.Scripted(strings.NewReader(""), &out)
+		if name == "none" {
+			// Without a terminal nothing is asked and nothing is chosen, so
+			// the install default (off) applies.
+			in = prompt.New(strings.NewReader(""), &out, false)
+		}
+		if _, err := ask(context.Background(), in, &out, fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files); err != nil {
+			t.Fatalf("%s: asked anyway: %v\n%s", name, err, out.String())
+		}
+		if strings.Contains(out.String(), "Operational telemetry") {
+			t.Errorf("%s: asked about operational telemetry:\n%s", name, out.String())
+		}
 	}
 }

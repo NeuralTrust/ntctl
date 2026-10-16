@@ -50,6 +50,7 @@ default, so pressing Enter takes a working choice:
 | Platform | detected from the cluster | aws, gcp, azure, openshift, kubernetes |
 | How the endpoints are exposed (asked only when the cluster has a Gateway API Gateway) | Ingresses; a Gateway when the cluster has no IngressClass and is not GKE | HTTPRoutes on one of the cluster's Gateways |
 | Products | all | any of `trustgate`, `trustguard`, `dataPlane` |
+| [Operational telemetry](#operational-telemetry) | No | Yes: TrustGate and TrustGuard send their own traces and metrics to NeuralTrust in hybrid installs, or to your in-cluster collector otherwise |
 | Where images come from | the NeuralTrust registry, with your key file | your own registry: its address, and either a username and password or the nodes' own identity (ECR, Artifact Registry, ACR) |
 | PostgreSQL | run it in the cluster | your own, as a connection string `postgres://user:password@host:5432/database?sslmode=require` |
 | Redis | run it in the cluster | your own, as `redis://:password@host:6379`, or `rediss://` for TLS |
@@ -85,7 +86,8 @@ Then `ntctl install`:
 
 Anything you set on the command line, in a `-f` values file, or in the
 environment is not asked. `--yes` takes the defaults for the rest and skips the
-confirmation, for CI:
+confirmation, for CI. Operational telemetry then stays off unless you pass
+`--operational-telemetry=true`:
 
 ```sh
 export NT_TRUSTGATE_CONFIG_SYNC_TOKEN=...   NT_TRUSTGATE_ENROLMENT_TOKEN=...
@@ -199,6 +201,9 @@ Flags for `install`, `upgrade`, `preflight` and `render`:
   Gateway terminates TLS, and its DNS must cover the domain's names, including
   `*.llm.` and `*.mcp.`. Several installs can share one Gateway, each with its
   own `--domain`.
+- `--operational-telemetry=true|false`: turn [operational telemetry](#operational-telemetry)
+  on or off. Off by default on install; an upgrade without it keeps the
+  install's setting.
 - `--version`: the chart version.
 - `--chart`: a local chart directory or `.tgz`, for air-gapped clusters.
 - `--ignore-capacity`: install even when the cluster is too small, as on a test
@@ -251,6 +256,44 @@ An install made with plain `helm` needs no migration. `ntctl adopt` checks that
 it re-renders exactly as deployed, then writes its values, without anything that
 looks like a secret, to `neuraltrust-values.yaml`. It changes nothing in the
 cluster, and later upgrades keep the release's own values and Secret names.
+
+## Operational telemetry
+
+With operational telemetry on, TrustGate and TrustGuard export their own traces
+and metrics: server spans, and request rate, errors and latency. Where they go
+depends on the deployment mode:
+
+- **hybrid** (the default): to NeuralTrust, through the install's egress
+  collector and with its enrolment credentials.
+- **external**: to the collector in your own cluster. Nothing leaves your
+  environment.
+
+It is off unless you turn it on. We recommend turning it on in hybrid installs:
+NeuralTrust support can then see the health of your gateway and help you
+faster.
+
+`ntctl install` asks, with No as the default; `--operational-telemetry=true` or
+`=false` answers without the question. `ntctl upgrade` keeps the install's
+setting. On a terminal, an upgrade of an install that never recorded a choice
+asks once; with `--yes` or without a terminal it never turns it on.
+
+To switch it on while troubleshooting, and off again afterwards, change nothing
+else and stay on the installed chart version (`ntctl status` shows it):
+
+```sh
+ntctl upgrade --operational-telemetry=true  --version <installed version>
+ntctl upgrade --operational-telemetry=false --version <installed version>
+```
+
+With plain `helm`:
+
+```sh
+helm upgrade neuraltrust-platform <chart> -n neuraltrust --version <installed version> \
+  --reuse-values --set global.observability.operationalTelemetry=true
+```
+
+`ntctl status` and `ntctl doctor` show the current setting. The values file
+ntctl saves records it as `global.observability.operationalTelemetry`.
 
 ## When something is wrong
 

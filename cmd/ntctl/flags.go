@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/NeuralTrust/ntctl/internal/chart"
@@ -21,6 +22,29 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
+// optionalBool is a true|false flag that also records whether it was given at
+// all, so an unset flag can leave a value to the release or to a question.
+type optionalBool struct{ v *bool }
+
+func (b *optionalBool) String() string {
+	if b == nil || b.v == nil {
+		return ""
+	}
+	return strconv.FormatBool(*b.v)
+}
+
+func (b *optionalBool) Set(s string) error {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return fmt.Errorf("want true or false, not %q", s)
+	}
+	b.v = &v
+	return nil
+}
+
+// IsBoolFlag lets the bare flag mean true, as with any boolean flag.
+func (b *optionalBool) IsBoolFlag() bool { return true }
+
 // opts are the flags most commands share.
 type opts struct {
 	kube       kube.Options
@@ -33,6 +57,8 @@ type opts struct {
 	products   string
 	gateway    string
 	output     string
+	// telemetry is --operational-telemetry; unset leaves the choice open.
+	telemetry optionalBool
 	// ignoreCapacity turns a capacity failure into a warning.
 	ignoreCapacity bool
 	// extra are values from interactive answers, layered like explicit flags.
@@ -59,6 +85,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.products, "products", "", "comma-separated products: "+strings.Join(values.Products, ","))
 		fs.BoolVar(&o.ignoreCapacity, "ignore-capacity", false, "treat too little cluster capacity as a warning, for test clusters (pods that do not fit stay Pending)")
 		fs.StringVar(&o.gateway, "gateway", "", "expose the endpoints as Gateway API HTTPRoutes on this existing Gateway, <namespace>/<name>[:<listener>], instead of Ingresses")
+		fs.Var(&o.telemetry, "operational-telemetry", "true or false: TrustGate and TrustGuard export their own traces and metrics (request rate, errors, latency); in hybrid installs to NeuralTrust, to help support diagnose your gateway, otherwise to your in-cluster collector (default: off on install; upgrade keeps the install's setting)")
 	}
 	return fs
 }
@@ -129,7 +156,7 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 	}
 	vals := values.Generate(defaults)
 	vals = values.Merge(vals, files)
-	vals = values.Merge(vals, values.Generate(values.Inputs{Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway}))
+	vals = values.Merge(vals, values.Generate(values.Inputs{Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
 	if o.extra != nil {
 		vals = values.Merge(vals, copyMap(o.extra))
 	}

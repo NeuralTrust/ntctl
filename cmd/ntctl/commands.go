@@ -136,8 +136,9 @@ func runStatus(ctx context.Context, args []string, out io.Writer) error {
 	if rel == nil {
 		fmt.Fprintf(out, "No release %q in namespace %q.\n\n", o.release, o.kube.Namespace)
 	} else {
-		fmt.Fprintf(out, "Release %s: chart %s, revision %d, %s, updated %s\n\n",
+		fmt.Fprintf(out, "Release %s: chart %s, revision %d, %s, updated %s\n",
 			rel.Name, rel.Chart.Metadata.Version, rel.Version, rel.Info.Status, rel.Info.LastDeployed.Format(time.RFC3339))
+		fmt.Fprintf(out, "Operational telemetry: %s\n\n", values.TelemetryState(rel.Config))
 	}
 	st.Print(out)
 	return nil
@@ -147,10 +148,26 @@ func releaseSummary(rel *release.Release) map[string]any {
 	if rel == nil {
 		return nil
 	}
+	telemetry, _ := values.OperationalTelemetry(rel.Config)
 	return map[string]any{
 		"name": rel.Name, "chart": rel.Chart.Metadata.Version, "revision": rel.Version,
 		"status": rel.Info.Status.String(), "updated": rel.Info.LastDeployed,
+		"deploymentMode": values.DeploymentMode(rel.Config), "operationalTelemetry": telemetry,
 	}
+}
+
+// installDefaults are what an install sets when the flags, files and answers
+// leave it open: the detected platform, every product, and operational
+// telemetry off, recorded so that a later upgrade knows it was decided.
+func installDefaults(platform string) values.Inputs {
+	off := false
+	return values.Inputs{Platform: platform, Products: values.Products, OperationalTelemetry: &off}
+}
+
+// reuse layers an upgrade's values over the release's own, as Helm does with
+// --reuse-values: whatever the upgrade does not set keeps its current value.
+func reuse(current, vals map[string]any) map[string]any {
+	return values.Merge(copyMap(current), copyMap(vals))
 }
 
 // prepared is everything an install, upgrade or preflight run works from.
@@ -192,7 +209,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	}
 	var defaults values.Inputs
 	if mode == preflight.ForInstall {
-		defaults = values.Inputs{Platform: cluster.Platform, Products: values.Products}
+		defaults = installDefaults(cluster.Platform)
 	}
 	vals, err := o.effectiveValues(defaults)
 	if err != nil {
@@ -204,7 +221,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	}
 	renderVals := vals
 	if mode == preflight.ForUpgrade && current != nil {
-		renderVals = values.Merge(copyMap(current.Config), copyMap(vals))
+		renderVals = reuse(current.Config, vals)
 	}
 	if willCreate == nil && mode == preflight.ForInstall {
 		willCreate = managedSecrets(renderVals)

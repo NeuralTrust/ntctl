@@ -26,9 +26,16 @@ import (
 )
 
 const installSummary = `Install the NeuralTrust platform. On a terminal ntctl asks for anything the
-flags and -f files leave open (domain, products, where images come from, your
-own PostgreSQL or Redis), each with a default. It then checks the cluster,
-creates the Secrets, installs, waits until ready and prints the DNS records.
+flags and -f files leave open (domain, products, operational telemetry, where
+images come from, your own PostgreSQL or Redis), each with a default. It then
+checks the cluster, creates the Secrets, installs, waits until ready and prints
+the DNS records.
+
+Operational telemetry is off unless you turn it on, here or later with
+ntctl upgrade --operational-telemetry=true --version <installed version>. TrustGate and TrustGuard then
+export their own traces and metrics (request rate, errors, latency): in hybrid
+installs to NeuralTrust, to help support diagnose your gateway; otherwise to
+your in-cluster collector. We recommend it for faster support.
 
 Credentials are read from the environment, or asked for with input hidden:
   NT_TRUSTGATE_CONFIG_SYNC_TOKEN   NT_TRUSTGATE_ENROLMENT_TOKEN
@@ -130,7 +137,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
-	vals, err := o.effectiveValues(values.Inputs{Platform: cluster.Platform, Products: values.Products})
+	vals, err := o.effectiveValues(installDefaults(cluster.Platform))
 	if err != nil {
 		return err
 	}
@@ -213,6 +220,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if line := exposure(p.values); line != "" {
 		fmt.Fprintf(out, "  Endpoints:  %s\n", line)
 	}
+	fmt.Fprintf(out, "  Telemetry:  operational traces and metrics %s\n", values.TelemetryState(p.values))
 	for _, line := range answers.Summary() {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
@@ -307,6 +315,13 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			}
 			fmt.Fprintf(out, "  %v\n", err)
 		}
+	}
+	if o.telemetry.v == nil && !set("global", "observability", "operationalTelemetry") && in.Interactive {
+		on, err := askTelemetry(in, out, values.DeploymentMode(files))
+		if err != nil {
+			return a, err
+		}
+		o.telemetry.v = &on
 	}
 
 	// Images.

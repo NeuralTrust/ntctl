@@ -37,6 +37,9 @@ type Inputs struct {
 	// Gateway, when set, exposes the endpoints as HTTPRoutes on that Gateway
 	// instead of Ingresses.
 	Gateway *gatewayapi.ParentRef
+	// OperationalTelemetry, when set, turns the gateway's and TrustGuard's own
+	// traces and metrics on or off.
+	OperationalTelemetry *bool
 }
 
 // Generate returns the values the flags stand for.
@@ -57,6 +60,9 @@ func Generate(in Inputs) map[string]any {
 			"provider":   "gateway-api",
 			"gatewayApi": map[string]any{"parentRefs": []any{ref}},
 		}
+	}
+	if in.OperationalTelemetry != nil {
+		global["observability"] = map[string]any{"operationalTelemetry": *in.OperationalTelemetry}
 	}
 	out := map[string]any{}
 	if len(in.Products) > 0 {
@@ -120,6 +126,37 @@ func Get(vals map[string]any, path ...string) any {
 		cur = m[p]
 	}
 	return cur
+}
+
+// DeploymentMode returns global.deploymentMode, or the chart's default,
+// hybrid.
+func DeploymentMode(vals map[string]any) string {
+	if m, _ := Get(vals, "global", "deploymentMode").(string); m != "" {
+		return m
+	}
+	return "hybrid"
+}
+
+// OperationalTelemetry reads global.observability.operationalTelemetry. set is
+// false when the values do not record a choice, which the chart takes as off.
+func OperationalTelemetry(vals map[string]any) (on, set bool) {
+	v := Get(vals, "global", "observability", "operationalTelemetry")
+	on, _ = v.(bool)
+	return on, v != nil
+}
+
+// TelemetryState says whether operational telemetry is on and, when it is,
+// where it goes: to NeuralTrust in hybrid installs, otherwise to the
+// install's own in-cluster collector.
+func TelemetryState(vals map[string]any) string {
+	switch on, _ := OperationalTelemetry(vals); {
+	case !on:
+		return "off"
+	case DeploymentMode(vals) == "hybrid":
+		return "on, sent to NeuralTrust"
+	default:
+		return "on, sent to your in-cluster collector"
+	}
 }
 
 // Save writes the values the operator would pass to helm. They hold no

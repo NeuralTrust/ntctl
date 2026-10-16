@@ -53,3 +53,19 @@ func TestNotInteractive(t *testing.T) {
 		t.Errorf("confirm without a terminal must fail, got %v", err)
 	}
 }
+
+func TestYesNo(t *testing.T) {
+	var out bytes.Buffer
+	p := Scripted(strings.NewReader("\nY\nmaybe\nno\n"), &out)
+	for i, want := range []bool{false, true, false} {
+		if got, err := p.YesNo("Turn it on?", false); err != nil || got != want {
+			t.Errorf("answer %d = %v, %v; want %v", i, got, err, want)
+		}
+	}
+	if !strings.Contains(out.String(), "[y/N]") || !strings.Contains(out.String(), "Answer y or n.") {
+		t.Errorf("unexpected prompt output:\n%s", out.String())
+	}
+	if got, err := New(strings.NewReader("y\n"), &bytes.Buffer{}, false).YesNo("Turn it on?", false); got || err != nil {
+		t.Errorf("without a terminal the default must be taken, got %v, %v", got, err)
+	}
+}
