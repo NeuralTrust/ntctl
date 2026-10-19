@@ -82,6 +82,36 @@ Then `ntctl install`:
    credentials. Pass it to `helm` or your GitOps tool if you move away from
    `ntctl`.
 
+### Adding a product later
+
+Run `ntctl install` again. When the namespace already has the install, it
+finds that before asking anything and adds products to it instead:
+
+```sh
+ntctl install                          # asks which products to add
+ntctl install --products trustguard --yes
+```
+
+- It asks only which products to add, offering the ones not installed, and
+  then their console tokens. Domain, platform, exposure, images, PostgreSQL,
+  Redis and operational telemetry stay as the install has them.
+- It stays on the installed chart version unless you pass `--version`.
+- It checks the cluster as an upgrade does, so capacity counts only what is
+  added. It then shows every resource that changes and asks before applying.
+  If the change does not become ready, the last working revision is restored.
+- When every product you chose is already installed, it says so and changes
+  nothing, so running the same command twice is safe. Without a terminal it
+  adds only what `--products` names.
+- `--domain`, `--platform`, `--gateway` or `--image-registry` with a value that
+  differs from the install is refused rather than applied. Change those with
+  `ntctl upgrade`. A registry key is not needed, since the install keeps its
+  pull settings.
+- When `neuraltrust-values.yaml` (or `--save-values`) is still there, it is
+  updated to match.
+
+`ntctl upgrade --products` does the same without questions. See
+[Adding or removing a product](#adding-or-removing-a-product).
+
 ### Without questions
 
 Anything you set on the command line, in a `-f` values file, or in the
@@ -171,7 +201,7 @@ and everything else works as described above.
 
 | Command | What it does |
 |---|---|
-| `ntctl install` | Asks what it needs, checks the cluster, creates the Secrets, installs, and prints the DNS records |
+| `ntctl install` | Asks what it needs, checks the cluster, creates the Secrets, installs, and prints the DNS records. Run again on an existing install, it adds products |
 | `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the install's values: shows the release notes and every change first, stops on unsafe ones, rolls back if it does not become ready |
 | `ntctl rollback` | Returns an install to an earlier revision (`--to N`), showing what changes first |
 | `ntctl history` | The revisions of an install |
@@ -195,7 +225,9 @@ Flags every command accepts:
 Flags for `install`, `upgrade`, `preflight` and `render`:
 
 - `-f values.yaml`: any chart value, as with `helm -f`. Repeat it to layer files.
-- `--domain`, `--platform`, `--products`.
+- `--domain`, `--platform`, `--products`. On `upgrade`, `--products` only
+  turns products on and the others keep their state; `--remove-products`
+  turns products off. See [Adding or removing a product](#adding-or-removing-a-product).
 - `--gateway <namespace>/<name>[:<listener>]`: expose the endpoints as Gateway
   API HTTPRoutes attached to that existing Gateway instead of Ingresses. The
   Gateway terminates TLS, and its DNS must cover the domain's names, including
@@ -243,6 +275,32 @@ cannot do in place:
 Pass `--allow-breaking` only when you accept that those resources are deleted
 and recreated. If the upgrade does not become ready, the last working revision
 is restored.
+
+### Adding or removing a product
+
+```sh
+ntctl upgrade --products trustguard --version <installed version> --dry-run
+ntctl upgrade --products trustguard --version <installed version>
+```
+
+`--products` on `upgrade` turns the products it names on, and every other
+product keeps running as it is. A product that already runs is left alone, so
+naming one never removes another. `--version` keeps the installed chart; leave
+it out to upgrade the chart in the same step.
+
+The new product's token Secrets are created as `install` creates them: from
+`NT_TRUSTGUARD_CONFIG_SYNC_TOKEN` and `NT_TRUSTGUARD_ENROLMENT_TOKEN` (or the
+`NT_TRUSTGATE_*` pair), from the console when you are signed in, or asked for
+with input hidden. Secrets already in place are kept, and a dry run asks for
+nothing. If the install's values name Secrets of their own for that product,
+those names are kept and ntctl creates nothing for them.
+
+To turn a product off, name it in `--remove-products`. Its workloads are
+deleted; the upgrade lists them first and asks before applying.
+
+```sh
+ntctl upgrade --remove-products trustgate --version <installed version>
+```
 
 To go back later:
 

@@ -82,7 +82,11 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.Var(&o.valueFiles, "f", "values file, as with helm -f (repeatable; later files win)")
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
-		fs.StringVar(&o.products, "products", "", "comma-separated products: "+strings.Join(values.Products, ","))
+		productsUsage := "comma-separated products: " + strings.Join(values.Products, ",")
+		if name == "upgrade" {
+			productsUsage = "comma-separated products to turn on: " + strings.Join(values.Products, ",") + "; the others keep their state (see --remove-products)"
+		}
+		fs.StringVar(&o.products, "products", "", productsUsage)
 		fs.BoolVar(&o.ignoreCapacity, "ignore-capacity", false, "treat too little cluster capacity as a warning, for test clusters (pods that do not fit stay Pending)")
 		fs.StringVar(&o.gateway, "gateway", "", "expose the endpoints as Gateway API HTTPRoutes on this existing Gateway, <namespace>/<name>[:<listener>], instead of Ingresses")
 		fs.Var(&o.telemetry, "operational-telemetry", "true or false: TrustGate and TrustGuard export their own traces and metrics (request rate, errors, latency); in hybrid installs to NeuralTrust, to help support diagnose your gateway, otherwise to your in-cluster collector (default: off on install; upgrade keeps the install's setting)")
@@ -105,11 +109,16 @@ func parse(fs *flag.FlagSet, args []string) error {
 
 // productList validates --products.
 func (o *opts) productList() ([]string, error) {
-	if o.products == "" {
+	return parseProducts(o.products)
+}
+
+// parseProducts validates a comma-separated product list.
+func parseProducts(list string) ([]string, error) {
+	if list == "" {
 		return nil, nil
 	}
 	var out []string
-	for _, p := range strings.Split(o.products, ",") {
+	for _, p := range strings.Split(list, ",") {
 		p = strings.TrimSpace(p)
 		valid := false
 		for _, known := range values.Products {

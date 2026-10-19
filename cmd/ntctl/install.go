@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"helm.sh/helm/v4/pkg/action"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -30,6 +31,11 @@ flags and -f files leave open (domain, products, operational telemetry, where
 images come from, your own PostgreSQL or Redis), each with a default. It then
 checks the cluster, creates the Secrets, installs, waits until ready and prints
 the DNS records.
+
+When the release already exists, install adds products to it instead: it
+asks only which products to add and their tokens, keeps every other setting
+of the release and its chart version, and upgrades in place after showing
+what changes. With nothing new to add it changes nothing.
 
 Operational telemetry is off unless you turn it on, here or later with
 ntctl upgrade --operational-telemetry=true --version <installed version>. TrustGate and TrustGuard then
@@ -118,6 +124,18 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	fmt.Fprintf(out, "Cluster: %s, %s, platform %s\n\n", o.kube.Target(), cluster.Version, cluster.Platform)
 
+	// An existing release is found before anything is asked: installing
+	// again adds products to it.
+	cfg, err := o.kube.Helm(action.ConfigurationSetLogger(helm.Logger()))
+	if err != nil {
+		return err
+	}
+	if rel, err := helm.Current(cfg, o.release); err != nil {
+		return err
+	} else if rel != nil {
+		return o.addProducts(ctx, in, out, f, sess, rel)
+	}
+
 	files, err := values.Files(o.kube.Settings(), o.valueFiles)
 	if err != nil {
 		return err
@@ -142,63 +160,19 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return err
 	}
 	// Tokens come from the environment, else from the console when signed
-	// in, else from the operator.
-	need := map[api.Product][]secrets.Spec{}
-	willCreate := map[string][]string{}
-	for _, spec := range secrets.TokenSpecs(enabledProducts(vals)) {
-		if !referenced(vals, spec.Name) {
-			continue
-		}
-		if keep, err := exists(ctx, cs, ns, spec.Name, f.replace); err != nil {
-			return err
-		} else if keep {
-			continue
-		}
-		v := strings.TrimSpace(os.Getenv(spec.Env))
-		if f.print() {
-			// Printed as a placeholder, so neither the console nor the
-			// operator is asked for it.
-			create = append(create, secrets.Token(ns, spec, ""))
-			continue
-		}
-		if v == "" && sess != nil {
-			need[api.Product(spec.Product)] = append(need[api.Product(spec.Product)], spec)
-			willCreate[spec.Name] = append(willCreate[spec.Name], spec.Key)
-			continue
-		}
-		if v == "" {
-			if v, err = in.Secret(spec.Prompt + " (from the console)"); err != nil {
-				return fmt.Errorf("%w; set %s, or sign in with `ntctl login`", err, spec.Env)
-			}
-		}
-		create = append(create, secrets.Token(ns, spec, v))
+	// in, else from the operator. Printed, they are placeholders.
+	tokens, need, err := tokenSecrets(ctx, in, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
+	if err != nil {
+		return err
 	}
-	var org, orgName string
-	var consoles []*consoleInstance
-	if len(need) > 0 {
-		if org, err = sess.org(f.org); err != nil {
-			return err
-		}
-		orgName = org
-		if org == sess.cfg.OrgID && sess.cfg.OrgName != "" {
-			orgName = sess.cfg.OrgName
-		}
-		defaultName, _ := values.Get(vals, "global", "domain").(string)
-		if defaultName == "" {
-			defaultName = o.release
-		}
-		if consoles, err = chooseInstances(ctx, in, out, sess, org, need, f.instances, defaultName); err != nil {
-			return err
-		}
-	}
-	for _, s := range create {
-		for k := range s.Data {
-			willCreate[s.Name] = append(willCreate[s.Name], k)
-		}
+	create = append(create, tokens...)
+	consoles, err := planConsole(ctx, in, out, sess, f.org, need, f.instances, instanceName(vals, o.release))
+	if err != nil {
+		return err
 	}
 
 	fmt.Fprintln(out, "\nChecking the cluster against this install…")
-	p, err := o.prepare(ctx, preflight.ForInstall, willCreate)
+	p, err := o.prepare(ctx, preflight.ForInstall, plannedKeys(create, need))
 	if err != nil {
 		return err
 	}
@@ -224,9 +198,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	for _, line := range answers.Summary() {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
-	for _, c := range consoles {
-		fmt.Fprintf(out, "  %s\n", c.describe(orgName))
-	}
+	consoles.describe(out)
 	if !f.yes {
 		if err := in.Confirm("Continue?"); err != nil {
 			return err
@@ -238,13 +210,11 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	} else if created {
 		fmt.Fprintf(out, "Created namespace %s\n", ns)
 	}
-	for _, c := range consoles {
-		list, err := c.issue(ctx, out, sess, org, ns)
-		if err != nil {
-			return err
-		}
-		create = append(create, list...)
+	issued, err := consoles.issue(ctx, out, sess, ns)
+	if err != nil {
+		return err
 	}
+	create = append(create, issued...)
 	done, err := secrets.Apply(ctx, p.cs, create, f.replace)
 	for _, d := range done {
 		fmt.Fprintf(out, "Secret: %s\n", d)
@@ -269,9 +239,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return fmt.Errorf("install did not complete: %w\nThe resources were kept so you can see what failed; run `ntctl status`, fix the cause, then `ntctl upgrade`", installErr)
 	}
 	fmt.Fprintln(out)
-	for _, c := range consoles {
-		c.finalize(ctx, out, sess, org, p.values)
-	}
+	consoles.finalize(ctx, out, sess, p.values)
 	fmt.Fprintln(out, "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console.")
 	return nil
 }
@@ -436,10 +404,20 @@ func askExposure(in *prompt.Prompter, cluster *detect.Cluster, platform string) 
 // exposure describes Gateway API exposure for the install summary, or "" for
 // Ingress.
 func exposure(vals map[string]any) string {
-	if p, _ := values.Get(vals, "global", "ingress", "provider").(string); p != "gateway-api" {
+	refs := gatewayRefs(vals)
+	if refs == nil {
 		return ""
 	}
-	var refs []string
+	return "HTTPRoutes on Gateway " + strings.Join(refs, ", ")
+}
+
+// gatewayRefs are the Gateways the endpoints attach to, as
+// <namespace>/<name>[:<listener>], or nil when they are Ingresses.
+func gatewayRefs(vals map[string]any) []string {
+	if p, _ := values.Get(vals, "global", "ingress", "provider").(string); p != "gateway-api" {
+		return nil
+	}
+	refs := []string{}
 	parents, _ := values.Get(vals, "global", "ingress", "gatewayApi", "parentRefs").([]any)
 	for _, p := range parents {
 		m, _ := p.(map[string]any)
@@ -449,7 +427,7 @@ func exposure(vals map[string]any) string {
 		ref.SectionName, _ = m["sectionName"].(string)
 		refs = append(refs, ref.String())
 	}
-	return "HTTPRoutes on Gateway " + strings.Join(refs, ", ")
+	return refs
 }
 
 func askMirror(in *prompt.Prompter, print bool) (setup.Images, error) {
@@ -524,6 +502,15 @@ func index(list []string, s string) int {
 		}
 	}
 	return len(list) - 1
+}
+
+// instanceName is the name offered for a new private instance: the domain,
+// else the release name.
+func instanceName(vals map[string]any, release string) string {
+	if d, _ := values.Get(vals, "global", "domain").(string); d != "" {
+		return d
+	}
+	return release
 }
 
 // referenced reports whether the values point a product at the named Secret,
