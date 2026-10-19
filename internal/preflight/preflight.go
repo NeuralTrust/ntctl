@@ -109,7 +109,7 @@ func release(in Input) Result {
 	case in.Mode == ForInstall && in.ReleaseExists:
 		r.Severity = Fail
 		r.Message = fmt.Sprintf("release %q already exists in namespace %q", in.Release, in.Namespace)
-		r.Fix = "Use `ntctl upgrade` to change an existing install."
+		r.Fix = "`ntctl install` adds products to an existing install; use `ntctl upgrade` to change anything else, or `ntctl preflight --for upgrade` to check it."
 	case in.Mode == ForUpgrade && !in.ReleaseExists:
 		r.Severity = Fail
 		r.Message = fmt.Sprintf("no release %q in namespace %q", in.Release, in.Namespace)
@@ -365,7 +365,7 @@ func secrets(ctx context.Context, in Input) ([]Result, error) {
 	}
 	msg := fmt.Sprintf("all %d Secrets the release reads are present", len(names))
 	if planned > 0 {
-		msg = fmt.Sprintf("%d of %d Secrets the release reads are present; ntctl install creates the other %d", len(names)-planned, len(names), planned)
+		msg = fmt.Sprintf("%d of %d Secrets the release reads are present; ntctl %s creates the other %d", len(names)-planned, len(names), in.Mode, planned)
 	}
 	r := Result{Code: "NT-PF-006", Check: "secrets", Severity: OK, Message: msg}
 	if len(missing) > 0 || len(missingKeys) > 0 {
@@ -379,6 +379,9 @@ func secrets(ctx context.Context, in Input) ([]Result, error) {
 		}
 		r.Message = strings.Join(parts, "; ")
 		r.Fix = "`ntctl install` creates the registry and token Secrets from --registry-key and your console tokens. Create any other Secret your values reference in namespace " + in.Namespace + "."
+		if in.Mode == ForUpgrade {
+			r.Fix = "`ntctl upgrade --products <product>` creates the token Secrets of a product it adds, from your console tokens. Create any other Secret your values reference in namespace " + in.Namespace + "."
+		}
 	}
 	return []Result{r}, nil
 }

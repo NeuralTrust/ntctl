@@ -143,11 +143,15 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 		t.Fatal("the Helm release holds a token")
 	}
 
-	// A second install keeps the Secrets, so it asks the console for nothing.
-	ntctl(t, 3, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
+	// The same install again finds both products installed: it changes
+	// nothing and asks the console for nothing.
+	out = ntctl(t, 0, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", "")
+	if !strings.Contains(out, "nothing to do") {
+		t.Errorf("a second install with the same products did not say so:\n%s", out)
+	}
 	if got := len(srv.Issued()); got != 2 {
-		t.Fatalf("a refused second install issued tokens (%d configs)", got)
+		t.Fatalf("a second install with nothing to add issued tokens (%d configs)", got)
 	}
 }
 

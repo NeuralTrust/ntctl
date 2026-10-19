@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +15,10 @@ import (
 	"helm.sh/helm/v4/pkg/action"
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	release "helm.sh/helm/v4/pkg/release/v1"
+	corev1 "k8s.io/api/core/v1"
 
+	"github.com/NeuralTrust/ntctl/internal/api"
+	"github.com/NeuralTrust/ntctl/internal/auth"
 	"github.com/NeuralTrust/ntctl/internal/changelog"
 	"github.com/NeuralTrust/ntctl/internal/diff"
 	"github.com/NeuralTrust/ntctl/internal/helm"
@@ -23,6 +27,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/prompt"
 	"github.com/NeuralTrust/ntctl/internal/redact"
 	"github.com/NeuralTrust/ntctl/internal/report"
+	"github.com/NeuralTrust/ntctl/internal/secrets"
 	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
@@ -73,6 +78,14 @@ run. Changes Kubernetes cannot apply in place (a new selector, a removed
 Secret or volume) stop the upgrade unless --allow-breaking is given. If the
 upgrade does not become ready, it is rolled back.
 
+--products turns products on and leaves the others as they are, so naming one
+never removes another. To add one on the installed chart:
+  ntctl upgrade --products trustguard --version <installed version>
+Its token Secrets are created as install does: from NT_TRUSTGUARD_* (or
+NT_TRUSTGATE_*), from the console when signed in, or asked for with input
+hidden. Secrets already in place are kept. --remove-products turns products
+off; their workloads are deleted.
+
 Operational telemetry (TrustGate and TrustGuard traces and metrics: in hybrid
 installs sent to NeuralTrust, to help support diagnose your gateway; otherwise
 to your in-cluster collector) keeps the install's setting unless
@@ -86,36 +99,116 @@ No as the default; with --yes or without a terminal it stays off.`
 func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
 	var o opts
 	var f changeFlags
+	var remove, org, gate, guard string
 	fs := newFlags("upgrade", upgradeSummary, out, &o, true)
 	f.register(fs, "upgrade")
+	fs.StringVar(&remove, "remove-products", "", "comma-separated products to turn off; their workloads are deleted")
+	fs.StringVar(&org, "org", "", "signed in: organization ID for the tokens of an added product (default: the selected one)")
+	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to add (default: create one)")
+	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to add (default: create one)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	in := prompt.New(stdin, out, !f.yes)
-	if o.telemetry.v == nil && in.Interactive {
-		cfg, err := o.kube.Helm(action.ConfigurationSetLogger(helm.Logger()))
-		if err != nil {
-			return err
-		}
-		// Without a release, prepare below says so.
-		if rel, err := helm.Current(cfg, o.release); err != nil {
-			return err
-		} else if rel != nil {
-			if err := o.upgradeTelemetry(in, out, rel.Config); err != nil {
-				return err
-			}
-		}
-	}
-	fmt.Fprintln(out, "Checking the cluster…")
-	p, err := o.prepare(ctx, preflight.ForUpgrade, nil)
+	cfg, err := o.kube.Helm(action.ConfigurationSetLogger(helm.Logger()))
 	if err != nil {
 		return err
 	}
-	if err := preflight.Print(out, p.results, false); err != nil {
+	rel, err := helm.Current(cfg, o.release)
+	if err != nil {
 		return err
 	}
+	// Without a release, applyChange says so.
+	plan := &changePlan{consoles: &consolePlan{}}
+	if rel != nil {
+		var sess *session
+		// Only an added product needs the console.
+		if o.products != "" {
+			if sess, err = openSession(); errors.Is(err, auth.ErrNotLoggedIn) {
+				sess = nil
+			} else if err != nil {
+				return err
+			}
+		}
+		pick := map[api.Product]string{api.TrustGate: gate, api.TrustGuard: guard}
+		if plan, err = o.planChange(ctx, in, out, rel, remove, sess, org, pick, false, f.dryRun); err != nil {
+			return err
+		}
+	}
+	_, err = o.applyChange(ctx, in, out, f, plan)
+	return err
+}
+
+// changePlan is an upgrade's product change, settled before the cluster is
+// checked: what turns on and off, the token Secrets the added products need,
+// and the console instances those tokens come from.
+type changePlan struct {
+	change   productChange
+	create   []*corev1.Secret
+	need     map[api.Product][]secrets.Spec
+	sess     *session
+	consoles *consolePlan
+	// replace overwrites token Secrets that already exist (install's
+	// --replace-secrets).
+	replace bool
+}
+
+// planChange settles the product change of an upgrade of rel. Products in
+// --products are turned on and those in remove off; the others keep their
+// state. Operational telemetry is settled as upgradeTelemetry says. The added
+// products' tokens are asked for now, so the checks see their Secrets; a dry
+// run asks for none.
+func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Writer, rel *release.Release, remove string, sess *session, org string, pick map[api.Product]string, replace, dryRun bool) (*changePlan, error) {
+	if err := o.upgradeTelemetry(in, out, rel.Config); err != nil {
+		return nil, err
+	}
+	files, err := values.Files(o.kube.Settings(), o.valueFiles)
+	if err != nil {
+		return nil, err
+	}
+	base := reuse(rel.Config, files)
+	c := &changePlan{sess: sess, consoles: &consolePlan{}, replace: replace}
+	if c.change, err = o.changeProducts(base, remove); err != nil {
+		return nil, err
+	}
+	// Settled: the change goes in as values that leave the other products
+	// alone, instead of --products naming the whole set.
+	o.products = ""
+	if !c.change.empty() {
+		o.extra = values.ProductDelta(base, c.change.add, c.change.remove)
+	}
+	c.change.print(out)
+	if len(c.change.add) == 0 {
+		return c, nil
+	}
+	cs, err := o.kube.Clientset()
+	if err != nil {
+		return nil, err
+	}
+	if c.create, c.need, err = tokenSecrets(ctx, in, cs, o.kube.Namespace, sess, reuse(base, o.extra), c.change.add, replace, dryRun); err != nil {
+		return nil, err
+	}
+	if c.consoles, err = planConsole(ctx, in, out, sess, org, c.need, pick, instanceName(base, o.release)); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// applyChange checks the cluster, shows what the upgrade changes and, once
+// confirmed, creates the added products' Secrets and upgrades, rolling back
+// when it does not become ready. It returns the release's values after the
+// upgrade, or nil when nothing was applied (a dry run, or nothing to change).
+func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writer, f changeFlags, c *changePlan) (map[string]any, error) {
+	fmt.Fprintln(out, "Checking the cluster…")
+	p, err := o.prepare(ctx, preflight.ForUpgrade, plannedKeys(c.create, c.need))
+	if err != nil {
+		return nil, err
+	}
+	if err := preflight.Print(out, p.results, false); err != nil {
+		return nil, err
+	}
 	if preflight.Failed(p.results) {
-		return errPreflight
+		return nil, errPreflight
 	}
 	from, to := p.current.Chart.Metadata.Version, p.chart.Version
 	fmt.Fprintf(out, "\nUpgrade %q in namespace %q from chart %s to %s\non %s.\n", o.release, o.kube.Namespace, from, to, o.kube.Target())
@@ -125,23 +218,44 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 
 	planned, err := helm.Plan(ctx, p.cfg, p.chart.Chart, p.values, o.release, o.kube.Namespace, true)
 	if err != nil {
-		return fmt.Errorf("the cluster rejected a dry run of the upgrade: %w", err)
+		return nil, fmt.Errorf("the cluster rejected a dry run of the upgrade: %w", err)
 	}
 	res, err := compare(p.current.Manifest, planned)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if done, err := f.review(out, res); done || err != nil {
-		return err
+		return nil, err
 	}
 	if res.Empty() && from == to {
 		fmt.Fprintln(out, "\nAlready up to date; nothing to upgrade.")
-		return nil
+		return nil, nil
 	}
+	if !c.change.empty() {
+		fmt.Fprintln(out)
+	}
+	if len(c.change.add) > 0 {
+		fmt.Fprintf(out, "  Adds:     %s\n", strings.Join(c.change.add, ", "))
+	}
+	if len(c.change.remove) > 0 {
+		fmt.Fprintf(out, "  Removes:  %s\n", strings.Join(c.change.remove, ", "))
+	}
+	c.consoles.describe(out)
 	if !f.yes {
 		if err := in.Confirm("Continue?"); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	issued, err := c.consoles.issue(ctx, out, c.sess, o.kube.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	done, err := secrets.Apply(ctx, p.cs, append(c.create, issued...), c.replace)
+	for _, d := range done {
+		fmt.Fprintf(out, "Secret: %s\n", d)
+	}
+	if err != nil {
+		return nil, err
 	}
 	fmt.Fprintf(out, "Upgrading… waiting up to %s; if it does not become ready, the last working revision is restored.\n", f.timeout)
 	result, upErr := helm.Upgrade(ctx, p.cfg, p.chart, p.values, o.release, o.kube.Namespace, f.timeout)
@@ -152,14 +266,16 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	switch {
 	case upErr == nil:
 	case result.RolledBackTo > 0 && result.RollbackReady:
-		return fmt.Errorf("upgrade failed (%w) and was rolled back to revision %d, which is running again", upErr, result.RolledBackTo)
+		return nil, fmt.Errorf("upgrade failed (%w) and was rolled back to revision %d, which is running again", upErr, result.RolledBackTo)
 	case result.RolledBackTo > 0:
-		return fmt.Errorf("upgrade failed (%w); it was rolled back to revision %d, but that is not ready either. Run `ntctl doctor`", upErr, result.RolledBackTo)
+		return nil, fmt.Errorf("upgrade failed (%w); it was rolled back to revision %d, but that is not ready either. Run `ntctl doctor`", upErr, result.RolledBackTo)
 	default:
-		return fmt.Errorf("upgrade failed (%w); there was no earlier working revision to roll back to, so it was left in place. Run `ntctl doctor`, fix the cause, and upgrade again", upErr)
+		return nil, fmt.Errorf("upgrade failed (%w); there was no earlier working revision to roll back to, so it was left in place. Run `ntctl doctor`, fix the cause, and upgrade again", upErr)
 	}
+	vals := reuse(p.current.Config, p.values)
+	c.consoles.finalize(ctx, out, c.sess, vals)
 	fmt.Fprintln(out, "\nUpgraded.")
-	return nil
+	return vals, nil
 }
 
 // releaseNotes prints the chart's notes between two versions. They help but

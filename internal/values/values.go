@@ -86,9 +86,59 @@ func Generate(in Inputs) map[string]any {
 
 func tokenRefs(configSync, enrolment string) map[string]any {
 	return map[string]any{
-		"configSync": map[string]any{"existingSecret": map[string]any{"name": configSync}},
-		"dataagent":  map[string]any{"enrolment": map[string]any{"existingSecret": map[string]any{"name": enrolment}}},
+		"configSync": secretRef(configSync),
+		"dataagent":  map[string]any{"enrolment": secretRef(enrolment)},
 	}
+}
+
+func secretRef(name string) map[string]any {
+	return map[string]any{"existingSecret": map[string]any{"name": name}}
+}
+
+// ProductDelta returns the values that turn the products in add on and those
+// in remove off, leaving every other product as it is: what an upgrade applies
+// over the release's own values. An added TrustGate or TrustGuard reads ntctl's
+// token Secrets, unless current already names Secrets of its own.
+func ProductDelta(current map[string]any, add, remove []string) map[string]any {
+	out := map[string]any{}
+	if len(add) == 0 && len(remove) == 0 {
+		return out
+	}
+	products := map[string]any{}
+	for _, p := range add {
+		products[p] = true
+	}
+	for _, p := range remove {
+		products[p] = false
+	}
+	out["global"] = map[string]any{"products": products}
+	for _, p := range add {
+		var root, configSync, enrolment string
+		switch p {
+		case "trustgate":
+			root, configSync, enrolment = "agentgateway", TrustGateConfigSync, TrustGateEnrolment
+		case "trustguard":
+			root, configSync, enrolment = "trustguard", TrustGuardConfigSync, TrustGuardEnrolment
+		default:
+			continue
+		}
+		refs := map[string]any{}
+		if !named(current, root, "configSync", "existingSecret", "name") {
+			refs["configSync"] = secretRef(configSync)
+		}
+		if !named(current, root, "dataagent", "enrolment", "existingSecret", "name") {
+			refs["dataagent"] = map[string]any{"enrolment": secretRef(enrolment)}
+		}
+		if len(refs) > 0 {
+			out[root] = refs
+		}
+	}
+	return out
+}
+
+func named(vals map[string]any, path ...string) bool {
+	s, _ := Get(vals, path...).(string)
+	return s != ""
 }
 
 // Files reads values files in order, later files winning, as helm -f does.
@@ -135,6 +185,21 @@ func DeploymentMode(vals map[string]any) string {
 		return m
 	}
 	return "hybrid"
+}
+
+// Installed lists the products the chart deploys for these values, by the
+// chart's own rule: in hybrid a product is on only when its flag is true; in
+// external and saas it is on unless its flag is false.
+func Installed(vals map[string]any) []string {
+	hybrid := DeploymentMode(vals) == "hybrid"
+	var out []string
+	for _, p := range Products {
+		on, set := Get(vals, "global", "products", p).(bool)
+		if (hybrid && on) || (!hybrid && (on || !set)) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // OperationalTelemetry reads global.observability.operationalTelemetry. set is

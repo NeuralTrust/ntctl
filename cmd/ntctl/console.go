@@ -25,6 +25,62 @@ type consoleInstance struct {
 	newName string
 }
 
+// consolePlan is where the tokens the console issues for a run come from: the
+// organization and, per product, its private instance. It is empty when no
+// token comes from the console.
+type consolePlan struct {
+	org, orgName string
+	instances    []*consoleInstance
+}
+
+// planConsole settles the consolePlan for the products in need. Nothing is
+// created: that waits until the operator confirms.
+func planConsole(ctx context.Context, in *prompt.Prompter, out io.Writer, s *session, orgFlag string, need map[api.Product][]secrets.Spec, pick map[api.Product]string, defaultName string) (*consolePlan, error) {
+	c := &consolePlan{}
+	if len(need) == 0 {
+		return c, nil
+	}
+	org, err := s.org(orgFlag)
+	if err != nil {
+		return nil, err
+	}
+	c.org, c.orgName = org, org
+	if org == s.cfg.OrgID && s.cfg.OrgName != "" {
+		c.orgName = s.cfg.OrgName
+	}
+	if c.instances, err = chooseInstances(ctx, in, out, s, org, need, pick, defaultName); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// describe prints a summary line per instance.
+func (c *consolePlan) describe(out io.Writer) {
+	for _, i := range c.instances {
+		fmt.Fprintf(out, "  %s\n", i.describe(c.orgName))
+	}
+}
+
+// issue creates the new instances and returns the token Secrets to create.
+func (c *consolePlan) issue(ctx context.Context, out io.Writer, s *session, ns string) ([]*corev1.Secret, error) {
+	var list []*corev1.Secret
+	for _, i := range c.instances {
+		l, err := i.issue(ctx, out, s, c.org, ns)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, l...)
+	}
+	return list, nil
+}
+
+// finalize records each instance's endpoint in the console.
+func (c *consolePlan) finalize(ctx context.Context, out io.Writer, s *session, vals map[string]any) {
+	for _, i := range c.instances {
+		i.finalize(ctx, out, s, c.org, vals)
+	}
+}
+
 // chooseInstances settles, per product that still needs tokens, which private
 // instance they come from. Nothing is created yet: that waits until the
 // operator confirms the install.

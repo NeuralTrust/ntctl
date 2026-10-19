@@ -22,7 +22,8 @@ Usage:
   ntctl <command> [flags]
 
 Commands:
-  install     Check the cluster, create the Secrets, install, and print the DNS records to create
+  install     Check the cluster, create the Secrets, install, and print the DNS records to create;
+              on an existing install, add products to it
   upgrade     Upgrade an existing install, keeping its values: shows release notes and every
               change first, stops on unsafe ones, rolls back if it does not become ready
   rollback    Return an install to an earlier revision, showing what changes first
