@@ -30,7 +30,9 @@ func TestAddProductsStopsBeforeAnyToken(t *testing.T) {
 	pinned := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"controlPlane": map[string]any{"configSyncAddr": "lb.example.com:443"}}})
 	exposed := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"ingress": map[string]any{
 		"provider": "gateway-api", "gatewayApi": map[string]any{"parentRefs": []any{map[string]any{"name": "internal", "namespace": "gw"}}}}}})
-	noTerminal := func(w io.Writer) *prompt.Prompter { return prompt.New(strings.NewReader(""), w, false) }
+	noTerminal := func(w io.Writer) *prompt.Prompter {
+		return prompt.New(context.Background(), strings.NewReader(""), w, false)
+	}
 	terminal := func(input string) func(io.Writer) *prompt.Prompter {
 		return func(w io.Writer) *prompt.Prompter { return prompt.Scripted(strings.NewReader(input), w) }
 	}

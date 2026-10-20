@@ -4,6 +4,7 @@ package prompt
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +18,15 @@ import (
 // ErrNoTerminal is returned when an answer is needed and nobody can type it.
 var ErrNoTerminal = errors.New("input needed but no terminal is attached")
 
+// ErrInterrupted is returned when the operator interrupts a question (Ctrl+C).
+var ErrInterrupted = errors.New("interrupted")
+
 // Prompter reads answers from a terminal.
 type Prompter struct {
+	// ctx ends a question waiting for input: the command's context, cancelled
+	// by Ctrl+C. Reading stdin cannot be interrupted, so each read runs on its
+	// own goroutine and the question returns ErrInterrupted without it.
+	ctx context.Context
 	in  *bufio.Reader
 	out io.Writer
 	fd  int
@@ -29,9 +37,10 @@ type Prompter struct {
 }
 
 // New returns a prompter on stdin/out. Questions are asked only when stdin is
-// a terminal and ask is true.
-func New(stdin io.Reader, out io.Writer, ask bool) *Prompter {
-	p := &Prompter{in: bufio.NewReader(stdin), out: out}
+// a terminal and ask is true. Cancelling ctx ends a question waiting for
+// input with ErrInterrupted.
+func New(ctx context.Context, stdin io.Reader, out io.Writer, ask bool) *Prompter {
+	p := &Prompter{ctx: ctx, in: bufio.NewReader(stdin), out: out}
 	if f, ok := stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		p.fd, p.tty = int(f.Fd()), true
 	}
@@ -41,7 +50,7 @@ func New(stdin io.Reader, out io.Writer, ask bool) *Prompter {
 
 // Scripted returns a prompter that answers from r as if typed, for tests.
 func Scripted(r io.Reader, out io.Writer) *Prompter {
-	return &Prompter{in: bufio.NewReader(r), out: out, Interactive: true}
+	return &Prompter{ctx: context.Background(), in: bufio.NewReader(r), out: out, Interactive: true}
 }
 
 // Text asks for a line. Enter keeps def; with no def an answer is required.
@@ -81,7 +90,7 @@ func (p *Prompter) Secret(question string) (string, error) {
 		fmt.Fprintf(p.out, "%s (input hidden): ", question)
 		var line string
 		if p.tty {
-			b, err := term.ReadPassword(p.fd)
+			b, err := p.readPassword()
 			fmt.Fprintln(p.out)
 			if err != nil {
 				return "", err
@@ -173,10 +182,53 @@ func (p *Prompter) Confirm(question string) error {
 }
 
 func (p *Prompter) line() (string, error) {
-	s, err := p.in.ReadString('\n')
+	s, err := await(p.ctx, func() (string, error) { return p.in.ReadString('\n') })
+	if errors.Is(err, ErrInterrupted) {
+		return "", err
+	}
 	// A last line without a newline still counts as an answer.
 	if err != nil && (!errors.Is(err, io.EOF) || s == "") {
 		return "", err
 	}
 	return strings.TrimSpace(s), nil
+}
+
+// readPassword reads a line with echo off. ReadPassword turns echo back on
+// only when it returns, which it does not when interrupted, so the terminal
+// state is restored here first: the shell would otherwise be left without echo.
+func (p *Prompter) readPassword() ([]byte, error) {
+	state, stateErr := term.GetState(p.fd)
+	b, err := await(p.ctx, func() ([]byte, error) { return term.ReadPassword(p.fd) })
+	if errors.Is(err, ErrInterrupted) && stateErr == nil {
+		_ = term.Restore(p.fd, state) // best effort: the run is ending anyway
+	}
+	return b, err
+}
+
+// await runs a blocking read on its own goroutine and returns its result, or
+// ErrInterrupted once ctx is cancelled. An interrupted read stays blocked on
+// stdin; the command is ending, so it is left to the process exit.
+func await[T any](ctx context.Context, read func() (T, error)) (T, error) {
+	var zero T
+	if ctx == nil {
+		return read()
+	}
+	if ctx.Err() != nil {
+		return zero, ErrInterrupted
+	}
+	type result struct {
+		v   T
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := read()
+		done <- result{v, err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-ctx.Done():
+		return zero, ErrInterrupted
+	}
 }

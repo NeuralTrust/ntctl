@@ -104,7 +104,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	case f.print() && f.replace:
 		return errors.New("--secrets-mode print changes no Secret; replace one yourself instead of passing --replace-secrets")
 	}
-	in := prompt.New(stdin, out, !f.yes)
+	in := prompt.New(ctx, stdin, out, !f.yes)
 	sess, err := openSession()
 	switch {
 	case errors.Is(err, auth.ErrNotLoggedIn):
