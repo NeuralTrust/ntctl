@@ -11,16 +11,16 @@ import (
 
 func TestParseRef(t *testing.T) {
 	for in, want := range map[string]gatewayapi.ParentRef{
-		"kgateway-system/internal":       {Namespace: "kgateway-system", Name: "internal"},
-		"kgateway-system/internal:https": {Namespace: "kgateway-system", Name: "internal", SectionName: "https"},
-		" gw/edge ":                      {Namespace: "gw", Name: "edge"},
+		"gateway-system/shared":       {Namespace: "gateway-system", Name: "shared"},
+		"gateway-system/shared:https": {Namespace: "gateway-system", Name: "shared", SectionName: "https"},
+		" gw/edge ":                   {Namespace: "gw", Name: "edge"},
 	} {
 		got, err := gatewayapi.ParseRef(in)
 		if err != nil || got != want {
 			t.Errorf("ParseRef(%q) = %+v, %v; want %+v", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", "internal", "/internal", "gw/", "gw/internal:", "a/b/c"} {
+	for _, bad := range []string{"", "shared", "/shared", "gw/", "gw/shared:", "a/b/c"} {
 		if _, err := gatewayapi.ParseRef(bad); err == nil {
 			t.Errorf("ParseRef(%q) accepted", bad)
 		}
@@ -29,7 +29,7 @@ func TestParseRef(t *testing.T) {
 
 func TestListGateways(t *testing.T) {
 	dyn := gatewayapitest.Client(
-		gatewayapitest.Gateway("gw", "internal", "10.0.6.10",
+		gatewayapitest.Gateway("gw", "shared", "192.0.2.10",
 			gatewayapitest.Listener("http", 80, map[string]any{"from": "All"}),
 			gatewayapitest.Listener("https", 443, nil),
 			gatewayapitest.Listener("team", 8443, map[string]any{"from": "Selector", "selector": map[string]any{
@@ -41,11 +41,11 @@ func TestListGateways(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gws) != 1 || gws[0].Ref() != "gw/internal" {
+	if len(gws) != 1 || gws[0].Ref() != "gw/shared" {
 		t.Fatalf("gateways = %+v", gws)
 	}
 	g := gws[0]
-	if typ, target := g.DNS(); typ != "A" || target != "10.0.6.10" {
+	if typ, target := g.DNS(); typ != "A" || target != "192.0.2.10" {
 		t.Errorf("DNS() = %s %s", typ, target)
 	}
 	all, _ := g.Listener("http")
@@ -73,7 +73,7 @@ func TestGetGatewayMissing(t *testing.T) {
 }
 
 func TestListRoutes(t *testing.T) {
-	parent := map[string]any{"name": "internal", "namespace": "gw", "sectionName": "https"}
+	parent := map[string]any{"name": "shared", "namespace": "gw", "sectionName": "https"}
 	local := map[string]any{"name": "local"}
 	dyn := gatewayapitest.Client(
 		gatewayapitest.Route("nt", "ok", []string{"app.example.com"}, []map[string]any{parent},
@@ -101,7 +101,7 @@ func TestListRoutes(t *testing.T) {
 		t.Errorf("accepted route has problems: %v", got)
 	}
 	got := byName["refused"].Problems()
-	if len(got) != 1 || !strings.Contains(got[0], "gw/internal:https: Accepted=False NotAllowedByListeners") {
+	if len(got) != 1 || !strings.Contains(got[0], "gw/shared:https: Accepted=False NotAllowedByListeners") {
 		t.Errorf("refused route problems = %v", got)
 	}
 	if got := byName["orphan"].Problems(); len(got) != 1 || !strings.Contains(got[0], "no Gateway controller") {

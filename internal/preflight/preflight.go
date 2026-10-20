@@ -90,7 +90,52 @@ func Run(ctx context.Context, in Input) ([]Result, error) {
 	}
 	rs = append(rs, secretResults...)
 	rs = append(rs, capacity(in))
+	if r, ok := exposure(in); ok {
+		rs = append(rs, r)
+	}
 	return rs, nil
+}
+
+// internalLB are, per platform, the Service annotations that keep a
+// LoadBalancer's address private, with the value that does.
+var internalLB = map[string]map[string]string{
+	"aws":   {"service.beta.kubernetes.io/aws-load-balancer-scheme": "internal", "service.beta.kubernetes.io/aws-load-balancer-internal": "true"},
+	"azure": {"service.beta.kubernetes.io/azure-load-balancer-internal": "true"},
+	"gcp":   {"networking.gke.io/load-balancer-type": "Internal", "cloud.google.com/load-balancer-type": "Internal"},
+}
+
+// exposure warns about LoadBalancer Services the cloud will give a public
+// address, on the clouds whose annotations say so. A central control plane
+// renders them for DataBridge and config sync; data planes that reach it
+// over the internet need exactly that, and private ones do not.
+func exposure(in Input) (Result, bool) {
+	known, ok := internalLB[strings.ToLower(in.Platform)]
+	if !ok || len(in.Needs.LoadBalancers) == 0 {
+		return Result{}, false
+	}
+	var public []string
+	for _, lb := range in.Needs.LoadBalancers {
+		private := false
+		for k, want := range known {
+			if strings.EqualFold(strings.TrimSpace(lb.Annotations[k]), want) {
+				private = true
+			}
+		}
+		if !private {
+			public = append(public, lb.Name)
+		}
+	}
+	r := Result{Code: "NT-PF-009", Check: "exposure", Severity: OK,
+		Message: fmt.Sprintf("%d LoadBalancer Services get private addresses", len(in.Needs.LoadBalancers))}
+	if len(public) == 0 {
+		return r, true
+	}
+	sort.Strings(public)
+	r.Severity = Warn
+	r.Message = fmt.Sprintf("%d LoadBalancer Services get a public address on %s: %s", len(public), in.Platform, strings.Join(public, ", "))
+	r.Fix = "Expected when data planes reach this install over the internet. If they reach it privately, keep the address private: on AWS set global.controlPlane.loadBalancerScheme: internal; " +
+		"on Azure annotate the Services with service.beta.kubernetes.io/azure-load-balancer-internal: \"true\", on GKE with networking.gke.io/load-balancer-type: Internal, in your values."
+	return r, true
 }
 
 // Failed reports whether any result is a failure.

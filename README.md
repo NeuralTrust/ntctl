@@ -79,7 +79,13 @@ Then `ntctl install`:
 2. Shows the cluster and the choices it is about to apply, and asks for
    confirmation.
 3. Creates the Secrets, installs the chart, waits until every workload is
-   ready, and prints the DNS records to create.
+   ready, and prints the DNS records to create. While it waits it says what is
+   ready and what it still waits for. A failure that waiting does not fix (an
+   image that cannot be pulled, a missing Secret, a crash loop, a config-sync
+   token another control plane issued) stops the wait once it has lasted four
+   minutes, instead of running to the timeout; `--stop-early=false` waits the
+   full `--timeout`. When an install or upgrade does not become ready, what
+   `ntctl doctor` finds wrong is printed with it.
 4. Writes the values it used to `neuraltrust-values.yaml`. The file holds no
    credentials. Pass it to `helm` or your GitOps tool if you move away from
    `ntctl`.
@@ -207,6 +213,8 @@ They are valid only at the control plane of the console that issued them, so
 the data plane dials that one: a console other than a region's (a dev or
 self-hosted console) points the install at its own control plane
 (`global.controlPlane.domain`), and the summary shows it as `Connects:`.
+A token Secret already in the namespace, say from an earlier install, is kept
+and reported; `--replace-secrets` takes new tokens from the console instead.
 The sign-in is saved in `~/.config/ntctl/credentials.json`, which only you can
 read. It is renewed as needed until it expires or you run `ntctl logout`. Tokens
 in the environment still take precedence.
@@ -247,12 +255,12 @@ one. The mode of an install cannot change in place.
 | `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
 | `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`) |
 | `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values |
-| `ntctl version` | The `ntctl` version and the latest chart version |
+| `ntctl version` | The `ntctl` version, the latest chart version, and whether a newer `ntctl` is out |
 | `ntctl login` / `logout` | Sign in to the console in the browser, or sign out and end the session |
 | `ntctl auth status` | Who is signed in, to which console, and the selected organization |
 | `ntctl orgs list` | The organizations you belong to |
 | `ntctl config get` / `set org` / `set region` | Show or change the organization and region |
-| `ntctl trustgate list` / `create <name>` | The organization's private TrustGate instances (`trustguard` for TrustGuard) |
+| `ntctl trustgate list` / `create <name>` | The organization's private TrustGate instances (`trustguard` for TrustGuard); a name already taken is refused |
 
 Flags every command accepts:
 
@@ -272,6 +280,13 @@ Flags for `install`, `upgrade`, `preflight` and `render`:
 - `--operational-telemetry=true|false`: turn [operational telemetry](#operational-telemetry)
   on or off. Off by default on install; an upgrade without it keeps the
   install's setting.
+- `--mode hybrid|external|saas`: where the control plane runs; see
+  [Deployment modes](#deployment-modes).
+- `--control-plane <domain>`: hybrid only. The control plane the data plane
+  dials (`global.controlPlane.domain`), when it is not NeuralTrust's for the
+  region: a self-hosted central control plane, or the one of the console your
+  tokens come from. Tokens are valid only at the control plane whose console
+  issued them; signed in, install sets this for you.
 - `--version`: the chart version.
 - `--chart`: a local chart directory or `.tgz`, for air-gapped clusters.
 - `--ignore-capacity`: install even when the cluster is too small, as on a test
@@ -419,7 +434,7 @@ and a fix for each finding:
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
 | `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
-| `NT-PF-*` | The preflight checks, against what is deployed |
+| `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP |
 
 If you need help, send NeuralTrust support a bundle:
 

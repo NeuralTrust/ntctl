@@ -185,6 +185,11 @@ func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Write
 		o.extra = values.ProductDelta(base, c.change.add, c.change.remove)
 	}
 	c.change.print(out)
+	// The chart sends a hybrid install's telemetry through one DataAgent,
+	// TrustGate's when it runs: adding it changes TrustGuard's too.
+	if values.DeploymentMode(base) == "hybrid" && has(c.change.add, "trustgate") && has(values.Installed(base), "trustguard") {
+		fmt.Fprintln(out, "TrustGate's DataAgent takes over sending this install's telemetry from TrustGuard's, so TrustGuard's DataAgent changes too; the list of changes below shows it.")
+	}
 	if len(c.change.add) == 0 {
 		return c, nil
 	}
@@ -192,7 +197,7 @@ func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Write
 	if err != nil {
 		return nil, err
 	}
-	if c.create, c.need, err = tokenSecrets(ctx, in, cs, o.kube.Namespace, sess, reuse(base, o.extra), c.change.add, replace, dryRun); err != nil {
+	if c.create, c.need, err = tokenSecrets(ctx, in, out, cs, o.kube.Namespace, sess, reuse(base, o.extra), c.change.add, replace, dryRun); err != nil {
 		return nil, err
 	}
 	if c.consoles, err = planConsole(ctx, in, out, sess, org, c.need, pick, instanceName(base, o.release)); err != nil {
@@ -200,7 +205,11 @@ func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Write
 	}
 	// The release keeps the control plane it dials; tokens from a console
 	// of another one would never be accepted.
-	if _, err := pointAtConsole(reuse(base, o.extra), c.consoles.controlPlane, false); err != nil {
+	target := reuse(base, o.extra)
+	if o.controlPlane != "" {
+		target = values.Merge(target, values.ControlPlaneValues(o.controlPlane))
+	}
+	if _, err := pointAtConsole(target, c.consoles.controlPlane, false); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -291,10 +300,17 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	} else {
 		fmt.Fprintf(out, "Upgrading… waiting up to %s. No revision has worked yet, so if this one does not become ready it is left in place for `ntctl doctor`.\n", f.timeout)
 	}
+	// Progress only: stopping an upgrade's wait would also cut short the
+	// rollback Helm runs when it fails.
+	w := waitWatch{cs: p.cs, cluster: p.cluster, ns: o.kube.Namespace, release: o.release, out: out, every: watchEvery}.start(ctx)
 	result, upErr := helm.Upgrade(ctx, p.cfg, p.chart, p.values, o.release, o.kube.Namespace, f.timeout)
+	w.finish()
 	if st, err := report.Collect(ctx, p.cs, p.dyn, o.kube.Namespace); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
+	}
+	if upErr != nil {
+		o.printFailures(ctx, out)
 	}
 	switch {
 	case upErr == nil:

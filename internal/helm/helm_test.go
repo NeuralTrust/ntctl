@@ -56,7 +56,7 @@ func tinyChart() *chart.Loaded {
 func TestUpgradeRollsBackToTheLastWorkingRevision(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	f.notReady(true)
@@ -81,7 +81,7 @@ func TestUpgradeWithNothingToRollBackTo(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
 	f.notReady(true)
-	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute); !errors.Is(err, ErrNotReady) {
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("install err = %v, want ErrNotReady", err)
 	}
 	res, err := Upgrade(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute)
@@ -98,7 +98,7 @@ func TestUpgradeWithNothingToRollBackTo(t *testing.T) {
 func TestUpgradeRollbackSeenPastMaxHistory(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "0"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "0"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 12; i++ {
@@ -121,7 +121,7 @@ func TestUninstallRemovesTheReleaseAndItsHistory(t *testing.T) {
 	f := newFakeCluster()
 	f.notReady(true)
 	// A release that never became ready uninstalls like any other.
-	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute); !errors.Is(err, ErrNotReady) {
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("install err = %v", err)
 	}
 	f.notReady(false)
@@ -131,7 +131,7 @@ func TestUninstallRemovesTheReleaseAndItsHistory(t *testing.T) {
 	if cur, err := Current(f.cfg, "rel"); err != nil || cur != nil {
 		t.Fatalf("after uninstall: %v, %v; want no release", cur, err)
 	}
-	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatalf("the name should be free again: %v", err)
 	}
 }
@@ -152,7 +152,7 @@ func TestLastWorking(t *testing.T) {
 func TestUpgradeKeepsValues(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1", "keep": "me"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1", "keep": "me"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "2"}, "rel", "ns", time.Minute); err != nil {
@@ -167,7 +167,7 @@ func TestUpgradeKeepsValues(t *testing.T) {
 func TestRollbackRestoresAnEarlierRevision(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "2"}, "rel", "ns", time.Minute); err != nil {
@@ -183,5 +183,22 @@ func TestRollbackRestoresAnEarlierRevision(t *testing.T) {
 	hist, err := History(f.cfg, "rel")
 	if err != nil || len(hist) != 3 {
 		t.Fatalf("history = %d revisions, %v", len(hist), err)
+	}
+}
+
+// TestInstallStoppedEarlyIsFailedNotPending: stopping the wait must leave a
+// release Helm can upgrade again, never one locked in pending-install.
+func TestInstallStoppedEarlyIsFailedNotPending(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeCluster()
+	f.notReady(true)
+	stop, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, stop); !errors.Is(err, ErrStopped) {
+		t.Fatalf("err = %v, want ErrStopped", err)
+	}
+	cur, err := Current(f.cfg, "rel")
+	if err != nil || cur == nil || cur.Info.Status != rcommon.StatusFailed {
+		t.Fatalf("after a stopped install: %v, %v; want a failed release", cur, err)
 	}
 }

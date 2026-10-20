@@ -103,7 +103,9 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	out := ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved, "--timeout", "45s")
 	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`,
-		"tokens for the control plane at cp.example.com", "install did not complete"} {
+		"tokens for the control plane at cp.example.com", "install did not complete",
+		// The failure comes with its cause: the images cannot be pulled.
+		"What doctor finds wrong", "NT-DR-010"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
@@ -457,7 +459,7 @@ func TestE2EAdoptUpgradeRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	vals := map[string]any{"global": map[string]any{"domain": "upgrade.example.com"}, "extra": map[string]any{"password": "CANARY-pw"}}
-	if _, err := helm.Install(ctx, cfg, v1, vals, "neuraltrust-platform", ns, 2*time.Minute); err != nil {
+	if _, err := helm.Install(ctx, cfg, v1, vals, "neuraltrust-platform", ns, 2*time.Minute, nil); err != nil {
 		t.Fatalf("plain install: %v", err)
 	}
 

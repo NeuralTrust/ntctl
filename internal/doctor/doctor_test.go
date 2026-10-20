@@ -237,7 +237,7 @@ func TestPullCauses(t *testing.T) {
 }
 
 func TestHTTPRouteNotAccepted(t *testing.T) {
-	parent := map[string]any{"name": "internal", "namespace": "gw"}
+	parent := map[string]any{"name": "shared", "namespace": "gw"}
 	dyn := gatewayapitest.Client(
 		gatewayapitest.Route(ns, "app", []string{"app.example.com"}, []map[string]any{parent},
 			[]map[string]any{gatewayapitest.ParentStatus(parent, "Accepted", "True", "Accepted")}),

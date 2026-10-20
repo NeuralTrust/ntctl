@@ -78,6 +78,16 @@ type Needs struct {
 	// Groups split those requests by where the pods may run: workloads with
 	// the same nodeSelector and tolerations share a group.
 	Groups []PodGroup
+	// LoadBalancers are the Services of type LoadBalancer the release
+	// renders, which the cloud gives an address of their own.
+	LoadBalancers []LoadBalancer
+}
+
+// LoadBalancer is a Service of type LoadBalancer and its annotations, which
+// decide on most clouds whether its address is private.
+type LoadBalancer struct {
+	Name        string
+	Annotations map[string]string
 }
 
 // PodGroup is the requests of workloads that can run on the same nodes.
@@ -122,6 +132,14 @@ func Analyse(objs []Object) Needs {
 			noteClass(dig(o, "spec", "ingressClassName"), ingress, &n.DefaultIngress)
 		case kind == "Route":
 			n.Routes = true
+		case kind == "Service" && dig(o, "spec", "type") == "LoadBalancer":
+			lb := LoadBalancer{Name: o.Name(), Annotations: map[string]string{}}
+			if m, ok := dig(o, "metadata", "annotations").(map[string]any); ok {
+				for k, v := range m {
+					lb.Annotations[k] = fmt.Sprint(v)
+				}
+			}
+			n.LoadBalancers = append(n.LoadBalancers, lb)
 		case kind == "HTTPRoute" && strings.HasPrefix(apiVersion(o), gatewayapi.Group+"/"):
 			n.HTTPRoutes = true
 			for _, p := range list(dig(o, "spec", "parentRefs")) {

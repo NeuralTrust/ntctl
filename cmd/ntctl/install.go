@@ -81,6 +81,8 @@ type installFlags struct {
 	timeout       time.Duration
 	org           string
 	instances     map[api.Product]string
+	// stopEarly ends the wait on a lasting failure waiting does not fix.
+	stopEarly bool
 }
 
 func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
@@ -96,6 +98,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.StringVar(&f.secretsMode, "secrets-mode", "kubernetes", "kubernetes: create the Secrets; print: print the kubectl commands that create them, install nothing")
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
+	fs.BoolVar(&f.stopEarly, "stop-early", true, "stop waiting once a failure that waiting does not fix (an image that cannot be pulled, a missing Secret, a crash loop, a refused config-sync token) has lasted "+watchGiveUp.String()+"; false waits the full --timeout")
 	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to install (default: create one)")
 	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to install (default: create one)")
@@ -168,7 +171,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	// Tokens come from the environment, else from the console when signed
 	// in, else from the operator. Printed, they are placeholders.
-	tokens, need, err := tokenSecrets(ctx, in, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
+	tokens, need, err := tokenSecrets(ctx, in, out, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
 	if err != nil {
 		return err
 	}
@@ -261,12 +264,18 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 
 	fmt.Fprintf(out, "Installing… waiting up to %s for every workload to become ready.\n", f.timeout)
-	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout)
+	w := waitWatch{cs: p.cs, cluster: p.cluster, ns: ns, release: o.release, out: out, every: watchEvery, giveUp: watchGiveUp, stopEarly: f.stopEarly}.start(ctx)
+	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout, w.stop)
+	w.finish()
 	if st, err := report.Collect(ctx, p.cs, p.dyn, ns); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
 	}
 	if installErr != nil {
+		o.printFailures(ctx, out)
+		if errors.Is(installErr, helm.ErrStopped) {
+			return fmt.Errorf("install stopped early: waiting would not fix what is shown above (--stop-early=false waits the full --timeout).\nThe resources were kept: fix the cause, then run `ntctl upgrade` to apply the release again")
+		}
 		return fmt.Errorf("install did not complete: %w\nThe resources were kept so you can see what failed: %s", installErr, fixThenUpgrade)
 	}
 	fmt.Fprintln(out)

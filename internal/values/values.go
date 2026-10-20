@@ -37,10 +37,13 @@ type Inputs struct {
 	// Mode is global.deploymentMode. Only a hybrid data plane reads the
 	// console's tokens, so the token Secret references are generated for
 	// hybrid (or an unset mode) only.
-	Mode     string
-	Domain   string
-	Platform string
-	Products []string
+	Mode string
+	// ControlPlane is global.controlPlane.domain: the control plane a
+	// hybrid data plane dials, when it is not NeuralTrust's for the region.
+	ControlPlane string
+	Domain       string
+	Platform     string
+	Products     []string
 	// Gateway, when set, exposes the endpoints as HTTPRoutes on that Gateway
 	// instead of Ingresses.
 	Gateway *gatewayapi.ParentRef
@@ -57,6 +60,9 @@ func Generate(in Inputs) map[string]any {
 	}
 	if in.Domain != "" {
 		global["domain"] = in.Domain
+	}
+	if in.ControlPlane != "" {
+		global["controlPlane"] = map[string]any{"domain": in.ControlPlane}
 	}
 	if in.Platform != "" {
 		global["platform"] = in.Platform

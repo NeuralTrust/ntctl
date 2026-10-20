@@ -87,11 +87,11 @@ func TestKnownCause(t *testing.T) {
 	ep := map[string]string{"CONFIG_SYNC_GRPC_ENDPOINT": "agentgateway-configsync.neuraltrust.ai:443"}
 	cases := map[string]string{
 		"ERROR change stream watch failed: configsync: watch recv: rpc error: code = Unauthenticated desc = missing or invalid config-sync token": "Config sync at agentgateway-configsync.neuraltrust.ai:443 refuses this data plane's token",
-		`FATAL: password authentication failed for user "nt"`: "PostgreSQL refuses",
-		"WRONGPASS invalid username-password pair":            "Redis refuses",
-		"x509: certificate signed by unknown authority":       "TLS certificate is not trusted",
-		"dial tcp: lookup db.example.com: no such host":       "does not resolve",
-		"dial tcp 10.0.0.1:5432: connect: connection refused": "cannot be reached",
+		`FATAL: password authentication failed for user "nt"`:  "PostgreSQL refuses",
+		"WRONGPASS invalid username-password pair":             "Redis refuses",
+		"x509: certificate signed by unknown authority":        "TLS certificate is not trusted",
+		"dial tcp: lookup db.example.com: no such host":        "does not resolve",
+		"dial tcp 192.0.2.1:5432: connect: connection refused": "cannot be reached",
 		"all good": "",
 	}
 	for line, want := range cases {
@@ -110,5 +110,29 @@ func TestNotableLinesReadsLongLines(t *testing.T) {
 	got := notableLines([]string{long}, 5)
 	if len(got) != 1 || got[0] != "ERROR change stream watch failed: rpc error: code = Unauthenticated" {
 		t.Fatalf("notableLines = %q", got)
+	}
+}
+
+func TestHopeless(t *testing.T) {
+	fail := func(code, fix string) preflight.Result {
+		return preflight.Result{Code: code, Severity: preflight.Fail, Fix: fix}
+	}
+	cases := map[string]struct {
+		r    preflight.Result
+		want bool
+	}{
+		"image pull":             {fail("NT-DR-010", "x"), true},
+		"missing Secret":         {fail("NT-DR-011", "x"), true},
+		"crash loop":             {fail("NT-DR-012", "x"), true},
+		"unready, known cause":   {fail("NT-DR-015", "Config sync at … refuses"), true},
+		"unready, unknown cause": {fail("NT-DR-015", readinessFix), false},
+		"unschedulable":          {fail("NT-DR-013", "x"), false},
+		"failed release":         {fail("NT-DR-001", "x"), false},
+		"a warning":              {preflight.Result{Code: "NT-DR-010", Severity: preflight.Warn}, false},
+	}
+	for name, c := range cases {
+		if got := Hopeless(c.r); got != c.want {
+			t.Errorf("%s: Hopeless = %v, want %v", name, got, c.want)
+		}
 	}
 }

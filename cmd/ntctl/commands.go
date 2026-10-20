@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -26,7 +27,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/version"
 )
 
-func runVersion(_ context.Context, args []string, out io.Writer) error {
+func runVersion(ctx context.Context, args []string, out io.Writer) error {
 	var o opts
 	fs := newFlags("version", "Print the ntctl version and the latest chart version.", out, &o, false)
 	if err := parse(fs, args); err != nil {
@@ -38,6 +39,17 @@ func runVersion(_ context.Context, args []string, out io.Writer) error {
 		latest = "unknown (" + err.Error() + ")"
 	}
 	fmt.Fprintf(out, "latest chart: %s\n", latest)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	newest, err := version.Latest(ctx, &http.Client{Timeout: 5 * time.Second}, version.ReleasesURL)
+	switch {
+	case err != nil:
+		fmt.Fprintf(out, "latest ntctl: unknown (%v)\n", err)
+	case version.Outdated(version.Version, newest):
+		fmt.Fprintf(out, "latest ntctl: %s; you run %s. Update with the install script:\n  curl -sSfL https://raw.githubusercontent.com/NeuralTrust/ntctl/main/install.sh | sh\n", newest, version.Version)
+	default:
+		fmt.Fprintf(out, "latest ntctl: %s\n", newest)
+	}
 	return nil
 }
 

@@ -389,7 +389,18 @@ func runInstances(p api.Product) func(context.Context, []string, io.Writer) erro
 			if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
 				return fmt.Errorf("usage: ntctl %s create <name>", name)
 			}
-			in, err := s.api.Create(ctx, p, org, strings.TrimSpace(pos[0]))
+			name := strings.TrimSpace(pos[0])
+			list, err := s.api.Instances(ctx, p, org)
+			if err != nil {
+				return err
+			}
+			// One name, one instance: install picks instances by name.
+			if have, err := findInstance(list, p, name); err != nil {
+				return err
+			} else if have != nil {
+				return fmt.Errorf("a private %s named %q already exists (%s); `ntctl install --%s-instance %s` installs it", p.Name(), have.Name, have.ID, strings.ToLower(p.Name()), have.ID)
+			}
+			in, err := s.api.Create(ctx, p, org, name)
 			if err != nil {
 				return err
 			}

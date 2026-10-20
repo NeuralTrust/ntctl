@@ -7,7 +7,30 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/NeuralTrust/ntctl/internal/preflight"
 )
+
+// readinessFix is the fix of an NT-DR-015 whose cause is not recognised.
+const readinessFix = "The readiness probe's failures and the container's last errors are above. `ntctl support-bundle` collects the full logs for NeuralTrust support."
+
+// Hopeless reports whether a finding is one that waiting does not fix: an
+// image that cannot be pulled, a Secret or ConfigMap that is missing, a
+// container that keeps crashing, or one that never becomes ready for a cause
+// doctor recognises (such as a token another control plane issued). Pods
+// that cannot be scheduled are not hopeless: an autoscaler may add nodes.
+func Hopeless(r preflight.Result) bool {
+	if r.Severity != preflight.Fail {
+		return false
+	}
+	switch r.Code {
+	case "NT-DR-010", "NT-DR-011", "NT-DR-012":
+		return true
+	case "NT-DR-015":
+		return r.Fix != readinessFix
+	}
+	return false
+}
 
 // readyGrace is how long a running container may stay unready before it is
 // a finding: long enough for a normal start, probes included.
@@ -116,8 +139,8 @@ func knownCause(lines []string, env map[string]string) string {
 			at = ep
 		}
 		return fmt.Sprintf("Config sync at %s refuses this data plane's token: the token was issued by the console of another control plane. "+
-			"Point the data plane at the control plane whose console issued the token (global.controlPlane.domain, or global.saasRegion) with `ntctl upgrade -f`, "+
-			"or put tokens from the console of the control plane at %s in the token Secrets and run `ntctl upgrade`.", at, at)
+			"Point the data plane at the control plane whose console issued the token: `ntctl upgrade --control-plane <its domain> --version <installed version>` "+
+			"(for a console at app.<domain>, that is <domain>). Or put tokens from the console of the control plane at %s in the token Secrets and run `ntctl upgrade`.", at, at)
 	case has("password authentication failed"):
 		return "PostgreSQL refuses the user or password: check the password in the external-postgresql Secret (POSTGRES_PASSWORD) and the user in your values, then run `ntctl upgrade`."
 	case has("WRONGPASS"), has("NOAUTH"), has("invalid username-password pair"):

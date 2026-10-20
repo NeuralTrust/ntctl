@@ -88,16 +88,29 @@ func Render(ctx context.Context, ch *chart.Loaded, vals map[string]any, o Render
 	return b.String(), nil
 }
 
+// ErrStopped means the wait for readiness was stopped early: the release was
+// applied and marked failed, as after a timeout.
+var ErrStopped = errors.New("the wait for readiness was stopped")
+
 // Install installs a new release and waits for it to become ready. On failure
-// the resources are kept so the operator can see what went wrong.
-func Install(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, vals map[string]any, name, namespace string, timeout time.Duration) (*release.Release, error) {
+// the resources are kept so the operator can see what went wrong. Cancelling
+// stop (optional) ends the wait early; the release is then marked failed,
+// exactly as when the timeout passes, and never left pending.
+func Install(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, vals map[string]any, name, namespace string, timeout time.Duration, stop context.Context) (*release.Release, error) {
 	inst := action.NewInstall(cfg)
 	inst.ReleaseName = name
 	inst.Namespace = namespace
 	inst.ServerSideApply = true
 	inst.WaitStrategy = kube.StatusWatcherStrategy
 	inst.Timeout = timeout
+	if stop != nil {
+		inst.WaitOptions = []kube.WaitOption{kube.WithWaitMethodContext(stop)}
+	}
 	r, err := inst.RunWithContext(ctx, ch.Chart, vals)
+	if err != nil && stop != nil && stop.Err() != nil && ctx.Err() == nil {
+		rel, _ := v1(r)
+		return rel, ErrStopped
+	}
 	rel, cerr := v1(r)
 	if err != nil {
 		return rel, readiness(err)

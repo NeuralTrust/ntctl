@@ -53,12 +53,14 @@ type opts struct {
 	version    string
 	valueFiles stringList
 	// mode is --mode, global.deploymentMode; "" leaves it to the files.
-	mode     string
-	domain   string
-	platform string
-	products string
-	gateway  string
-	output   string
+	mode   string
+	domain string
+	// controlPlane is --control-plane, global.controlPlane.domain.
+	controlPlane string
+	platform     string
+	products     string
+	gateway      string
+	output       string
 	// telemetry is --operational-telemetry; unset leaves the choice open.
 	telemetry optionalBool
 	// ignoreCapacity turns a capacity failure into a warning.
@@ -87,6 +89,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.Var(&o.valueFiles, "f", "values file, as with helm -f (repeatable; later files win)")
 		fs.StringVar(&o.mode, "mode", "", "where the control plane runs: hybrid (NeuralTrust hosts it; the chart's default), external (this cluster runs everything; nothing leaves it), or saas (this cluster is a control plane serving data planes elsewhere)")
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
+		fs.StringVar(&o.controlPlane, "control-plane", "", "hybrid: the domain of the control plane the data plane dials (global.controlPlane.domain), when it is not NeuralTrust's for the region; tokens are valid only at the control plane whose console issued them")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
 		productsUsage := "comma-separated products: " + strings.Join(values.Products, ",")
 		if name == "upgrade" {
@@ -176,7 +179,11 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 	}
 	vals := values.Generate(defaults)
 	vals = values.Merge(vals, files)
-	vals = values.Merge(vals, values.Generate(values.Inputs{Mode: mode, Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
+	cp := strings.TrimSpace(o.controlPlane)
+	if strings.Contains(cp, "://") || strings.ContainsAny(cp, ":/ ") || (cp != "" && !strings.Contains(cp, ".")) {
+		return nil, fmt.Errorf("--control-plane takes a bare domain such as cp.example.com, not %q", o.controlPlane)
+	}
+	vals = values.Merge(vals, values.Generate(values.Inputs{Mode: mode, ControlPlane: cp, Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
 	if o.extra != nil {
 		vals = values.Merge(vals, copyMap(o.extra))
 	}

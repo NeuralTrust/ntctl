@@ -216,7 +216,7 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod) []preflight.R
 				g := add(w, preflight.Result{
 					Code: "NT-DR-015", Check: "readiness", Severity: preflight.Fail,
 					Message: fmt.Sprintf("%s container %s runs but never becomes ready", w, c.Name),
-					Fix:     "The readiness probe's failures and the container's last errors are above. `ntctl support-bundle` collects the full logs for NeuralTrust support.",
+					Fix:     readinessFix,
 				}, p.Name)
 				if len(g.pods) == 1 {
 					events := filter(eventsFor(ctx, in, "Pod", p.Name), "Unhealthy: Readiness probe failed", "Unhealthy: Startup probe failed")

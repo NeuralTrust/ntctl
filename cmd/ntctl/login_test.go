@@ -66,6 +66,12 @@ func TestConsoleCommands(t *testing.T) {
 	if got := srv.Instances(api.TrustGate, "org-2"); len(got) != 1 {
 		t.Fatalf("the instance should be in the selected org, got %v", got)
 	}
+	if out = ntctl(t, 1, "trustgate", "create", "EDGE-1"); !strings.Contains(out, "already exists") || !strings.Contains(out, "--trustgate-instance") {
+		t.Fatalf("a taken name should be refused:\n%s", out)
+	}
+	if got := srv.Instances(api.TrustGate, "org-2"); len(got) != 1 {
+		t.Fatalf("a refused create made an instance: %v", got)
+	}
 	if out := ntctl(t, 0, "trustgate", "list", "--org", "org-2"); !strings.Contains(out, "edge-1") {
 		t.Fatalf("list:\n%s", out)
 	}

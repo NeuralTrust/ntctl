@@ -107,8 +107,8 @@ func TestAskFromEnvironment(t *testing.T) {
 
 func stgCluster() *detect.Cluster {
 	return &detect.Cluster{Platform: "azure", GatewayAPI: true, GatewaysRead: true, Gateways: []gatewayapi.Gateway{{
-		Namespace: "kgateway-system", Name: "internal", Class: "kgateway",
-		Addresses: []gatewayapi.Address{{Type: "IPAddress", Value: "10.0.6.10"}},
+		Namespace: "gateway-system", Name: "shared", Class: "kgateway",
+		Addresses: []gatewayapi.Address{{Type: "IPAddress", Value: "192.0.2.10"}},
 	}}}
 }
 
@@ -124,7 +124,7 @@ func TestAskOffersGateway(t *testing.T) {
 	if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader("\n"), &out), &out, fake.NewSimpleClientset(), stgCluster(), &o, installFlags{}, files); err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
-	if o.gateway != "kgateway-system/internal" || !strings.Contains(out.String(), "HTTPRoutes on Gateway kgateway-system/internal (kgateway, 10.0.6.10)") {
+	if o.gateway != "gateway-system/shared" || !strings.Contains(out.String(), "HTTPRoutes on Gateway gateway-system/shared (kgateway, 192.0.2.10)") {
 		t.Errorf("gateway = %q\n%s", o.gateway, out.String())
 	}
 
@@ -149,15 +149,15 @@ func TestAskOffersGateway(t *testing.T) {
 }
 
 func TestGatewayFlag(t *testing.T) {
-	o := opts{gateway: "kgateway-system/internal:https"}
+	o := opts{gateway: "gateway-system/shared:https"}
 	vals, err := o.effectiveValues(values.Inputs{Platform: "azure"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := exposure(vals); got != "HTTPRoutes on Gateway kgateway-system/internal:https" {
+	if got := exposure(vals); got != "HTTPRoutes on Gateway gateway-system/shared:https" {
 		t.Errorf("exposure = %q (values %v)", got, values.Get(vals, "global", "ingress"))
 	}
-	if _, err := (&opts{gateway: "internal"}).effectiveValues(values.Inputs{}); err == nil {
+	if _, err := (&opts{gateway: "shared"}).effectiveValues(values.Inputs{}); err == nil {
 		t.Error("accepted --gateway without a namespace")
 	}
 	if exposure(values.Generate(values.Inputs{Platform: "aws"})) != "" {
@@ -368,5 +368,25 @@ func TestInstalledMessage(t *testing.T) {
 				t.Errorf("%s: message lacks %q:\n%s", m, w, got)
 			}
 		}
+	}
+}
+
+func TestControlPlaneFlag(t *testing.T) {
+	vals, err := (&opts{controlPlane: "cp.example.com"}).effectiveValues(installDefaults("aws"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, explicit := values.DialedControlPlane(vals); d != "cp.example.com" || !explicit {
+		t.Errorf("--control-plane: dials %q (explicit %v)", d, explicit)
+	}
+	for _, bad := range []string{"https://cp.example.com", "cp.example.com:443", "localhost", "cp.example.com/x"} {
+		if _, err := (&opts{controlPlane: bad}).effectiveValues(values.Inputs{}); err == nil {
+			t.Errorf("--control-plane %q accepted", bad)
+		}
+	}
+	// Signed in to another control plane's console, a new install refuses
+	// rather than dial a control plane that would reject the tokens.
+	if _, err := pointAtConsole(vals, "neuraltrust.ai", true); err == nil || !strings.Contains(err.Error(), "cp.example.com") {
+		t.Errorf("explicit control plane vs console: %v", err)
 	}
 }

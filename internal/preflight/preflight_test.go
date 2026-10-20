@@ -106,14 +106,14 @@ func gatewayInput() Input {
 	in.Cluster.IngressClasses, in.Cluster.DefaultIngressClass = nil, ""
 	in.Cluster.GatewayAPI, in.Cluster.GatewaysRead = true, true
 	in.Cluster.Gateways = []gatewayapi.Gateway{{
-		Namespace: "kgateway-system", Name: "internal",
+		Namespace: "gateway-system", Name: "shared",
 		Listeners: []gatewayapi.Listener{{Name: "http", From: "All"}, {Name: "private", From: "Same"}},
-		Addresses: []gatewayapi.Address{{Type: "IPAddress", Value: "10.0.6.10"}},
+		Addresses: []gatewayapi.Address{{Type: "IPAddress", Value: "192.0.2.10"}},
 	}}
 	in.IngressProvider = "gateway-api"
 	in.Needs.DefaultIngress = false
 	in.Needs.HTTPRoutes = true
-	in.Needs.Gateways = []gatewayapi.ParentRef{{Namespace: "kgateway-system", Name: "internal"}}
+	in.Needs.Gateways = []gatewayapi.ParentRef{{Namespace: "gateway-system", Name: "shared"}}
 	return in
 }
 
@@ -134,7 +134,7 @@ func ingressResult(t *testing.T, in Input) Result {
 
 func TestGatewayRoutes(t *testing.T) {
 	r := ingressResult(t, gatewayInput())
-	if r.Severity != OK || !strings.Contains(r.Message, "kgateway-system/internal (10.0.6.10)") {
+	if r.Severity != OK || !strings.Contains(r.Message, "gateway-system/shared (192.0.2.10)") {
 		t.Errorf("healthy Gateway attach = %+v", r)
 	}
 
@@ -146,14 +146,14 @@ func TestGatewayRoutes(t *testing.T) {
 		"no Gateway API":      {func(in *Input) { in.Cluster.GatewayAPI = false }, Fail, "does not serve"},
 		"Gateways unreadable": {func(in *Input) { in.Cluster.GatewaysRead = false }, Warn, "could not list"},
 		"missing Gateway": {func(in *Input) {
-			in.Needs.Gateways = []gatewayapi.ParentRef{{Namespace: "kgateway-system", Name: "external"}}
+			in.Needs.Gateways = []gatewayapi.ParentRef{{Namespace: "gateway-system", Name: "external"}}
 		}, Fail, "does not exist"},
 		"missing listener":               {func(in *Input) { in.Needs.Gateways[0].SectionName = "https" }, Warn, `no listener "https"`},
 		"listener refuses the namespace": {func(in *Input) { in.Needs.Gateways[0].SectionName = "private" }, Warn, "does not admit"},
 		"parent in the release namespace": {func(in *Input) {
 			in.Cluster.Gateways[0].Namespace = in.Namespace
 			in.Cluster.Gateways[0].Listeners = []gatewayapi.Listener{{Name: "private", From: "Same"}}
-			in.Needs.Gateways = []gatewayapi.ParentRef{{Name: "internal"}}
+			in.Needs.Gateways = []gatewayapi.ParentRef{{Name: "shared"}}
 		}, OK, ""},
 		"chart predates gateway-api": {func(in *Input) {
 			in.Needs.HTTPRoutes, in.Needs.Gateways, in.Needs.DefaultIngress = false, nil, true
@@ -177,7 +177,41 @@ func TestNoIngressControllerSuggestsGateway(t *testing.T) {
 	in.IngressProvider = ""
 	in.Needs.HTTPRoutes, in.Needs.Gateways, in.Needs.DefaultIngress = false, nil, true
 	r := ingressResult(t, in)
-	if r.Severity != Warn || !strings.Contains(r.Fix, "--gateway kgateway-system/internal") {
+	if r.Severity != Warn || !strings.Contains(r.Fix, "--gateway gateway-system/shared") {
 		t.Errorf("result = %+v", r)
+	}
+}
+
+func TestExposure(t *testing.T) {
+	lb := func(name string, ann map[string]string) manifest.LoadBalancer {
+		return manifest.LoadBalancer{Name: name, Annotations: ann}
+	}
+	cases := []struct {
+		name, platform string
+		lbs            []manifest.LoadBalancer
+		want           Severity // "" when the check does not apply
+		says           string
+	}{
+		{name: "no load balancers", platform: "azure"},
+		{name: "unknown platform", platform: "kubernetes", lbs: []manifest.LoadBalancer{lb("databridge-southbound", nil)}},
+		{name: "azure public", platform: "azure", lbs: []manifest.LoadBalancer{lb("databridge-southbound", nil), lb("agentgateway-admin-configsync", nil)}, want: Warn,
+			says: "2 LoadBalancer Services get a public address on azure: agentgateway-admin-configsync, databridge-southbound"},
+		{name: "azure internal", platform: "azure", lbs: []manifest.LoadBalancer{lb("databridge-southbound", map[string]string{"service.beta.kubernetes.io/azure-load-balancer-internal": "true"})}, want: OK},
+		{name: "aws internal scheme", platform: "aws", lbs: []manifest.LoadBalancer{lb("databridge-southbound", map[string]string{"service.beta.kubernetes.io/aws-load-balancer-scheme": "internal"})}, want: OK},
+		{name: "aws internet-facing", platform: "aws", lbs: []manifest.LoadBalancer{lb("databridge-southbound", map[string]string{"service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"})}, want: Warn},
+		{name: "gke internal", platform: "gcp", lbs: []manifest.LoadBalancer{lb("x", map[string]string{"networking.gke.io/load-balancer-type": "Internal"})}, want: OK},
+	}
+	for _, c := range cases {
+		r, ok := exposure(Input{Platform: c.platform, Needs: manifest.Needs{LoadBalancers: c.lbs}})
+		switch {
+		case c.want == "" && ok:
+			t.Errorf("%s: should not apply, got %+v", c.name, r)
+		case c.want != "" && (!ok || r.Severity != c.want):
+			t.Errorf("%s: %+v, want %s", c.name, r, c.want)
+		case c.says != "" && !strings.Contains(r.Message, c.says):
+			t.Errorf("%s: message %q lacks %q", c.name, r.Message, c.says)
+		case r.Severity == Warn && r.Fix == "":
+			t.Errorf("%s: a warning without a fix", c.name)
+		}
 	}
 }

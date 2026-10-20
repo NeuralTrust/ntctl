@@ -112,7 +112,7 @@ metadata:
   name: agentgateway-gateway
 spec:
   parentRefs:
-    - {name: internal, namespace: kgateway-system, sectionName: https}
+    - {name: shared, namespace: gateway-system, sectionName: https}
     - {name: local}
     - {name: svc, kind: Service, group: ""}
 ---
@@ -122,7 +122,7 @@ metadata:
   name: trustguard
 spec:
   parentRefs:
-    - {name: internal, namespace: kgateway-system, sectionName: https}
+    - {name: shared, namespace: gateway-system, sectionName: https}
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ spec:
 		t.Errorf("needs = %+v", n)
 	}
 	if len(n.Gateways) != 2 ||
-		n.Gateways[0].String() != "kgateway-system/internal:https" ||
+		n.Gateways[0].String() != "gateway-system/shared:https" ||
 		n.Gateways[1].Name != "local" || n.Gateways[1].Namespace != "" {
 		t.Errorf("gateways = %+v; want the two Gateway parents once each, the Service parent left out", n.Gateways)
 	}
@@ -184,5 +184,32 @@ spec:
 	}
 	if w.NodeSelector["accelerator"] != "nvidia" || len(w.Tolerations) != 1 || w.Tolerations[0].Key != "nvidia.com/gpu" {
 		t.Errorf("GPU placement = %+v %+v", w.NodeSelector, w.Tolerations)
+	}
+}
+
+func TestAnalyseLoadBalancers(t *testing.T) {
+	objs, err := Parse(`apiVersion: v1
+kind: Service
+metadata:
+  name: databridge-southbound
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: ClusterIP
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := Analyse(objs)
+	if len(n.LoadBalancers) != 1 || n.LoadBalancers[0].Name != "databridge-southbound" ||
+		n.LoadBalancers[0].Annotations["service.beta.kubernetes.io/azure-load-balancer-internal"] != "true" {
+		t.Fatalf("load balancers = %+v", n.LoadBalancers)
 	}
 }

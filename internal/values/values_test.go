@@ -69,13 +69,13 @@ func TestSaveHasNoTokensAndRoundTrips(t *testing.T) {
 }
 
 func TestGenerateGateway(t *testing.T) {
-	out := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "kgateway-system", Name: "internal", SectionName: "https"}})
+	out := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "gateway-system", Name: "shared", SectionName: "https"}})
 	if Get(out, "global", "ingress", "provider") != "gateway-api" {
 		t.Fatalf("provider not set: %v", out)
 	}
 	refs, _ := Get(out, "global", "ingress", "gatewayApi", "parentRefs").([]any)
 	ref, _ := refs[0].(map[string]any)
-	if len(refs) != 1 || ref["namespace"] != "kgateway-system" || ref["name"] != "internal" || ref["sectionName"] != "https" {
+	if len(refs) != 1 || ref["namespace"] != "gateway-system" || ref["name"] != "shared" || ref["sectionName"] != "https" {
 		t.Errorf("parentRefs = %v", refs)
 	}
 	noSection := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "gw", Name: "edge"}})

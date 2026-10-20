@@ -125,6 +125,9 @@ func (o *opts) sameAsRelease(out io.Writer, f installFlags, current map[string]a
 	if err := differs("platform", o.platform, "global.platform"); err != nil {
 		return err
 	}
+	if have, _ := values.DialedControlPlane(current); o.controlPlane != "" && o.controlPlane != have {
+		return fmt.Errorf("--control-plane %s differs from the control plane the release dials (%s). Adding a product keeps the release's settings; change it with `ntctl upgrade --control-plane`, then add the product", o.controlPlane, have)
+	}
 	if err := o.sameMode(current); err != nil {
 		return err
 	}

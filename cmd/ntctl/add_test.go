@@ -29,7 +29,7 @@ func TestAddProductsStopsBeforeAnyToken(t *testing.T) {
 	all := values.Generate(values.Inputs{Domain: "d.example.com", Products: values.Products})
 	pinned := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"controlPlane": map[string]any{"configSyncAddr": "lb.example.com:443"}}})
 	exposed := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"ingress": map[string]any{
-		"provider": "gateway-api", "gatewayApi": map[string]any{"parentRefs": []any{map[string]any{"name": "internal", "namespace": "gw"}}}}}})
+		"provider": "gateway-api", "gatewayApi": map[string]any{"parentRefs": []any{map[string]any{"name": "shared", "namespace": "gw"}}}}}})
 	noTerminal := func(w io.Writer) *prompt.Prompter {
 		return prompt.New(context.Background(), strings.NewReader(""), w, false)
 	}
@@ -53,8 +53,8 @@ func TestAddProductsStopsBeforeAnyToken(t *testing.T) {
 			says: []string{"registry key is not used", "nothing to do"}},
 		{name: "another domain", o: opts{products: "trustguard", domain: "other.example.com"}, cfg: gate, in: noTerminal, err: "--domain other.example.com differs"},
 		{name: "another platform", o: opts{products: "trustguard", platform: "gcp"}, cfg: values.Merge(gateOnly(), map[string]any{"global": map[string]any{"platform": "azure"}}), in: noTerminal, err: "--platform gcp differs"},
-		{name: "another gateway", o: opts{products: "trustguard", gateway: "gw/external"}, cfg: exposed, in: noTerminal, err: "--gateway gw/external differs from how the release is exposed (HTTPRoutes on Gateway gw/internal)"},
-		{name: "a gateway on an Ingress install", o: opts{products: "trustguard", gateway: "gw/internal"}, cfg: gate, in: noTerminal, err: "(Ingresses)"},
+		{name: "another gateway", o: opts{products: "trustguard", gateway: "gw/external"}, cfg: exposed, in: noTerminal, err: "--gateway gw/external differs from how the release is exposed (HTTPRoutes on Gateway gw/shared)"},
+		{name: "a gateway on an Ingress install", o: opts{products: "trustguard", gateway: "gw/shared"}, cfg: gate, in: noTerminal, err: "(Ingresses)"},
 		{name: "another mode", o: opts{products: "trustguard", mode: "external"}, cfg: gate, in: noTerminal, err: "--mode external differs from the release's mode, hybrid"},
 		{name: "the same mode", o: opts{products: "trustgate", mode: "Hybrid"}, cfg: gate, in: noTerminal, says: []string{"nothing to do"}},
 		{name: "print mode", o: opts{products: "trustguard"}, f: installFlags{secretsMode: "print"}, cfg: gate, in: noTerminal, err: "--secrets-mode print is for a new install"},

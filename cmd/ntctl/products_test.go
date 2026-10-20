@@ -86,9 +86,9 @@ func TestTokenSecretsOnlyForMissingOnes(t *testing.T) {
 	cs := fake.NewClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: values.TrustGuardEnrolment, Namespace: ns}, Data: map[string][]byte{values.EnrolmentKey: []byte("x")}})
 	vals := reuse(gateOnly(), values.ProductDelta(gateOnly(), []string{"trustguard"}, nil))
 	t.Setenv("NT_TRUSTGUARD_CONFIG_SYNC_TOKEN", "")
-	var out bytes.Buffer
+	var out, notes bytes.Buffer
 
-	create, need, err := tokenSecrets(ctx, prompt.Scripted(strings.NewReader("sync-token\n"), &out), cs, ns, nil, vals, []string{"trustguard"}, false, false)
+	create, need, err := tokenSecrets(ctx, prompt.Scripted(strings.NewReader("sync-token\n"), &out), &notes, cs, ns, nil, vals, []string{"trustguard"}, false, false)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
@@ -101,10 +101,13 @@ func TestTokenSecretsOnlyForMissingOnes(t *testing.T) {
 	if got := plannedKeys(create, need); !reflect.DeepEqual(got, map[string][]string{values.TrustGuardConfigSync: {values.ConfigSyncKey}}) {
 		t.Errorf("planned = %v", got)
 	}
+	if !strings.Contains(notes.String(), "Keeping the existing token Secret "+values.TrustGuardEnrolment) {
+		t.Errorf("a kept token Secret was not reported:\n%s", notes.String())
+	}
 
 	// A dry run asks nothing.
 	out.Reset()
-	create, _, err = tokenSecrets(ctx, prompt.Scripted(strings.NewReader(""), &out), cs, ns, nil, vals, []string{"trustguard"}, false, true)
+	create, _, err = tokenSecrets(ctx, prompt.Scripted(strings.NewReader(""), &out), &notes, cs, ns, nil, vals, []string{"trustguard"}, false, true)
 	if err != nil || len(create) != 1 || out.Len() != 0 {
 		t.Fatalf("placeholders: create = %v, err = %v, asked:\n%s", names(create), err, out.String())
 	}
