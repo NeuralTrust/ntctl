@@ -132,9 +132,9 @@ func untar(t *testing.T, r io.Reader) map[string]string {
 }
 
 func TestGatewayResources(t *testing.T) {
-	parent := map[string]any{"name": "internal", "namespace": "kgateway-system"}
+	parent := map[string]any{"name": "shared", "namespace": "gateway-system"}
 	dyn := gatewayapitest.Client(
-		gatewayapitest.Gateway("kgateway-system", "internal", "10.0.6.10", gatewayapitest.Listener("https", 443, map[string]any{"from": "All"})),
+		gatewayapitest.Gateway("gateway-system", "shared", "192.0.2.10", gatewayapitest.Listener("https", 443, map[string]any{"from": "All"})),
 		gatewayapitest.Route(ns, "agentgateway-gateway", []string{"gateway.example.com"}, []map[string]any{parent}, nil),
 	)
 	var buf bytes.Buffer
@@ -147,7 +147,7 @@ func TestGatewayResources(t *testing.T) {
 	if !strings.Contains(files["resources/httproutes.yaml"], "gateway.example.com") {
 		t.Errorf("httproutes.yaml:\n%s", files["resources/httproutes.yaml"])
 	}
-	if !strings.Contains(files["resources/gateways.yaml"], "10.0.6.10") {
+	if !strings.Contains(files["resources/gateways.yaml"], "192.0.2.10") {
 		t.Errorf("gateways.yaml should hold the parent Gateway:\n%s", files["resources/gateways.yaml"])
 	}
 }

@@ -27,10 +27,17 @@ import (
 )
 
 const installSummary = `Install the NeuralTrust platform. On a terminal ntctl asks for anything the
-flags and -f files leave open (domain, products, operational telemetry, where
-images come from, your own PostgreSQL or Redis), each with a default. It then
-checks the cluster, creates the Secrets, installs, waits until ready and prints
-the DNS records.
+flags and -f files leave open (where the control plane runs, domain, products,
+operational telemetry, where images come from, your own PostgreSQL or Redis),
+each with a default. It then checks the cluster, creates the Secrets,
+installs, waits until ready and prints the DNS records.
+
+--mode says where the control plane runs: hybrid (the default) installs a data
+plane that NeuralTrust's control plane manages; external installs everything
+in this cluster and nothing leaves it; saas installs a control plane here that
+serves data planes elsewhere. External and saas installs ask for the console's
+first admin, from ONPREM_SUPERADMIN_EMAIL and ONPREM_SUPERADMIN_PASSWORD or the
+terminal, and need no NeuralTrust token.
 
 When the release already exists, install adds products to it instead: it
 asks only which products to add and their tokens, keeps every other setting
@@ -74,6 +81,8 @@ type installFlags struct {
 	timeout       time.Duration
 	org           string
 	instances     map[api.Product]string
+	// stopEarly ends the wait on a lasting failure waiting does not fix.
+	stopEarly bool
 }
 
 func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
@@ -89,6 +98,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.StringVar(&f.secretsMode, "secrets-mode", "kubernetes", "kubernetes: create the Secrets; print: print the kubectl commands that create them, install nothing")
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
+	fs.BoolVar(&f.stopEarly, "stop-early", true, "stop waiting once a failure that waiting does not fix (an image that cannot be pulled, a missing Secret, a crash loop, a refused config-sync token) has lasted "+watchGiveUp.String()+"; false waits the full --timeout")
 	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to install (default: create one)")
 	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to install (default: create one)")
@@ -161,7 +171,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	// Tokens come from the environment, else from the console when signed
 	// in, else from the operator. Printed, they are placeholders.
-	tokens, need, err := tokenSecrets(ctx, in, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
+	tokens, need, err := tokenSecrets(ctx, in, out, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
 	if err != nil {
 		return err
 	}
@@ -169,6 +179,13 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	consoles, err := planConsole(ctx, in, out, sess, f.org, need, f.instances, instanceName(vals, o.release))
 	if err != nil {
 		return err
+	}
+	// The console's tokens are valid only at its own control plane, which
+	// is not always the region's (a dev or self-hosted console).
+	if cp, err := pointAtConsole(vals, consoles.controlPlane, true); err != nil {
+		return err
+	} else if cp != nil {
+		o.extra = values.Merge(orEmpty(o.extra), cp)
 	}
 
 	fmt.Fprintln(out, "\nChecking the cluster against this install…")
@@ -190,11 +207,15 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		p.chart.Name, p.chart.Version, o.release, ns, o.kube.Target())
 	domain, _ := values.Get(p.values, "global", "domain").(string)
 	platform, _ := values.Get(p.values, "global", "platform").(string)
-	fmt.Fprintf(out, "  Domain:     %s\n  Platform:   %s\n  Products:   %s\n", domain, platform, strings.Join(enabledProducts(p.values), ", "))
+	fmt.Fprintf(out, "  Mode:       %s\n", describeMode(values.DeploymentMode(p.values)))
+	fmt.Fprintf(out, "  Domain:     %s\n  Platform:   %s\n  Products:   %s\n", domain, platform, strings.Join(values.Installed(p.values), ", "))
 	if line := exposure(p.values); line != "" {
 		fmt.Fprintf(out, "  Endpoints:  %s\n", line)
 	}
 	fmt.Fprintf(out, "  Telemetry:  operational traces and metrics %s\n", values.TelemetryState(p.values))
+	if cp, _ := values.DialedControlPlane(p.values); cp != "" && values.DeploymentMode(p.values) == "hybrid" {
+		fmt.Fprintf(out, "  Connects:   control plane at %s\n", cp)
+	}
 	for _, line := range answers.Summary() {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
@@ -215,6 +236,19 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return err
 	}
 	create = append(create, issued...)
+	// The console says where its tokens are valid; that wins over the guess
+	// made from its URL.
+	if d, err := consoles.issuedControlPlane(); err != nil {
+		return err
+	} else if d != "" && values.DeploymentMode(p.values) == "hybrid" {
+		if _, err := pointAtConsole(vals, d, true); err != nil {
+			return err
+		}
+		if have, _ := values.DialedControlPlane(p.values); have != d {
+			values.Merge(p.values, values.ControlPlaneValues(d))
+			fmt.Fprintf(out, "The console issued the tokens for the control plane at %s; the data plane dials it.\n", d)
+		}
+	}
 	done, err := secrets.Apply(ctx, p.cs, create, f.replace)
 	for _, d := range done {
 		fmt.Fprintf(out, "Secret: %s\n", d)
@@ -230,18 +264,80 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 
 	fmt.Fprintf(out, "Installing… waiting up to %s for every workload to become ready.\n", f.timeout)
-	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout)
+	w := waitWatch{cs: p.cs, cluster: p.cluster, ns: ns, release: o.release, out: out, every: watchEvery, giveUp: watchGiveUp, stopEarly: f.stopEarly}.start(ctx)
+	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout, w.stop)
+	w.finish()
 	if st, err := report.Collect(ctx, p.cs, p.dyn, ns); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
 	}
 	if installErr != nil {
-		return fmt.Errorf("install did not complete: %w\nThe resources were kept so you can see what failed; run `ntctl status`, fix the cause, then `ntctl upgrade`", installErr)
+		o.printFailures(ctx, out)
+		if errors.Is(installErr, helm.ErrStopped) {
+			return fmt.Errorf("install stopped early: waiting would not fix what is shown above (--stop-early=false waits the full --timeout).\nThe resources were kept: fix the cause, then run `ntctl upgrade` to apply the release again")
+		}
+		return fmt.Errorf("install did not complete: %w\nThe resources were kept so you can see what failed: %s", installErr, fixThenUpgrade)
 	}
 	fmt.Fprintln(out)
 	consoles.finalize(ctx, out, sess, p.values)
-	fmt.Fprintln(out, "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console.")
+	fmt.Fprintln(out, installedMessage(p.values))
 	return nil
+}
+
+// installedMessage is the last line of a successful install: where the setup
+// continues, which depends on where the control plane runs.
+func installedMessage(vals map[string]any) string {
+	if values.DeploymentMode(vals) == "hybrid" {
+		return "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console."
+	}
+	domain, _ := values.Get(vals, "global", "domain").(string)
+	msg := fmt.Sprintf("Installed. Create the DNS records above, then sign in to this install's console at https://app.%s.", domain)
+	if values.DeploymentMode(vals) == "saas" {
+		cp, _ := values.Get(vals, "global", "controlPlane", "domain").(string)
+		if cp == "" {
+			cp = domain
+		}
+		msg += fmt.Sprintf(`
+To connect a data plane that runs elsewhere:
+  1. Export this control plane's CA with the chart's scripts/export-controlplane-ca.sh,
+     and apply the bundle in the data plane's namespace (Secret controlplane-ca).
+  2. Create a private gateway in this console, for the data plane's tokens.
+  3. Install the data plane with values setting global.controlPlane.domain: %s
+     and global.controlPlane.caSecretName: controlplane-ca, and with that gateway's
+     tokens in NT_TRUSTGATE_CONFIG_SYNC_TOKEN and NT_TRUSTGATE_ENROLMENT_TOKEN.`, cp)
+	}
+	return msg
+}
+
+// describeMode says in words where the control plane of a mode runs.
+func describeMode(mode string) string {
+	switch mode {
+	case "external":
+		return "external (everything runs in this cluster; nothing leaves it)"
+	case "saas":
+		return "saas (this cluster is a control plane for data planes elsewhere)"
+	}
+	return mode + " (NeuralTrust hosts the control plane; this cluster runs the data plane)"
+}
+
+// sameMode refuses a --mode other than the release's: where the control
+// plane runs cannot change in place.
+func (o *opts) sameMode(current map[string]any) error {
+	if _, err := o.effectiveMode(nil); err != nil || o.mode == "" {
+		return err
+	}
+	if have := values.DeploymentMode(current); o.mode != have {
+		return fmt.Errorf("--mode %s differs from the release's mode, %s; a release cannot change where its control plane runs in place. Install the other mode as a separate release (--namespace)", o.mode, have)
+	}
+	return nil
+}
+
+// orEmpty returns m, or an empty map when m is nil, so it can be merged into.
+func orEmpty(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
 }
 
 // ask settles every install choice the flags and files leave open. On a
@@ -249,8 +345,30 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 // defaults and the environment.
 func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.Interface, cluster *detect.Cluster, o *opts, f installFlags, files map[string]any) (setup.Answers, error) {
 	var a setup.Answers
-	var err error
 	set := func(path ...string) bool { return values.Get(files, path...) != nil }
+
+	mode, err := o.effectiveMode(files)
+	if err != nil {
+		return a, err
+	}
+	if mode == "" && in.Interactive {
+		i, err := in.Choose("Where does the control plane run?", []string{
+			"NeuralTrust hosts it; this cluster runs the data plane (hybrid)",
+			"In this cluster, with everything else; nothing leaves it (external)",
+			"In this cluster, serving data planes that run elsewhere (central control plane, saas)",
+		}, 0)
+		if err != nil {
+			return a, err
+		}
+		// Hybrid is the chart's default: choosing it writes nothing.
+		if i > 0 {
+			o.mode = values.Modes[i]
+		}
+		mode = values.Modes[i]
+	}
+	if mode == "" {
+		mode = "hybrid"
+	}
 
 	if o.domain == "" && !set("global", "domain") {
 		if o.domain, err = in.Text("Base domain for the endpoints, e.g. platform.example.com", ""); err != nil {
@@ -285,7 +403,7 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		}
 	}
 	if o.telemetry.v == nil && !set("global", "observability", "operationalTelemetry") && in.Interactive {
-		on, err := askTelemetry(in, out, values.DeploymentMode(files))
+		on, err := askTelemetry(in, out, mode)
 		if err != nil {
 			return a, err
 		}
@@ -340,12 +458,16 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 	}
 
 	// Datastores. Hybrid shares one PostgreSQL role and one Redis, which is
-	// what these questions configure. External mode gives every service its
+	// what these questions configure. The other modes give every service its
 	// own database role; that is set with -f.
-	mode, _ := values.Get(files, "global", "deploymentMode").(string)
-	if mode != "" && mode != "hybrid" {
+	if mode != "hybrid" {
 		if !set("global", "postgresql") || !set("global", "redis") {
-			fmt.Fprintln(out, "  External mode: PostgreSQL and Redis stay in the cluster unless your -f values configure them (see values-managed-datastores.yaml.example in the chart).")
+			fmt.Fprintf(out, "  Mode %s: PostgreSQL and Redis run in the cluster unless your -f values configure them (see values-managed-datastores.yaml.example in the chart).\n", mode)
+		}
+		if !set("global", "superadmin", "existingSecret", "name") && !set("global", "superadmin", "email") {
+			if a.Admin, err = askAdmin(ctx, in, out, cs, o.kube.Namespace, f); err != nil {
+				return a, err
+			}
 		}
 		return a, nil
 	}
@@ -369,6 +491,71 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		}
 	}
 	return a, nil
+}
+
+// minAdminPassword is the shortest first-admin password install accepts.
+const minAdminPassword = 12
+
+// askAdmin settles the console's first admin of an external or saas install:
+// an existing admin Secret is kept, else the login comes from
+// ONPREM_SUPERADMIN_EMAIL and ONPREM_SUPERADMIN_PASSWORD, else from the
+// operator. With --secrets-mode print the password is left to the printed
+// command.
+func askAdmin(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.Interface, ns string, f installFlags) (*setup.Admin, error) {
+	keep, err := exists(ctx, cs, ns, setup.AdminSecret, f.replace)
+	if err != nil {
+		return nil, err
+	}
+	if keep {
+		fmt.Fprintf(out, "  Using the existing admin Secret %s.\n", setup.AdminSecret)
+		return &setup.Admin{Existing: true}, nil
+	}
+	ad := &setup.Admin{Email: strings.TrimSpace(os.Getenv(setup.AdminEmailKey)), Password: os.Getenv(setup.AdminPassKey)}
+	missing := fmt.Errorf("the console's first admin is needed: set %s and %s, or point global.superadmin.existingSecret.name at a Secret of yours", setup.AdminEmailKey, setup.AdminPassKey)
+	if ad.Email == "" {
+		if !in.Interactive {
+			return nil, missing
+		}
+		for {
+			if ad.Email, err = in.Text("Email of the console's first admin", ""); err != nil {
+				return nil, err
+			}
+			if ad.Email = strings.TrimSpace(ad.Email); strings.Contains(ad.Email, "@") {
+				break
+			}
+			fmt.Fprintln(out, "  Enter an email address.")
+		}
+	}
+	if f.print() {
+		ad.Password = ""
+		return ad, nil
+	}
+	if ad.Password != "" {
+		if len(ad.Password) < minAdminPassword {
+			return nil, fmt.Errorf("%s must be at least %d characters", setup.AdminPassKey, minAdminPassword)
+		}
+		return ad, nil
+	}
+	if !in.Interactive {
+		return nil, missing
+	}
+	for {
+		if ad.Password, err = in.Secret(fmt.Sprintf("Password for %s (at least %d characters)", ad.Email, minAdminPassword)); err != nil {
+			return nil, err
+		}
+		again, err := in.Secret("Repeat the password")
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case len(ad.Password) < minAdminPassword:
+			fmt.Fprintf(out, "  The password needs at least %d characters.\n", minAdminPassword)
+		case again != ad.Password:
+			fmt.Fprintln(out, "  The passwords differ.")
+		default:
+			return ad, nil
+		}
+	}
 }
 
 // askExposure offers the cluster's Gateways next to Ingress and returns the

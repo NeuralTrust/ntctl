@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -21,11 +22,12 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/report"
 	"github.com/NeuralTrust/ntctl/internal/secrets"
+	"github.com/NeuralTrust/ntctl/internal/setup"
 	"github.com/NeuralTrust/ntctl/internal/values"
 	"github.com/NeuralTrust/ntctl/internal/version"
 )
 
-func runVersion(_ context.Context, args []string, out io.Writer) error {
+func runVersion(ctx context.Context, args []string, out io.Writer) error {
 	var o opts
 	fs := newFlags("version", "Print the ntctl version and the latest chart version.", out, &o, false)
 	if err := parse(fs, args); err != nil {
@@ -37,6 +39,17 @@ func runVersion(_ context.Context, args []string, out io.Writer) error {
 		latest = "unknown (" + err.Error() + ")"
 	}
 	fmt.Fprintf(out, "latest chart: %s\n", latest)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	newest, err := version.Latest(ctx, &http.Client{Timeout: 5 * time.Second}, version.ReleasesURL)
+	switch {
+	case err != nil:
+		fmt.Fprintf(out, "latest ntctl: unknown (%v)\n", err)
+	case version.Outdated(version.Version, newest):
+		fmt.Fprintf(out, "latest ntctl: %s; you run %s. Update with the install script:\n  curl -sSfL https://raw.githubusercontent.com/NeuralTrust/ntctl/main/install.sh | sh\n", newest, version.Version)
+	default:
+		fmt.Fprintf(out, "latest ntctl: %s\n", newest)
+	}
 	return nil
 }
 
@@ -138,9 +151,17 @@ func runStatus(ctx context.Context, args []string, out io.Writer) error {
 	} else {
 		fmt.Fprintf(out, "Release %s: chart %s, revision %d, %s, updated %s\n",
 			rel.Name, rel.Chart.Metadata.Version, rel.Version, rel.Info.Status, rel.Info.LastDeployed.Format(time.RFC3339))
+		fmt.Fprintf(out, "Mode: %s\n", describeMode(values.DeploymentMode(rel.Config)))
+		if cp, _ := values.DialedControlPlane(rel.Config); cp != "" && values.DeploymentMode(rel.Config) == "hybrid" {
+			fmt.Fprintf(out, "Control plane: %s\n", cp)
+		}
 		fmt.Fprintf(out, "Operational telemetry: %s\n\n", values.TelemetryState(rel.Config))
 	}
 	st.Print(out)
+	// Something is not running: the next step is finding out why.
+	if (rel != nil && (failed(rel) || status(rel).IsPending())) || !st.Ready() || len(st.Problems) > 0 {
+		fmt.Fprintln(out, "\nRun `ntctl doctor` for the cause and how to fix it.")
+	}
 	return nil
 }
 
@@ -270,9 +291,15 @@ func (o *opts) clients() (kubernetes.Interface, dynamic.Interface, error) {
 }
 
 // managedSecrets are the Secrets `ntctl install` creates for these values:
-// the pull secret and the token Secrets of the enabled products.
+// the pull secret and, in hybrid, the token Secrets of the enabled products.
 func managedSecrets(vals map[string]any) map[string][]string {
 	out := map[string][]string{secrets.PullSecret: {".dockerconfigjson"}}
+	if values.DeploymentMode(vals) != "hybrid" {
+		if values.Get(vals, "global", "superadmin", "existingSecret", "name") == setup.AdminSecret {
+			out[setup.AdminSecret] = []string{setup.AdminEmailKey, setup.AdminPassKey}
+		}
+		return out
+	}
 	for _, s := range secrets.TokenSpecs(enabledProducts(vals)) {
 		out[s.Name] = append(out[s.Name], s.Key)
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/api"
 	"github.com/NeuralTrust/ntctl/internal/auth"
 	"github.com/NeuralTrust/ntctl/internal/changelog"
+	"github.com/NeuralTrust/ntctl/internal/chart"
 	"github.com/NeuralTrust/ntctl/internal/diff"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
@@ -118,6 +119,9 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
+	if err := interrupted(rel, o.kube.Namespace); err != nil {
+		return err
+	}
 	// Without a release, applyChange says so.
 	plan := &changePlan{consoles: &consolePlan{}}
 	if rel != nil {
@@ -159,6 +163,9 @@ type changePlan struct {
 // products' tokens are asked for now, so the checks see their Secrets; a dry
 // run asks for none.
 func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Writer, rel *release.Release, remove string, sess *session, org string, pick map[api.Product]string, replace, dryRun bool) (*changePlan, error) {
+	if err := o.sameMode(rel.Config); err != nil {
+		return nil, err
+	}
 	if err := o.upgradeTelemetry(in, out, rel.Config); err != nil {
 		return nil, err
 	}
@@ -178,6 +185,11 @@ func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Write
 		o.extra = values.ProductDelta(base, c.change.add, c.change.remove)
 	}
 	c.change.print(out)
+	// The chart sends a hybrid install's telemetry through one DataAgent,
+	// TrustGate's when it runs: adding it changes TrustGuard's too.
+	if values.DeploymentMode(base) == "hybrid" && has(c.change.add, "trustgate") && has(values.Installed(base), "trustguard") {
+		fmt.Fprintln(out, "TrustGate's DataAgent takes over sending this install's telemetry from TrustGuard's, so TrustGuard's DataAgent changes too; the list of changes below shows it.")
+	}
 	if len(c.change.add) == 0 {
 		return c, nil
 	}
@@ -185,10 +197,19 @@ func (o *opts) planChange(ctx context.Context, in *prompt.Prompter, out io.Write
 	if err != nil {
 		return nil, err
 	}
-	if c.create, c.need, err = tokenSecrets(ctx, in, cs, o.kube.Namespace, sess, reuse(base, o.extra), c.change.add, replace, dryRun); err != nil {
+	if c.create, c.need, err = tokenSecrets(ctx, in, out, cs, o.kube.Namespace, sess, reuse(base, o.extra), c.change.add, replace, dryRun); err != nil {
 		return nil, err
 	}
 	if c.consoles, err = planConsole(ctx, in, out, sess, org, c.need, pick, instanceName(base, o.release)); err != nil {
+		return nil, err
+	}
+	// The release keeps the control plane it dials; tokens from a console
+	// of another one would never be accepted.
+	target := reuse(base, o.extra)
+	if o.controlPlane != "" {
+		target = values.Merge(target, values.ControlPlaneValues(o.controlPlane))
+	}
+	if _, err := pointAtConsole(target, c.consoles.controlPlane, false); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -227,9 +248,17 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	if done, err := f.review(out, res); done || err != nil {
 		return nil, err
 	}
-	if res.Empty() && from == to {
+	// A failed release renders the same as it was stored, yet it is not
+	// running: applying it again is the retry once the cause is fixed.
+	retry := failed(p.current)
+	// A product change is applied even when it renders nothing new: the
+	// release must record it, and its tokens be issued.
+	if res.Empty() && from == to && !retry && c.change.empty() {
 		fmt.Fprintln(out, "\nAlready up to date; nothing to upgrade.")
 		return nil, nil
+	}
+	if retry {
+		fmt.Fprintf(out, "\nRevision %d failed; this applies it again so it can become ready.\n", p.current.Version)
 	}
 	if !c.change.empty() {
 		fmt.Fprintln(out)
@@ -250,6 +279,11 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	if err != nil {
 		return nil, err
 	}
+	if d, err := c.consoles.issuedControlPlane(); err != nil {
+		return nil, err
+	} else if _, err := pointAtConsole(reuse(p.current.Config, p.values), d, false); err != nil {
+		return nil, err
+	}
 	done, err := secrets.Apply(ctx, p.cs, append(c.create, issued...), c.replace)
 	for _, d := range done {
 		fmt.Fprintf(out, "Secret: %s\n", d)
@@ -257,11 +291,26 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	if err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(out, "Upgrading… waiting up to %s; if it does not become ready, the last working revision is restored.\n", f.timeout)
+	hist, err := helm.History(p.cfg, o.release)
+	if err != nil {
+		return nil, err
+	}
+	if w := helm.LastWorking(hist); w != nil {
+		fmt.Fprintf(out, "Upgrading… waiting up to %s; if it does not become ready, revision %d is restored.\n", f.timeout, w.Version)
+	} else {
+		fmt.Fprintf(out, "Upgrading… waiting up to %s. No revision has worked yet, so if this one does not become ready it is left in place for `ntctl doctor`.\n", f.timeout)
+	}
+	// Progress only: stopping an upgrade's wait would also cut short the
+	// rollback Helm runs when it fails.
+	w := waitWatch{cs: p.cs, cluster: p.cluster, ns: o.kube.Namespace, release: o.release, out: out, every: watchEvery}.start(ctx)
 	result, upErr := helm.Upgrade(ctx, p.cfg, p.chart, p.values, o.release, o.kube.Namespace, f.timeout)
+	w.finish()
 	if st, err := report.Collect(ctx, p.cs, p.dyn, o.kube.Namespace); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
+	}
+	if upErr != nil {
+		o.printFailures(ctx, out)
 	}
 	switch {
 	case upErr == nil:
@@ -270,7 +319,7 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	case result.RolledBackTo > 0:
 		return nil, fmt.Errorf("upgrade failed (%w); it was rolled back to revision %d, but that is not ready either. Run `ntctl doctor`", upErr, result.RolledBackTo)
 	default:
-		return nil, fmt.Errorf("upgrade failed (%w); there was no earlier working revision to roll back to, so it was left in place. Run `ntctl doctor`, fix the cause, and upgrade again", upErr)
+		return nil, fmt.Errorf("upgrade failed (%w); there was no earlier working revision to roll back to, so it was left in place: %s", upErr, fixThenUpgrade)
 	}
 	vals := reuse(p.current.Config, p.values)
 	c.consoles.finalize(ctx, out, c.sess, vals)
@@ -379,7 +428,7 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 	case target == nil && to > 0:
 		return fmt.Errorf("release %q has no revision %d; see `ntctl history`", o.release, to)
 	case target == nil:
-		return fmt.Errorf("release %q has no earlier revision that worked; see `ntctl history` and pass --to", o.release)
+		return fmt.Errorf("release %q has no earlier revision that worked, so there is nothing to roll back to; %s", o.release, fixThenUpgrade)
 	case target.Version == cur.Version:
 		return fmt.Errorf("revision %d is the current one", to)
 	}
@@ -445,6 +494,7 @@ func runAdopt(ctx context.Context, args []string, out io.Writer) error {
 	fs := newFlags("adopt", adoptSummary, out, &o, false)
 	fs.StringVar(&file, "values-file", "neuraltrust-values.yaml", "where to write the release's values, secrets removed (empty to skip)")
 	fs.BoolVar(&showDiff, "show-diff", false, "print the full diff when the release does not re-render identically")
+	fs.StringVar(&o.chartPath, "chart", "", "local chart directory or .tgz of the release's chart version, for clusters without access to the chart registry")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -459,8 +509,24 @@ func runAdopt(ctx context.Context, args []string, out io.Writer) error {
 	if rel == nil {
 		return fmt.Errorf("no release %q in namespace %q; pass --namespace and --release", o.release, o.kube.Namespace)
 	}
-	fmt.Fprintf(out, "Release %s: chart %s, revision %d, %s, on %s.\n", rel.Name, rel.Chart.Metadata.Version, rel.Version, rel.Info.Status, o.kube.Target())
-	planned, err := helm.Plan(ctx, cfg, rel.Chart, rel.Config, o.release, o.kube.Namespace, false)
+	fmt.Fprintf(out, "Release %s: chart %s, revision %d, %s, on %s.\n", rel.Name, rel.Chart.Metadata.Version, rel.Version, status(rel), o.kube.Target())
+	if err := interrupted(rel, o.kube.Namespace); err != nil {
+		return err
+	}
+	if failed(rel) {
+		fmt.Fprintf(out, "Revision %d failed: adopt compares it with what it applied, but it is not running; %s.\n", rel.Version, fixThenUpgrade)
+	}
+	// The chart stored in the release has no subcharts (Helm does not keep
+	// them), so the release's own version is loaded from its source.
+	want := rel.Chart.Metadata.Version
+	ch, err := chart.Load(o.kube.Settings(), chart.Source{Path: o.chartPath, Version: want})
+	if err != nil {
+		return fmt.Errorf("loading chart %s, the release's version: %w; without access to the chart registry, pass --chart with that version's directory or .tgz", want, err)
+	}
+	if ch.Version != want {
+		return fmt.Errorf("--chart is version %s, but the release runs %s; pass the chart the release was installed with", ch.Version, want)
+	}
+	planned, err := helm.Plan(ctx, cfg, ch.Chart, rel.Config, o.release, o.kube.Namespace, false)
 	if err != nil {
 		return fmt.Errorf("the cluster rejected a dry run of the release's own chart: %w", err)
 	}

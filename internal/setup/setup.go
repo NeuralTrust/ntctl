@@ -26,7 +26,20 @@ const (
 	PostgresSecret = "external-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
 	RedisSecret    = "external-redis"
+
+	// AdminSecret holds the console's first admin in external and saas
+	// installs, under the keys the chart reads by default.
+	AdminSecret   = "onprem-superadmin"
+	AdminEmailKey = "ONPREM_SUPERADMIN_EMAIL"
+	AdminPassKey  = "ONPREM_SUPERADMIN_PASSWORD" // #nosec G101 -- a key name, not a credential
 )
+
+// OwnSecrets are the names of every Secret ntctl may create in an install
+// namespace, including the ones earlier versions used.
+func OwnSecrets() []string {
+	return []string{secrets.PullSecret, PostgresSecret, RedisSecret, "ntctl-postgresql", "ntctl-redis", AdminSecret,
+		"agentgateway-config-sync", "trustguard-config-sync", "dataagent-enrolment-trustgate", "dataagent-enrolment-trustguard"}
+}
 
 // Images says where the cluster pulls images from. An empty Registry means
 // the NeuralTrust registry, authenticated with RegistryKey.
@@ -61,11 +74,21 @@ type Redis struct {
 	TLS      bool
 }
 
-// Answers are the install choices. Nil datastores stay in the cluster.
+// Admin is the console's first admin in an external or saas install.
+type Admin struct {
+	Email    string
+	Password string
+	// Existing means the Secret is already in place and kept as it is.
+	Existing bool
+}
+
+// Answers are the install choices. Nil datastores stay in the cluster; a nil
+// Admin leaves the bootstrap admin to the values.
 type Answers struct {
 	Images   Images
 	Postgres *Postgres
 	Redis    *Redis
+	Admin    *Admin
 }
 
 // Values returns the chart values the answers stand for.
@@ -94,6 +117,9 @@ func (a Answers) Values() map[string]any {
 			"deploy":         false,
 			"existingSecret": map[string]any{"name": RedisSecret},
 		}
+	}
+	if a.Admin != nil {
+		global["superadmin"] = map[string]any{"existingSecret": map[string]any{"name": AdminSecret}}
 	}
 	if len(global) == 0 {
 		return map[string]any{}
@@ -131,6 +157,9 @@ func (a Answers) Secrets(ns string) ([]*corev1.Secret, error) {
 			"REDIS_TLS":      strconv.FormatBool(r.TLS),
 		}))
 	}
+	if ad := a.Admin; ad != nil && !ad.Existing {
+		out = append(out, secrets.Opaque(ns, AdminSecret, map[string]string{AdminEmailKey: ad.Email, AdminPassKey: ad.Password}))
+	}
 	return out, nil
 }
 
@@ -160,6 +189,13 @@ func (a Answers) Summary() []string {
 		out = append(out, fmt.Sprintf("Redis:      %s:%d%s", r.Host, r.Port, tls))
 	} else {
 		out = append(out, "Redis:      in the cluster")
+	}
+	switch ad := a.Admin; {
+	case ad == nil:
+	case ad.Existing:
+		out = append(out, "Admin:      from the existing Secret "+AdminSecret)
+	default:
+		out = append(out, "Admin:      "+ad.Email+" (first sign-in to the console)")
 	}
 	return out
 }

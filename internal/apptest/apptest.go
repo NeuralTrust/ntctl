@@ -37,6 +37,9 @@ type Server struct {
 	AccessTTL time.Duration
 	// ReadOnly makes every write answer 403, as for a member without ADMIN.
 	ReadOnly bool
+	// ControlPlane is the DNS suffix of the control plane the issued tokens
+	// are valid at; New sets the EU region's.
+	ControlPlane string
 
 	n         int
 	codes     map[string]grant
@@ -67,18 +70,19 @@ type Issued struct {
 // New starts a fake console with one user in two organizations.
 func New() *Server {
 	s := &Server{
-		Email:     "ops@example.com",
-		Orgs:      []api.Org{{ID: "org-1", Name: "Acme", Region: "eu", Role: "ADMIN"}, {ID: "org-2", Name: "Acme Labs", Region: "eu", Role: "ADMIN"}},
-		Chosen:    "org-1",
-		AccessTTL: time.Hour,
-		codes:     map[string]grant{},
-		access:    map[string]access{},
-		refresh:   map[string]string{},
-		used:      map[string]string{},
-		revoked:   map[string]bool{},
-		instances: map[string][]api.Instance{},
-		idem:      map[string]api.Instance{},
-		finalized: map[string]string{},
+		Email:        "ops@example.com",
+		Orgs:         []api.Org{{ID: "org-1", Name: "Acme", Region: "eu", Role: "ADMIN"}, {ID: "org-2", Name: "Acme Labs", Region: "eu", Role: "ADMIN"}},
+		Chosen:       "org-1",
+		AccessTTL:    time.Hour,
+		ControlPlane: "neuraltrust.ai",
+		codes:        map[string]grant{},
+		access:       map[string]access{},
+		refresh:      map[string]string{},
+		used:         map[string]string{},
+		revoked:      map[string]bool{},
+		instances:    map[string][]api.Instance{},
+		idem:         map[string]api.Instance{},
+		finalized:    map[string]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.discovery)
@@ -390,7 +394,9 @@ func (s *Server) installConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found", "message": "no such instance in this organization"})
 		return
 	}
-	cfg := api.InstallConfig{TenantID: r.PathValue("org"), ConfigSyncToken: s.next("configsync"), EnrolmentToken: s.next("enrolment")}
+	// The real console reports TrustGate's config-sync host for both kinds.
+	cfg := api.InstallConfig{TenantID: r.PathValue("org"), ConfigSyncToken: s.next("configsync"), EnrolmentToken: s.next("enrolment"),
+		ConfigSyncEndpoint: "agentgateway-configsync." + s.ControlPlane + ":443", DataBridgeAddr: "databridge." + s.ControlPlane + ":443"}
 	product := api.TrustGate
 	if r.PathValue("kind") == "guards" {
 		product = api.TrustGuard
@@ -398,7 +404,7 @@ func (s *Server) installConfig(w http.ResponseWriter, r *http.Request) {
 	s.issued = append(s.issued, Issued{Product: string(product), Org: r.PathValue("org"), ID: r.PathValue("id"), Rotate: body.Rotate, Config: cfg})
 	writeJSON(w, http.StatusOK, map[string]string{
 		"tenantId": cfg.TenantID, "configSyncToken": cfg.ConfigSyncToken, "enrolmentToken": cfg.EnrolmentToken,
-		"configSyncGrpcEndpoint": "agentgateway-configsync.example:443", "databridgeAddr": "databridge.example:443",
+		"configSyncGrpcEndpoint": cfg.ConfigSyncEndpoint, "databridgeAddr": cfg.DataBridgeAddr,
 	})
 }
 

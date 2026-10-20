@@ -29,7 +29,7 @@ func TestAddProductsStopsBeforeAnyToken(t *testing.T) {
 	all := values.Generate(values.Inputs{Domain: "d.example.com", Products: values.Products})
 	pinned := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"controlPlane": map[string]any{"configSyncAddr": "lb.example.com:443"}}})
 	exposed := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"ingress": map[string]any{
-		"provider": "gateway-api", "gatewayApi": map[string]any{"parentRefs": []any{map[string]any{"name": "internal", "namespace": "gw"}}}}}})
+		"provider": "gateway-api", "gatewayApi": map[string]any{"parentRefs": []any{map[string]any{"name": "shared", "namespace": "gw"}}}}}})
 	noTerminal := func(w io.Writer) *prompt.Prompter {
 		return prompt.New(context.Background(), strings.NewReader(""), w, false)
 	}
@@ -53,8 +53,10 @@ func TestAddProductsStopsBeforeAnyToken(t *testing.T) {
 			says: []string{"registry key is not used", "nothing to do"}},
 		{name: "another domain", o: opts{products: "trustguard", domain: "other.example.com"}, cfg: gate, in: noTerminal, err: "--domain other.example.com differs"},
 		{name: "another platform", o: opts{products: "trustguard", platform: "gcp"}, cfg: values.Merge(gateOnly(), map[string]any{"global": map[string]any{"platform": "azure"}}), in: noTerminal, err: "--platform gcp differs"},
-		{name: "another gateway", o: opts{products: "trustguard", gateway: "gw/external"}, cfg: exposed, in: noTerminal, err: "--gateway gw/external differs from how the release is exposed (HTTPRoutes on Gateway gw/internal)"},
-		{name: "a gateway on an Ingress install", o: opts{products: "trustguard", gateway: "gw/internal"}, cfg: gate, in: noTerminal, err: "(Ingresses)"},
+		{name: "another gateway", o: opts{products: "trustguard", gateway: "gw/external"}, cfg: exposed, in: noTerminal, err: "--gateway gw/external differs from how the release is exposed (HTTPRoutes on Gateway gw/shared)"},
+		{name: "a gateway on an Ingress install", o: opts{products: "trustguard", gateway: "gw/shared"}, cfg: gate, in: noTerminal, err: "(Ingresses)"},
+		{name: "another mode", o: opts{products: "trustguard", mode: "external"}, cfg: gate, in: noTerminal, err: "--mode external differs from the release's mode, hybrid"},
+		{name: "the same mode", o: opts{products: "trustgate", mode: "Hybrid"}, cfg: gate, in: noTerminal, says: []string{"nothing to do"}},
 		{name: "print mode", o: opts{products: "trustguard"}, f: installFlags{secretsMode: "print"}, cfg: gate, in: noTerminal, err: "--secrets-mode print is for a new install"},
 		{name: "configSyncAddr serves one product", o: opts{products: "trustguard"}, cfg: pinned, in: noTerminal, err: "configSyncAddr, which serves a single product"},
 		{name: "the question offers what is missing", cfg: pinned, in: terminal("\n"), err: "serves a single product",
@@ -119,5 +121,30 @@ func TestUpdateSavedValuesOnlyWhenKept(t *testing.T) {
 	}
 	if strings.Contains(string(b), "CANARY") || !strings.Contains(string(b), "trustgate: true") {
 		t.Fatalf("saved values:\n%s", b)
+	}
+}
+
+func TestFilesMatchRelease(t *testing.T) {
+	current := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"platform": "azure"}})
+	cases := []struct {
+		name  string
+		files map[string]any
+		err   string
+	}{
+		{name: "no files", files: map[string]any{}},
+		{name: "the first install's own values", files: gateOnly()},
+		{name: "another domain", files: map[string]any{"global": map[string]any{"domain": "other.example.com"}}, err: `global.domain to "other.example.com", but the release has "d.example.com"`},
+		{name: "another platform", files: map[string]any{"global": map[string]any{"platform": "aws"}}, err: "global.platform"},
+		{name: "hybrid spelled out", files: map[string]any{"global": map[string]any{"deploymentMode": "hybrid"}}},
+		{name: "another mode", files: map[string]any{"global": map[string]any{"deploymentMode": "external"}}, err: "cannot change where its control plane runs"},
+	}
+	for _, c := range cases {
+		err := filesMatchRelease(c.files, current)
+		switch {
+		case c.err == "" && err != nil:
+			t.Errorf("%s: %v", c.name, err)
+		case c.err != "" && (err == nil || !strings.Contains(err.Error(), c.err)):
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.err)
+		}
 	}
 }

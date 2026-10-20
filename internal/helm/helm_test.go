@@ -3,6 +3,7 @@ package helm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -12,6 +13,8 @@ import (
 	"helm.sh/helm/v4/pkg/chart/common"
 	chartv2 "helm.sh/helm/v4/pkg/chart/v2"
 	kubefake "helm.sh/helm/v4/pkg/kube/fake"
+	rcommon "helm.sh/helm/v4/pkg/release/common"
+	release "helm.sh/helm/v4/pkg/release/v1"
 	"helm.sh/helm/v4/pkg/storage"
 	"helm.sh/helm/v4/pkg/storage/driver"
 
@@ -53,7 +56,7 @@ func tinyChart() *chart.Loaded {
 func TestUpgradeRollsBackToTheLastWorkingRevision(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	f.notReady(true)
@@ -78,7 +81,7 @@ func TestUpgradeWithNothingToRollBackTo(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
 	f.notReady(true)
-	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute); !errors.Is(err, ErrNotReady) {
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("install err = %v, want ErrNotReady", err)
 	}
 	res, err := Upgrade(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute)
@@ -90,10 +93,66 @@ func TestUpgradeWithNothingToRollBackTo(t *testing.T) {
 	}
 }
 
+// TestUpgradeRollbackSeenPastMaxHistory: once history is pruned to
+// MaxHistory, its length no longer grows, and a rollback must still be seen.
+func TestUpgradeRollbackSeenPastMaxHistory(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeCluster()
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "0"}, "rel", "ns", time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 12; i++ {
+		if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": fmt.Sprint(i)}, "rel", "ns", time.Minute); err != nil {
+			t.Fatalf("upgrade %d: %v", i, err)
+		}
+	}
+	f.notReady(true)
+	res, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "bad"}, "rel", "ns", time.Minute)
+	if !errors.Is(err, ErrNotReady) {
+		t.Fatalf("err = %v, want ErrNotReady", err)
+	}
+	if res.RolledBackTo != 13 {
+		t.Fatalf("RolledBackTo = %d, want 13 (the last working revision)", res.RolledBackTo)
+	}
+}
+
+func TestUninstallRemovesTheReleaseAndItsHistory(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeCluster()
+	f.notReady(true)
+	// A release that never became ready uninstalls like any other.
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("install err = %v", err)
+	}
+	f.notReady(false)
+	if err := Uninstall(f.cfg, "rel", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if cur, err := Current(f.cfg, "rel"); err != nil || cur != nil {
+		t.Fatalf("after uninstall: %v, %v; want no release", cur, err)
+	}
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, nil); err != nil {
+		t.Fatalf("the name should be free again: %v", err)
+	}
+}
+
+func TestLastWorking(t *testing.T) {
+	rev := func(v int, st rcommon.Status) *release.Release {
+		return &release.Release{Version: v, Info: &release.Info{Status: st}}
+	}
+	if got := LastWorking([]*release.Release{rev(1, rcommon.StatusFailed)}); got != nil {
+		t.Fatalf("a failed-only history has no working revision, got %d", got.Version)
+	}
+	hist := []*release.Release{rev(1, rcommon.StatusSuperseded), rev(2, rcommon.StatusDeployed), rev(3, rcommon.StatusFailed)}
+	if got := LastWorking(hist); got == nil || got.Version != 2 {
+		t.Fatalf("LastWorking = %v, want revision 2", got)
+	}
+}
+
 func TestUpgradeKeepsValues(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1", "keep": "me"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1", "keep": "me"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "2"}, "rel", "ns", time.Minute); err != nil {
@@ -108,7 +167,7 @@ func TestUpgradeKeepsValues(t *testing.T) {
 func TestRollbackRestoresAnEarlierRevision(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeCluster()
-	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute); err != nil {
+	if _, err := Install(ctx, f.cfg, tinyChart(), map[string]any{"v": "1"}, "rel", "ns", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Upgrade(ctx, f.cfg, tinyChart(), map[string]any{"v": "2"}, "rel", "ns", time.Minute); err != nil {
@@ -124,5 +183,22 @@ func TestRollbackRestoresAnEarlierRevision(t *testing.T) {
 	hist, err := History(f.cfg, "rel")
 	if err != nil || len(hist) != 3 {
 		t.Fatalf("history = %d revisions, %v", len(hist), err)
+	}
+}
+
+// TestInstallStoppedEarlyIsFailedNotPending: stopping the wait must leave a
+// release Helm can upgrade again, never one locked in pending-install.
+func TestInstallStoppedEarlyIsFailedNotPending(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeCluster()
+	f.notReady(true)
+	stop, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := Install(ctx, f.cfg, tinyChart(), nil, "rel", "ns", time.Minute, stop); !errors.Is(err, ErrStopped) {
+		t.Fatalf("err = %v, want ErrStopped", err)
+	}
+	cur, err := Current(f.cfg, "rel")
+	if err != nil || cur == nil || cur.Info.Status != rcommon.StatusFailed {
+		t.Fatalf("after a stopped install: %v, %v; want a failed release", cur, err)
 	}
 }

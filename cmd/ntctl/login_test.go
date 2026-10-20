@@ -66,6 +66,12 @@ func TestConsoleCommands(t *testing.T) {
 	if got := srv.Instances(api.TrustGate, "org-2"); len(got) != 1 {
 		t.Fatalf("the instance should be in the selected org, got %v", got)
 	}
+	if out = ntctl(t, 1, "trustgate", "create", "EDGE-1"); !strings.Contains(out, "already exists") || !strings.Contains(out, "--trustgate-instance") {
+		t.Fatalf("a taken name should be refused:\n%s", out)
+	}
+	if got := srv.Instances(api.TrustGate, "org-2"); len(got) != 1 {
+		t.Fatalf("a refused create made an instance: %v", got)
+	}
 	if out := ntctl(t, 0, "trustgate", "list", "--org", "org-2"); !strings.Contains(out, "edge-1") {
 		t.Fatalf("list:\n%s", out)
 	}
@@ -108,6 +114,43 @@ func TestLoginRefusesUnknownRegion(t *testing.T) {
 	}
 }
 
+func TestLoginValidatesTheRegionWithAnAppURL(t *testing.T) {
+	srv := console(t)
+	if out := ntctl(t, 1, "login", "--app-url", srv.URL, "--region", "mars"); !strings.Contains(out, "unknown region") {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+// TestRegionFollowsTheConsole: signed in, the region is the console's, so
+// changing it alone would pair one region's data plane with another's tokens.
+func TestRegionFollowsTheConsole(t *testing.T) {
+	srv := console(t)
+	ntctl(t, 0, "login", "--app-url", srv.URL)
+	if out := ntctl(t, 1, "config", "set", "region", "us"); !strings.Contains(out, "ntctl login --region us") {
+		t.Fatalf("output:\n%s", out)
+	}
+	ntctl(t, 0, "logout")
+	if out := ntctl(t, 0, "config", "set", "region", "us"); !strings.Contains(out, "Region set to us") {
+		t.Fatalf("signed out, the region is the next login's:\n%s", out)
+	}
+}
+
+func TestFindOrg(t *testing.T) {
+	orgs := []api.Org{{ID: "o1", Name: "Acme"}, {ID: "o2", Name: "acme"}, {ID: "o3", Name: "Labs"}}
+	if o, err := findOrg(orgs, "labs"); err != nil || o.ID != "o3" {
+		t.Errorf("by name: %v, %v", o, err)
+	}
+	if o, err := findOrg(orgs, "o2"); err != nil || o.ID != "o2" {
+		t.Errorf("by ID: %v, %v", o, err)
+	}
+	if _, err := findOrg(orgs, "ACME"); err == nil || !strings.Contains(err.Error(), "o1, o2") {
+		t.Errorf("a shared name: %v", err)
+	}
+	if _, err := findOrg(orgs, "nope"); err == nil {
+		t.Error("an unknown organization")
+	}
+}
+
 func signedIn(t *testing.T) (*apptest.Server, *session) {
 	t.Helper()
 	srv := console(t)
@@ -128,31 +171,131 @@ func TestChooseInstances(t *testing.T) {
 	srv.AddInstance(api.TrustGate, "org-1", api.Instance{ID: "gw-1", Name: "prod"})
 	ctx := context.Background()
 	var out bytes.Buffer
+	noTerminal := func() *prompt.Prompter { return prompt.New(context.Background(), strings.NewReader(""), &out, false) }
+	choose := func(in *prompt.Prompter, pick map[api.Product]string, def string) ([]*consoleInstance, error) {
+		return chooseInstances(ctx, in, &out, s, "org-1", "Acme", gateSpecs(), pick, def)
+	}
 
 	// Non-interactive, nothing named: a new instance named after the domain.
-	plan, err := chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), nil, "platform.example.com")
+	plan, err := choose(noTerminal(), nil, "platform.example.com")
 	if err != nil || len(plan) != 1 || plan[0].inst != nil || plan[0].newName != "platform.example.com" {
 		t.Fatalf("plan = %+v, %v", plan, err)
 	}
-	// Named by flag.
-	plan, err = chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "prod"}, "x")
-	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
-		t.Fatalf("plan = %+v, %v", plan, err)
+	// Non-interactive, an instance already has the default name: it is
+	// reused, so running an install again never adds a second one.
+	plan, err = choose(noTerminal(), nil, "PROD")
+	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" || plan[0].newName != "" {
+		t.Fatalf("default name taken: %+v, %v", plan, err)
 	}
-	if _, err = chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "nope"}, "x"); err == nil {
-		t.Fatal("an unknown instance name should fail")
+	// Named by flag, by name or by ID.
+	for _, key := range []string{"prod", "gw-1"} {
+		plan, err = choose(noTerminal(), map[api.Product]string{api.TrustGate: key}, "x")
+		if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
+			t.Fatalf("--trustgate-instance %s: %+v, %v", key, plan, err)
+		}
+	}
+	if _, err = choose(noTerminal(), map[api.Product]string{api.TrustGate: "nope"}, "x"); err == nil || !strings.Contains(err.Error(), "in organization Acme") {
+		t.Fatalf("an unknown instance name: err = %v, want it to name the organization", err)
 	}
 	// Interactive: the existing one is offered; Enter creates a new one.
-	plan, err = chooseInstances(ctx, prompt.Scripted(strings.NewReader("1\n"), &out), &out, s, "org-1", gateSpecs(), nil, "x")
+	plan, err = choose(prompt.Scripted(strings.NewReader("1\n"), &out), nil, "x")
 	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
 		t.Fatalf("choosing the existing one: %+v, %v", plan, err)
 	}
-	plan, err = chooseInstances(ctx, prompt.Scripted(strings.NewReader("\nedge\n"), &out), &out, s, "org-1", gateSpecs(), nil, "x")
+	plan, err = choose(prompt.Scripted(strings.NewReader("\nedge\n"), &out), nil, "x")
 	if err != nil || plan[0].inst != nil || plan[0].newName != "edge" {
 		t.Fatalf("creating a new one: %+v, %v", plan, err)
 	}
+	// Interactive: Enter takes the instance named like the default.
+	plan, err = choose(prompt.Scripted(strings.NewReader("\n"), &out), nil, "prod")
+	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
+		t.Fatalf("the default should be the instance named like the install: %+v, %v", plan, err)
+	}
+	// Interactive: typing a taken name means that instance.
+	plan, err = choose(prompt.Scripted(strings.NewReader("2\nprod\n"), &out), nil, "x")
+	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
+		t.Fatalf("a taken name should reuse the instance: %+v, %v", plan, err)
+	}
 	if len(srv.Instances(api.TrustGate, "org-1")) != 1 {
 		t.Fatal("choosing must not create anything")
+	}
+
+	// Two instances share a name: refused, listing both IDs.
+	srv.AddInstance(api.TrustGate, "org-1", api.Instance{ID: "gw-2", Name: "prod"})
+	for _, pick := range []map[api.Product]string{{api.TrustGate: "prod"}, nil} {
+		if _, err = choose(noTerminal(), pick, "prod"); err == nil || !strings.Contains(err.Error(), "gw-1, gw-2") {
+			t.Fatalf("an ambiguous name: err = %v, want both IDs", err)
+		}
+	}
+	// An ID always wins.
+	if plan, err = choose(noTerminal(), map[api.Product]string{api.TrustGate: "gw-2"}, "x"); err != nil || plan[0].inst.ID != "gw-2" {
+		t.Fatalf("by ID: %+v, %v", plan, err)
+	}
+}
+
+func TestPointAtConsole(t *testing.T) {
+	gate := gateOnly()
+	us := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"saasRegion": "us"}})
+	pinned := values.Merge(gateOnly(), values.ControlPlaneValues("cp.example.com"))
+	external := values.Merge(gateOnly(), map[string]any{"global": map[string]any{"deploymentMode": "external"}})
+	cases := []struct {
+		name   string
+		vals   map[string]any
+		domain string
+		fresh  bool
+		want   string // the domain set, "" for none
+		err    string
+	}{
+		{name: "region console", vals: gate, domain: "neuraltrust.ai", fresh: true},
+		{name: "us console", vals: us, domain: "us.neuraltrust.ai", fresh: true},
+		{name: "unknown console", vals: gate, domain: "", fresh: true},
+		{name: "dev console, new install", vals: gate, domain: "cp.example.com", fresh: true, want: "cp.example.com"},
+		{name: "dev console, existing release", vals: gate, domain: "cp.example.com", err: "release's data plane dials the control plane at neuraltrust.ai"},
+		{name: "values name another one", vals: pinned, domain: "other.example.com", fresh: true, err: "global.controlPlane.domain"},
+		{name: "values name the same one", vals: pinned, domain: "cp.example.com"},
+		{name: "external dials nothing", vals: external, domain: "cp.example.com", fresh: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := pointAtConsole(c.vals, c.domain, c.fresh)
+			switch {
+			case c.err != "":
+				if err == nil || !strings.Contains(err.Error(), c.err) {
+					t.Fatalf("err = %v, want %q", err, c.err)
+				}
+				return
+			case err != nil:
+				t.Fatal(err)
+			}
+			d, _ := values.Get(got, "global", "controlPlane", "domain").(string)
+			if d != c.want {
+				t.Fatalf("set %q, want %q", d, c.want)
+			}
+		})
+	}
+}
+
+func TestIssuedControlPlane(t *testing.T) {
+	srv, s := signedIn(t)
+	srv.ControlPlane = "dev.example.com"
+	ctx := context.Background()
+	var out bytes.Buffer
+	plan := &consolePlan{org: "org-1", instances: []*consoleInstance{
+		{product: api.TrustGate, specs: secrets.TokenSpecs([]string{"trustgate"}), newName: "a"},
+		{product: api.TrustGuard, specs: secrets.TokenSpecs([]string{"trustguard"}), newName: "b"},
+	}}
+	if d, err := plan.issuedControlPlane(); err != nil || d != "" {
+		t.Fatalf("before issue: %q, %v", d, err)
+	}
+	if _, err := plan.issue(ctx, &out, s, "neuraltrust"); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := plan.issuedControlPlane(); err != nil || d != "dev.example.com" {
+		t.Fatalf("issued for %q, %v; want dev.example.com", d, err)
+	}
+	plan.instances[1].cfg.ConfigSyncEndpoint = "agentgateway-configsync.other.example.com:443"
+	if _, err := plan.issuedControlPlane(); err == nil {
+		t.Fatal("two products issued for two control planes must be refused")
 	}
 }
 

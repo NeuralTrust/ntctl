@@ -141,9 +141,20 @@ func TestReleaseStates(t *testing.T) {
 	if r.Severity != preflight.Fail || len(r.Detail) == 0 || !strings.Contains(r.Detail[0], "deadline") {
 		t.Errorf("failed release: %+v", r)
 	}
+	if !strings.Contains(r.Fix, "No other finding explains it") || !strings.Contains(r.Fix, "support-bundle") {
+		t.Errorf("a failed release with no other finding should point at the bundle: %q", r.Fix)
+	}
+	crashing := pod("api-6b8f-a", "api-6b8f", waiting("CrashLoopBackOff", ""))
+	if r = run(t, rel(rcommon.StatusFailed, ""), crashing)["NT-DR-001"]; !strings.Contains(r.Fix, "findings below") {
+		t.Errorf("a failed release with findings should point at them: %q", r.Fix)
+	}
 	r = run(t, rel(rcommon.StatusPendingUpgrade, ""))["NT-DR-001"]
-	if r.Severity != preflight.Fail || !strings.Contains(r.Fix, "helm rollback") {
-		t.Errorf("stuck release: %+v", r)
+	if r.Severity != preflight.Fail || !strings.Contains(r.Fix, "ntctl rollback") {
+		t.Errorf("stuck upgrade: %+v", r)
+	}
+	r = run(t, rel(rcommon.StatusPendingInstall, ""))["NT-DR-001"]
+	if r.Severity != preflight.Fail || !strings.Contains(r.Fix, "ntctl uninstall") {
+		t.Errorf("stuck install: %+v", r)
 	}
 }
 
@@ -226,7 +237,7 @@ func TestPullCauses(t *testing.T) {
 }
 
 func TestHTTPRouteNotAccepted(t *testing.T) {
-	parent := map[string]any{"name": "internal", "namespace": "gw"}
+	parent := map[string]any{"name": "shared", "namespace": "gw"}
 	dyn := gatewayapitest.Client(
 		gatewayapitest.Route(ns, "app", []string{"app.example.com"}, []map[string]any{parent},
 			[]map[string]any{gatewayapitest.ParentStatus(parent, "Accepted", "True", "Accepted")}),

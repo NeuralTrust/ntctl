@@ -59,7 +59,7 @@ func Gateway(ns, name, ip string, listeners ...map[string]any) *unstructured.Uns
 }
 
 // Route is an HTTPRoute with hostnames and parent refs; parents is a list of
-// maps such as {"name": "internal", "namespace": "gw"}. status, when not nil,
+// maps such as {"name": "shared", "namespace": "gw"}. status, when not nil,
 // becomes status.parents.
 func Route(ns, name string, hosts []string, parents []map[string]any, status []map[string]any) *unstructured.Unstructured {
 	hs := make([]any, 0, len(hosts))

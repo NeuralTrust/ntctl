@@ -28,6 +28,7 @@ Commands:
   upgrade     Upgrade an existing install, keeping its values: shows release notes and every
               change first, stops on unsafe ones, rolls back if it does not become ready
   rollback    Return an install to an earlier revision, showing what changes first
+  uninstall   Remove an install; volumes and the Secrets ntctl created are kept unless asked
   history     Show the revisions of an install
   adopt       Check that a plain-Helm install can be managed with ntctl, changing nothing
   status      Show readiness, problem pods and DNS records for an install
@@ -90,6 +91,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runStatus(ctx, args[1:], stdout)
 	case "rollback":
 		err = runRollback(ctx, args[1:], stdin, stdout)
+	case "uninstall":
+		err = runUninstall(ctx, args[1:], stdin, stdout)
 	case "history":
 		err = runHistory(ctx, args[1:], stdout)
 	case "adopt":

@@ -87,9 +87,13 @@ func (c productChange) print(out io.Writer) {
 // need, and fetched only once the operator confirms), else from the operator.
 // With placeholders nothing is asked and each Secret has an empty value, for a
 // printed command or a dry run.
-func tokenSecrets(ctx context.Context, in *prompt.Prompter, cs kubernetes.Interface, ns string, sess *session, vals map[string]any, products []string, replace, placeholders bool) ([]*corev1.Secret, map[api.Product][]secrets.Spec, error) {
+func tokenSecrets(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.Interface, ns string, sess *session, vals map[string]any, products []string, replace, placeholders bool) ([]*corev1.Secret, map[api.Product][]secrets.Spec, error) {
 	var create []*corev1.Secret
 	need := map[api.Product][]secrets.Spec{}
+	// Only a hybrid data plane dials NeuralTrust with tokens.
+	if values.DeploymentMode(vals) != "hybrid" {
+		return nil, need, nil
+	}
 	for _, spec := range secrets.TokenSpecs(products) {
 		if !referenced(vals, spec.Name) {
 			continue
@@ -97,6 +101,9 @@ func tokenSecrets(ctx context.Context, in *prompt.Prompter, cs kubernetes.Interf
 		if keep, err := exists(ctx, cs, ns, spec.Name, replace); err != nil {
 			return nil, nil, err
 		} else if keep {
+			// Said aloud: a Secret left by an earlier install may hold tokens
+			// of another instance or console, which would not connect.
+			fmt.Fprintf(out, "  Keeping the existing token Secret %s; --replace-secrets takes new tokens instead.\n", spec.Name)
 			continue
 		}
 		if placeholders {

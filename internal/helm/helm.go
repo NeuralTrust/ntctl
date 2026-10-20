@@ -88,16 +88,29 @@ func Render(ctx context.Context, ch *chart.Loaded, vals map[string]any, o Render
 	return b.String(), nil
 }
 
+// ErrStopped means the wait for readiness was stopped early: the release was
+// applied and marked failed, as after a timeout.
+var ErrStopped = errors.New("the wait for readiness was stopped")
+
 // Install installs a new release and waits for it to become ready. On failure
-// the resources are kept so the operator can see what went wrong.
-func Install(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, vals map[string]any, name, namespace string, timeout time.Duration) (*release.Release, error) {
+// the resources are kept so the operator can see what went wrong. Cancelling
+// stop (optional) ends the wait early; the release is then marked failed,
+// exactly as when the timeout passes, and never left pending.
+func Install(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, vals map[string]any, name, namespace string, timeout time.Duration, stop context.Context) (*release.Release, error) {
 	inst := action.NewInstall(cfg)
 	inst.ReleaseName = name
 	inst.Namespace = namespace
 	inst.ServerSideApply = true
 	inst.WaitStrategy = kube.StatusWatcherStrategy
 	inst.Timeout = timeout
+	if stop != nil {
+		inst.WaitOptions = []kube.WaitOption{kube.WithWaitMethodContext(stop)}
+	}
 	r, err := inst.RunWithContext(ctx, ch.Chart, vals)
+	if err != nil && stop != nil && stop.Err() != nil && ctx.Err() == nil {
+		rel, _ := v1(r)
+		return rel, ErrStopped
+	}
 	rel, cerr := v1(r)
 	if err != nil {
 		return rel, readiness(err)
@@ -131,6 +144,11 @@ func Upgrade(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, v
 	if err != nil {
 		return UpgradeResult{}, err
 	}
+	last := 0
+	if n := len(before); n > 0 {
+		last = before[n-1].Version
+	}
+	working := LastWorking(before)
 	up := action.NewUpgrade(cfg)
 	up.Namespace = namespace
 	up.ReuseValues = true
@@ -144,19 +162,28 @@ func Upgrade(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, v
 	if _, err = up.RunWithContext(ctx, name, ch.Chart, vals); err == nil {
 		return UpgradeResult{}, nil
 	}
-	// The upgrade added one revision; a rollback, when Helm found a working
-	// revision to return to, added another.
+	// The upgrade wrote revision last+1; a rollback, when Helm found a working
+	// revision to return to, wrote one more. Revision numbers are compared,
+	// not history lengths: MaxHistory prunes old revisions on every write.
 	var res UpgradeResult
-	if after, herr := history(cfg, name); herr == nil && len(after) > len(before)+1 {
-		for i := len(before) - 1; i >= 0; i-- {
-			if st := before[i].Info.Status; st == rcommon.StatusDeployed || st == rcommon.StatusSuperseded {
-				res.RolledBackTo = before[i].Version
-				break
-			}
+	if after, herr := history(cfg, name); herr == nil && len(after) > 0 && working != nil {
+		if newest := after[len(after)-1]; newest.Version > last+1 {
+			res.RolledBackTo = working.Version
+			res.RollbackReady = newest.Info.Status == rcommon.StatusDeployed
 		}
-		res.RollbackReady = after[len(after)-1].Info.Status == rcommon.StatusDeployed
 	}
 	return res, readiness(err)
+}
+
+// LastWorking returns the newest revision in hist that was deployed
+// successfully, or nil when none ever was.
+func LastWorking(hist []*release.Release) *release.Release {
+	for i := len(hist) - 1; i >= 0; i-- {
+		if st := hist[i].Info.Status; st == rcommon.StatusDeployed || st == rcommon.StatusSuperseded {
+			return hist[i]
+		}
+	}
+	return nil
 }
 
 // Plan returns the manifest an upgrade to ch with vals would apply, without
@@ -198,6 +225,20 @@ func Rollback(cfg *action.Configuration, name string, to int, timeout time.Durat
 	return nil
 }
 
+// Uninstall removes a release and every resource it created, waiting up to
+// timeout for them to be gone, as `helm uninstall --wait` does. Its history
+// goes too, so the name can be installed again.
+func Uninstall(cfg *action.Configuration, name string, timeout time.Duration) error {
+	u := action.NewUninstall(cfg)
+	u.WaitStrategy = kube.StatusWatcherStrategy
+	u.DeletionPropagation = "background"
+	u.Timeout = timeout
+	if _, err := u.Run(name); err != nil {
+		return readiness(err)
+	}
+	return nil
+}
+
 // History returns the release's revisions, oldest first.
 func History(cfg *action.Configuration, name string) ([]*release.Release, error) {
 	return history(cfg, name)
@@ -221,7 +262,8 @@ func history(cfg *action.Configuration, name string) ([]*release.Release, error)
 	return out, nil
 }
 
-// Current returns the deployed release, or nil when there is none.
+// Current returns the release's newest revision, whatever its status (a
+// failed or pending one included), or nil when there is no release.
 func Current(cfg *action.Configuration, name string) (*release.Release, error) {
 	r, err := action.NewStatus(cfg).Run(name)
 	if errors.Is(err, driver.ErrReleaseNotFound) {

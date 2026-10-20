@@ -69,13 +69,13 @@ func TestSaveHasNoTokensAndRoundTrips(t *testing.T) {
 }
 
 func TestGenerateGateway(t *testing.T) {
-	out := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "kgateway-system", Name: "internal", SectionName: "https"}})
+	out := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "gateway-system", Name: "shared", SectionName: "https"}})
 	if Get(out, "global", "ingress", "provider") != "gateway-api" {
 		t.Fatalf("provider not set: %v", out)
 	}
 	refs, _ := Get(out, "global", "ingress", "gatewayApi", "parentRefs").([]any)
 	ref, _ := refs[0].(map[string]any)
-	if len(refs) != 1 || ref["namespace"] != "kgateway-system" || ref["name"] != "internal" || ref["sectionName"] != "https" {
+	if len(refs) != 1 || ref["namespace"] != "gateway-system" || ref["name"] != "shared" || ref["sectionName"] != "https" {
 		t.Errorf("parentRefs = %v", refs)
 	}
 	noSection := Generate(Inputs{Gateway: &gatewayapi.ParentRef{Namespace: "gw", Name: "edge"}})
@@ -157,6 +157,30 @@ func TestInstalledFollowsTheChartRule(t *testing.T) {
 	for _, c := range cases {
 		if got := Installed(c.vals); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s: Installed = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestNoTokenRefsOutsideHybrid: external and saas data planes never read the
+// console's tokens, so nothing points them at token Secrets.
+func TestNoTokenRefsOutsideHybrid(t *testing.T) {
+	for _, mode := range []string{"external", "saas"} {
+		v := Generate(Inputs{Mode: mode, Domain: "d.example.com", Products: Products})
+		if Get(v, "global", "deploymentMode") != mode {
+			t.Errorf("%s: deploymentMode = %v", mode, Get(v, "global", "deploymentMode"))
+		}
+		if Get(v, "agentgateway") != nil || Get(v, "trustguard") != nil {
+			t.Errorf("%s: token references generated: %v", mode, v)
+		}
+		delta := ProductDelta(map[string]any{"global": map[string]any{"deploymentMode": mode}}, []string{"trustguard"}, nil)
+		if Get(delta, "trustguard") != nil || Get(delta, "global", "products", "trustguard") != true {
+			t.Errorf("%s: delta = %v, want only the product switch", mode, delta)
+		}
+	}
+	for _, mode := range []string{"", "hybrid"} {
+		v := Generate(Inputs{Mode: mode, Products: []string{"trustgate"}})
+		if Get(v, "agentgateway", "configSync", "existingSecret", "name") != TrustGateConfigSync {
+			t.Errorf("mode %q: hybrid must reference the token Secrets: %v", mode, v)
 		}
 	}
 }

@@ -70,12 +70,12 @@ func TestPlatformFallback(t *testing.T) {
 func TestInspectGatewayAPI(t *testing.T) {
 	cs := fake.NewSimpleClientset(node("w1", "azure:///subscriptions/x", "4", "16Gi"))
 	cs.Discovery().(*fakediscovery.FakeDiscovery).Resources = []*metav1.APIResourceList{{GroupVersion: "gateway.networking.k8s.io/v1"}}
-	dyn := gatewayapitest.Client(gatewayapitest.Gateway("kgateway-system", "internal", "10.0.6.10", gatewayapitest.Listener("https", 443, nil)))
+	dyn := gatewayapitest.Client(gatewayapitest.Gateway("gateway-system", "shared", "192.0.2.10", gatewayapitest.Listener("https", 443, nil)))
 	c, err := Inspect(context.Background(), cs, dyn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.GatewayAPI || !c.GatewaysRead || len(c.Gateways) != 1 || c.Gateways[0].Ref() != "kgateway-system/internal" {
+	if !c.GatewayAPI || !c.GatewaysRead || len(c.Gateways) != 1 || c.Gateways[0].Ref() != "gateway-system/shared" {
 		t.Errorf("gateway api=%v read=%v gateways=%+v", c.GatewayAPI, c.GatewaysRead, c.Gateways)
 	}
 

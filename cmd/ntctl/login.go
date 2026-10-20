@@ -128,10 +128,12 @@ func runLogin(ctx context.Context, args []string, out io.Writer) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+	regionURL, err := config.AppURL(region)
+	if err != nil {
+		return err
+	}
 	if appURL == "" {
-		if appURL, err = config.AppURL(region); err != nil {
-			return err
-		}
+		appURL = regionURL
 	}
 	appURL = strings.TrimSuffix(appURL, "/")
 	md, err := auth.Discover(ctx, httpClient, appURL)
@@ -284,8 +286,14 @@ func runConfig(ctx context.Context, args []string, out io.Writer) error {
 		fmt.Fprintf(out, "console: %s\nregion:  %s\norg:     %s %s\n", cfg.AppURL, cfg.Region, cfg.OrgID, parens(cfg.OrgName))
 		return nil
 	case sub == "set" && len(pos) == 2 && pos[0] == "region":
-		if _, err := config.AppURL(pos[1]); err != nil {
+		u, err := config.AppURL(pos[1])
+		if err != nil {
 			return err
+		}
+		// Signed in, the region is the console's: changing it alone would
+		// install data planes for one region with another's tokens.
+		if s, err := openSession(); err == nil && s.cfg.AppURL != u {
+			return fmt.Errorf("you are signed in to %s, and the region follows the console you sign in to; run `ntctl login --region %s` to switch", s.cfg.AppURL, strings.ToLower(pos[1]))
 		}
 		cfg.Region = strings.ToLower(pos[1])
 		if err := cfg.Save(); err != nil {
@@ -302,20 +310,44 @@ func runConfig(ctx context.Context, args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		for _, o := range orgs {
-			if o.ID == pos[1] || strings.EqualFold(o.Name, pos[1]) {
-				s.cfg.OrgID, s.cfg.OrgName = o.ID, o.Name
-				if err := s.cfg.Save(); err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "Organization set to %s (%s).\n", o.Name, o.ID)
-				return nil
-			}
+		o, err := findOrg(orgs, pos[1])
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("you are not a member of an organization %q; see `ntctl orgs list`", pos[1])
+		s.cfg.OrgID, s.cfg.OrgName = o.ID, o.Name
+		if err := s.cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Organization set to %s (%s).\n", o.Name, o.ID)
+		return nil
 	}
 	fs.Usage()
 	return errors.New("usage: ntctl config get | set org <id|name> | set region <eu|us>")
+}
+
+// findOrg returns the organization whose ID is key or, failing that, the one
+// whose name is key, ignoring case; a name several share is refused.
+func findOrg(orgs []api.Org, key string) (api.Org, error) {
+	var named []api.Org
+	for _, o := range orgs {
+		if o.ID == key {
+			return o, nil
+		}
+		if strings.EqualFold(o.Name, key) {
+			named = append(named, o)
+		}
+	}
+	switch len(named) {
+	case 0:
+		return api.Org{}, fmt.Errorf("you are not a member of an organization %q; see `ntctl orgs list`", key)
+	case 1:
+		return named[0], nil
+	}
+	ids := make([]string, 0, len(named))
+	for _, o := range named {
+		ids = append(ids, o.ID)
+	}
+	return api.Org{}, fmt.Errorf("%d of your organizations are named %q (%s); set one by its ID", len(named), key, strings.Join(ids, ", "))
 }
 
 func parens(s string) string {
@@ -357,7 +389,18 @@ func runInstances(p api.Product) func(context.Context, []string, io.Writer) erro
 			if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
 				return fmt.Errorf("usage: ntctl %s create <name>", name)
 			}
-			in, err := s.api.Create(ctx, p, org, strings.TrimSpace(pos[0]))
+			name := strings.TrimSpace(pos[0])
+			list, err := s.api.Instances(ctx, p, org)
+			if err != nil {
+				return err
+			}
+			// One name, one instance: install picks instances by name.
+			if have, err := findInstance(list, p, name); err != nil {
+				return err
+			} else if have != nil {
+				return fmt.Errorf("a private %s named %q already exists (%s); `ntctl install --%s-instance %s` installs it", p.Name(), have.Name, have.ID, strings.ToLower(p.Name()), have.ID)
+			}
+			in, err := s.api.Create(ctx, p, org, name)
 			if err != nil {
 				return err
 			}

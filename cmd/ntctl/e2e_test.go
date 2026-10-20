@@ -89,6 +89,9 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	const ns = "ntctl-e2e-chart"
 	cs := cluster(t, ns)
 	srv := console(t)
+	// A console whose control plane is not a region's, as a dev or
+	// self-hosted one: its tokens are valid only there.
+	srv.ControlPlane = "cp.example.com"
 	ntctl(t, 0, "login", "--app-url", srv.URL)
 
 	dir := t.TempDir()
@@ -99,12 +102,18 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	saved := filepath.Join(dir, "values.yaml")
 	out := ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved, "--timeout", "45s")
-	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`, "install did not complete"} {
+	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`,
+		"tokens for the control plane at cp.example.com", "install did not complete",
+		// The failure comes with its cause: the images cannot be pulled.
+		"What doctor finds wrong", "NT-DR-010"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
 	}
 	noCanary(t, saved)
+	if b, err := os.ReadFile(saved); err != nil || !strings.Contains(string(b), "domain: cp.example.com") {
+		t.Errorf("the saved values do not point the data plane at the console's control plane (%v):\n%s", err, b)
+	}
 
 	issued := srv.Issued()
 	if len(issued) != 2 {
@@ -143,15 +152,47 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 		t.Fatal("the Helm release holds a token")
 	}
 
-	// The same install again finds both products installed: it changes
-	// nothing and asks the console for nothing.
-	out = ntctl(t, 0, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
+	// The same install again finds the release failed: it says how to get
+	// out, changes nothing and asks the console for nothing.
+	out = ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
 		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", "")
-	if !strings.Contains(out, "nothing to do") {
-		t.Errorf("a second install with the same products did not say so:\n%s", out)
+	if !strings.Contains(out, "revision 1 failed") || !strings.Contains(out, "ntctl doctor") {
+		t.Errorf("a second install on a failed release did not say how to recover:\n%s", out)
 	}
 	if got := len(srv.Issued()); got != 2 {
-		t.Fatalf("a second install with nothing to add issued tokens (%d configs)", got)
+		t.Fatalf("a second install on a failed release issued tokens (%d configs)", got)
+	}
+
+	// Upgrade on the failed release applies it again instead of reporting
+	// that it is up to date. The images still cannot be pulled, so it fails
+	// again, and with no working revision it stays in place.
+	out = ntctl(t, 1, "upgrade", "--yes", "--ignore-capacity", "--namespace", ns, "--version", rel.Chart.Metadata.Version, "--timeout", "30s")
+	for _, want := range []string{"Revision 1 failed; this applies it again", "No revision has worked yet", "left in place"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("upgrade of a failed release: output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Already up to date") {
+		t.Errorf("upgrade of a failed release reported it up to date:\n%s", out)
+	}
+
+	// Uninstall without typing the namespace removes nothing; with --yes it
+	// removes the release and, asked to, ntctl's Secrets.
+	ntctl(t, 1, "uninstall", "--namespace", ns)
+	if cur, err := helm.Current(cfg, "neuraltrust-platform"); err != nil || cur == nil {
+		t.Fatalf("an unconfirmed uninstall removed the release (%v)", err)
+	}
+	out = ntctl(t, 0, "uninstall", "--yes", "--delete-secrets", "--namespace", ns)
+	for _, want := range []string{"Keeps:    namespace " + ns, "Removed release", "Deleted Secret " + values.TrustGateConfigSync} {
+		if !strings.Contains(out, want) {
+			t.Errorf("uninstall: output lacks %q:\n%s", want, out)
+		}
+	}
+	if cur, err := helm.Current(cfg, "neuraltrust-platform"); err != nil || cur != nil {
+		t.Fatalf("after uninstall: release %v, %v", cur, err)
+	}
+	if _, err := cs.CoreV1().Secrets(ns).Get(context.Background(), values.TrustGateConfigSync, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("--delete-secrets kept %s (%v)", values.TrustGateConfigSync, err)
 	}
 }
 
@@ -249,6 +290,27 @@ func TestE2EInstallRecordsTheEndpoint(t *testing.T) {
 	defer cancel()
 	if _, err := cs.CoreV1().ConfigMaps(ns).Get(ctx, "e2e", metav1.GetOptions{}); err != nil {
 		t.Fatalf("the chart was not installed: %v", err)
+	}
+
+	// Installing again with another product adds it: one new instance and
+	// its token Secrets, and an upgrade in place.
+	out = ntctl(t, 0, "install", "--yes", "--namespace", ns, "--chart", chart, "--products", "trustguard", "--save-values", "", "--timeout", "1m")
+	for _, want := range []string{"is already installed", "Adding trustguard", "Upgraded.", "Added trustguard"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("adding a product: output lacks %q:\n%s", want, out)
+		}
+	}
+	if got := srv.Instances(api.TrustGuard, "org-1"); len(got) != 1 {
+		t.Fatalf("adding TrustGuard created %d instances, want 1", len(got))
+	}
+	if got := secretValue(t, cs, ns, values.TrustGuardConfigSync, values.ConfigSyncKey); got == "" {
+		t.Fatal("the added product has no config-sync Secret")
+	}
+	// The same again changes nothing and asks the console for nothing.
+	issued := len(srv.Issued())
+	out = ntctl(t, 0, "install", "--yes", "--namespace", ns, "--chart", chart, "--products", "trustguard", "--save-values", "")
+	if !strings.Contains(out, "nothing to do") || len(srv.Issued()) != issued {
+		t.Errorf("a repeated add was not a no-op (%d -> %d configs):\n%s", issued, len(srv.Issued()), out)
 	}
 }
 
@@ -350,6 +412,7 @@ metadata:
 data:
   level: ` + level + `
   domain: {{ .Values.global.domain | quote }}
+  sub: {{ .Subcharts.sub.Chart.Version | quote }}
 ---
 apiVersion: v1
 kind: Secret
@@ -358,6 +421,10 @@ metadata:
 stringData:
   password: {{ .Values.extra.password | quote }}
 `,
+		// A subchart: Helm does not keep it in the stored release, which
+		// is what adopt once tripped on.
+		"charts/sub/Chart.yaml":        "apiVersion: v2\nname: sub\nversion: 0.1.0\n",
+		"charts/sub/templates/cm.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: tiny-sub\ndata:\n  level: " + level + "\n",
 	}
 	for name, body := range files {
 		p := filepath.Join(dir, name)
@@ -386,19 +453,20 @@ func TestE2EAdoptUpgradeRollback(t *testing.T) {
 	if _, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	v1, err := chart.Load(k.Settings(), chart.Source{Path: tinyChart(t, "3.0.0", "tiny", "info")})
+	v1Dir := tinyChart(t, "3.0.0", "tiny", "info")
+	v1, err := chart.Load(k.Settings(), chart.Source{Path: v1Dir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	vals := map[string]any{"global": map[string]any{"domain": "upgrade.example.com"}, "extra": map[string]any{"password": "CANARY-pw"}}
-	if _, err := helm.Install(ctx, cfg, v1, vals, "neuraltrust-platform", ns, 2*time.Minute); err != nil {
+	if _, err := helm.Install(ctx, cfg, v1, vals, "neuraltrust-platform", ns, 2*time.Minute, nil); err != nil {
 		t.Fatalf("plain install: %v", err)
 	}
 
 	// adopt changes nothing and writes the values without the password.
 	before := versions(t, cs, ns)
 	file := filepath.Join(t.TempDir(), "values.yaml")
-	out := ntctl(t, 0, "adopt", "--namespace", ns, "--values-file", file)
+	out := ntctl(t, 0, "adopt", "--namespace", ns, "--chart", v1Dir, "--values-file", file)
 	if !strings.Contains(out, "re-renders exactly as deployed") || !strings.Contains(out, "extra.password") {
 		t.Fatalf("adopt output:\n%s", out)
 	}
