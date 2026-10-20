@@ -130,16 +130,16 @@ func TestChooseInstances(t *testing.T) {
 	var out bytes.Buffer
 
 	// Non-interactive, nothing named: a new instance named after the domain.
-	plan, err := chooseInstances(ctx, prompt.New(strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), nil, "platform.example.com")
+	plan, err := chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), nil, "platform.example.com")
 	if err != nil || len(plan) != 1 || plan[0].inst != nil || plan[0].newName != "platform.example.com" {
 		t.Fatalf("plan = %+v, %v", plan, err)
 	}
 	// Named by flag.
-	plan, err = chooseInstances(ctx, prompt.New(strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "prod"}, "x")
+	plan, err = chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "prod"}, "x")
 	if err != nil || plan[0].inst == nil || plan[0].inst.ID != "gw-1" {
 		t.Fatalf("plan = %+v, %v", plan, err)
 	}
-	if _, err = chooseInstances(ctx, prompt.New(strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "nope"}, "x"); err == nil {
+	if _, err = chooseInstances(ctx, prompt.New(context.Background(), strings.NewReader(""), &out, false), &out, s, "org-1", gateSpecs(), map[api.Product]string{api.TrustGate: "nope"}, "x"); err == nil {
 		t.Fatal("an unknown instance name should fail")
 	}
 	// Interactive: the existing one is offered; Enter creates a new one.

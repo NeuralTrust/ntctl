@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -88,7 +89,9 @@ func TestUpgradeOperationalTelemetry(t *testing.T) {
 	terminal := func(input string) func(io.Writer) *prompt.Prompter {
 		return func(w io.Writer) *prompt.Prompter { return prompt.Scripted(strings.NewReader(input), w) }
 	}
-	noTerminal := func(w io.Writer) *prompt.Prompter { return prompt.New(strings.NewReader("y\n"), w, false) }
+	noTerminal := func(w io.Writer) *prompt.Prompter {
+		return prompt.New(context.Background(), strings.NewReader("y\n"), w, false)
+	}
 
 	cases := []struct {
 		name    string

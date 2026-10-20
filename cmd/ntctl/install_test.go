@@ -86,7 +86,7 @@ func TestAskFromEnvironment(t *testing.T) {
 	t.Setenv("NT_POSTGRES_URL", "postgres://nt:pw@db.example.com/nt")
 	t.Setenv("NT_REDIS_URL", "rediss://:pw@cache.example.com:6380")
 	var out bytes.Buffer
-	in := prompt.New(strings.NewReader(""), &out, false)
+	in := prompt.New(context.Background(), strings.NewReader(""), &out, false)
 	o := opts{domain: "d.example.com"}
 	a, err := ask(context.Background(), in, &out, fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o,
 		installFlags{imageRegistry: "123.dkr.ecr.eu-west-1.amazonaws.com/nt", nodeIdentity: true}, map[string]any{})
@@ -218,7 +218,7 @@ func TestAskTelemetryNotAskedWhenSettled(t *testing.T) {
 		if name == "none" {
 			// Without a terminal nothing is asked and nothing is chosen, so
 			// the install default (off) applies.
-			in = prompt.New(strings.NewReader(""), &out, false)
+			in = prompt.New(context.Background(), strings.NewReader(""), &out, false)
 		}
 		if _, err := ask(context.Background(), in, &out, fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files); err != nil {
 			t.Fatalf("%s: asked anyway: %v\n%s", name, err, out.String())

@@ -109,7 +109,7 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	in := prompt.New(stdin, out, !f.yes)
+	in := prompt.New(ctx, stdin, out, !f.yes)
 	cfg, err := o.kube.Helm(action.ConfigurationSetLogger(helm.Logger()))
 	if err != nil {
 		return err
@@ -393,7 +393,7 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 		return err
 	}
 	if !f.yes {
-		if err := prompt.New(stdin, out, true).Confirm("Continue?"); err != nil {
+		if err := prompt.New(ctx, stdin, out, true).Confirm("Continue?"); err != nil {
 			return err
 		}
 	}

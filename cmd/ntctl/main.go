@@ -14,6 +14,7 @@ import (
 
 	"github.com/NeuralTrust/ntctl/internal/api"
 	"github.com/NeuralTrust/ntctl/internal/helm"
+	"github.com/NeuralTrust/ntctl/internal/prompt"
 )
 
 const usage = `ntctl installs and operates the NeuralTrust platform on Kubernetes.
@@ -54,9 +55,19 @@ Run "ntctl <command> -h" for the flags of a command.
 // errPreflight marks a run stopped by failing checks; the details were printed.
 var errPreflight = errors.New("preflight checks failed")
 
+// exitInterrupted is the shell's code for a process ended by SIGINT (128 + 2).
+const exitInterrupted = 130
+
 func main() {
 	slog.SetDefault(slog.New(helm.Logger()))
+	// The first Ctrl+C cancels ctx: a question ends, a Helm wait stops and rolls
+	// back. Once it has, the default handling is restored, so a second Ctrl+C
+	// ends the process wherever the run is.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
@@ -109,6 +120,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
 		return 2
 	}
+	return exitCode(ctx, err, stderr)
+}
+
+// exitCode reports a command's outcome on stderr and returns its exit code.
+func exitCode(ctx context.Context, err error, stderr io.Writer) int {
 	switch {
 	case err == nil:
 		return 0
@@ -116,6 +132,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 0
 	case errors.Is(err, errPreflight):
 		return 3
+	case errors.Is(err, prompt.ErrInterrupted):
+		// Interrupted at a question: every command asks before it changes anything.
+		fmt.Fprintln(stderr, "\nInterrupted.")
+		return exitInterrupted
+	case ctx.Err() != nil:
+		fmt.Fprintf(stderr, "Error: %v\nInterrupted.\n", err)
+		return exitInterrupted
 	default:
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1

@@ -2,9 +2,12 @@ package prompt
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScripted(t *testing.T) {
@@ -36,7 +39,7 @@ func TestScripted(t *testing.T) {
 }
 
 func TestNotInteractive(t *testing.T) {
-	p := New(strings.NewReader("ignored\n"), &bytes.Buffer{}, false)
+	p := New(context.Background(), strings.NewReader("ignored\n"), &bytes.Buffer{}, false)
 	if v, err := p.Text("Domain", "d"); v != "d" || err != nil {
 		t.Errorf("default not taken: %q %v", v, err)
 	}
@@ -65,7 +68,60 @@ func TestYesNo(t *testing.T) {
 	if !strings.Contains(out.String(), "[y/N]") || !strings.Contains(out.String(), "Answer y or n.") {
 		t.Errorf("unexpected prompt output:\n%s", out.String())
 	}
-	if got, err := New(strings.NewReader("y\n"), &bytes.Buffer{}, false).YesNo("Turn it on?", false); got || err != nil {
+	if got, err := New(context.Background(), strings.NewReader("y\n"), &bytes.Buffer{}, false).YesNo("Turn it on?", false); got || err != nil {
 		t.Errorf("without a terminal the default must be taken, got %v, %v", got, err)
+	}
+}
+
+// blockingReader never returns, like a terminal nobody types in.
+type blockingReader struct{ unblock chan struct{} }
+
+func (r blockingReader) Read([]byte) (int, error) {
+	<-r.unblock
+	return 0, io.EOF
+}
+
+// TestInterruptEndsAQuestion is Ctrl+C at a prompt: the command's context is
+// cancelled while the read is blocked on a terminal, and every kind of
+// question returns ErrInterrupted at once instead of waiting for Enter.
+func TestInterruptEndsAQuestion(t *testing.T) {
+	asks := map[string]func(*Prompter) error{
+		"text":    func(p *Prompter) error { _, err := p.Text("Domain", ""); return err },
+		"choose":  func(p *Prompter) error { _, err := p.Choose("Platform", []string{"aws", "gcp"}, 0); return err },
+		"yesno":   func(p *Prompter) error { _, err := p.YesNo("Turn it on?", false); return err },
+		"confirm": func(p *Prompter) error { return p.Confirm("Continue?") },
+		"secret":  func(p *Prompter) error { _, err := p.Secret("Token"); return err },
+	}
+	for name, ask := range asks {
+		t.Run(name, func(t *testing.T) {
+			stdin := blockingReader{unblock: make(chan struct{})}
+			defer close(stdin.unblock)
+			ctx, cancel := context.WithCancel(context.Background())
+			p := Scripted(stdin, io.Discard)
+			p.ctx = ctx
+
+			done := make(chan error, 1)
+			go func() { done <- ask(p) }()
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrInterrupted) {
+					t.Fatalf("err = %v, want ErrInterrupted", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the question kept waiting for input after the interrupt")
+			}
+		})
+	}
+}
+
+func TestInterruptedBeforeAsking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p := Scripted(strings.NewReader("an answer\n"), io.Discard)
+	p.ctx = ctx
+	if _, err := p.Text("Domain", ""); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v, want ErrInterrupted: an interrupt already received must not be answered", err)
 	}
 }
