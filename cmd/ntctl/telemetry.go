@@ -31,7 +31,7 @@ func askTelemetry(in *prompt.Prompter, out io.Writer, mode string) (bool, error)
 // what it records. A release that never recorded a choice is asked about once,
 // on a terminal, and the answer is recorded; without a terminal it stays off.
 func (o *opts) upgradeTelemetry(in *prompt.Prompter, out io.Writer, current map[string]any) error {
-	if o.telemetry.v != nil || !in.Interactive {
+	if o.telemetry.v != nil || !in.Interactive || o.addingOnly {
 		return nil
 	}
 	if _, set := values.OperationalTelemetry(current); set {

@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
+	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
 // Workload is the readiness of one Deployment, StatefulSet or DaemonSet.
@@ -113,8 +114,58 @@ func Collect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface
 			return nil, err
 		}
 	}
+	if err := s.serviceRecords(ctx, cs, ns, seen); err != nil {
+		return nil, err
+	}
 	sort.Slice(s.Records, func(i, j int) bool { return s.Records[i].Host < s.Records[j].Host })
 	return s, nil
+}
+
+// configSyncHost is the annotation the chart puts on a central control
+// plane's config-sync LoadBalancer Service: the host data planes dial.
+const configSyncHost = "neuraltrust.ai/config-sync-host"
+
+// serviceRecords adds the hosts a central control plane (saas mode) exposes
+// on LoadBalancer Services, which data planes elsewhere dial: each
+// config-sync Service's annotated host, and databridge.<domain> for the
+// DataBridge southbound Service, the domain being the config-sync hosts'.
+func (s *Status) serviceRecords(ctx context.Context, cs kubernetes.Interface, ns string, seen map[string]bool) error {
+	svcs, err := cs.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("listing services: %w", err)
+	}
+	domain := ""
+	for _, svc := range svcs.Items {
+		if d, ok := values.ControlPlaneFromAddr(svc.Annotations[configSyncHost]); ok {
+			domain = d
+		}
+	}
+	for _, svc := range svcs.Items {
+		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			continue
+		}
+		host := svc.Annotations[configSyncHost]
+		if host == "" && strings.HasSuffix(svc.Name, "-southbound") && domain != "" {
+			host = "databridge." + domain
+		}
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		typ, target := "", ""
+		for _, lb := range svc.Status.LoadBalancer.Ingress {
+			if lb.Hostname != "" {
+				typ, target = "CNAME", lb.Hostname
+				break
+			}
+			if lb.IP != "" {
+				typ, target = "A", lb.IP
+				break
+			}
+		}
+		s.Records = append(s.Records, Record{Host: host, Type: typ, Target: target})
+	}
+	return nil
 }
 
 // routeRecords adds a record per HTTPRoute hostname, pointing at the address

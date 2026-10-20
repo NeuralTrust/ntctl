@@ -160,3 +160,27 @@ func TestInstalledFollowsTheChartRule(t *testing.T) {
 		}
 	}
 }
+
+// TestNoTokenRefsOutsideHybrid: external and saas data planes never read the
+// console's tokens, so nothing points them at token Secrets.
+func TestNoTokenRefsOutsideHybrid(t *testing.T) {
+	for _, mode := range []string{"external", "saas"} {
+		v := Generate(Inputs{Mode: mode, Domain: "d.example.com", Products: Products})
+		if Get(v, "global", "deploymentMode") != mode {
+			t.Errorf("%s: deploymentMode = %v", mode, Get(v, "global", "deploymentMode"))
+		}
+		if Get(v, "agentgateway") != nil || Get(v, "trustguard") != nil {
+			t.Errorf("%s: token references generated: %v", mode, v)
+		}
+		delta := ProductDelta(map[string]any{"global": map[string]any{"deploymentMode": mode}}, []string{"trustguard"}, nil)
+		if Get(delta, "trustguard") != nil || Get(delta, "global", "products", "trustguard") != true {
+			t.Errorf("%s: delta = %v, want only the product switch", mode, delta)
+		}
+	}
+	for _, mode := range []string{"", "hybrid"} {
+		v := Generate(Inputs{Mode: mode, Products: []string{"trustgate"}})
+		if Get(v, "agentgateway", "configSync", "existingSecret", "name") != TrustGateConfigSync {
+			t.Errorf("mode %q: hybrid must reference the token Secrets: %v", mode, v)
+		}
+	}
+}

@@ -52,17 +52,22 @@ type opts struct {
 	chartPath  string
 	version    string
 	valueFiles stringList
-	domain     string
-	platform   string
-	products   string
-	gateway    string
-	output     string
+	// mode is --mode, global.deploymentMode; "" leaves it to the files.
+	mode     string
+	domain   string
+	platform string
+	products string
+	gateway  string
+	output   string
 	// telemetry is --operational-telemetry; unset leaves the choice open.
 	telemetry optionalBool
 	// ignoreCapacity turns a capacity failure into a warning.
 	ignoreCapacity bool
 	// extra are values from interactive answers, layered like explicit flags.
 	extra map[string]any
+	// addingOnly marks install's add-products flow, which keeps every
+	// setting of the release and asks about nothing but the products.
+	addingOnly bool
 }
 
 func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *flag.FlagSet {
@@ -80,6 +85,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.chartPath, "chart", "", "local chart directory or .tgz (default: the public NeuralTrust chart registry)")
 		fs.StringVar(&o.version, "version", "", "chart version or constraint (default: latest "+chart.Supported+")")
 		fs.Var(&o.valueFiles, "f", "values file, as with helm -f (repeatable; later files win)")
+		fs.StringVar(&o.mode, "mode", "", "where the control plane runs: hybrid (NeuralTrust hosts it; the chart's default), external (this cluster runs everything; nothing leaves it), or saas (this cluster is a control plane serving data planes elsewhere)")
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
 		productsUsage := "comma-separated products: " + strings.Join(values.Products, ",")
@@ -145,6 +151,11 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	mode, err := o.effectiveMode(files)
+	if err != nil {
+		return nil, err
+	}
+	defaults.Mode = mode
 	// Defaults only fill what the files leave unset.
 	if values.Get(files, "global", "platform") != nil {
 		defaults.Platform = ""
@@ -165,9 +176,26 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 	}
 	vals := values.Generate(defaults)
 	vals = values.Merge(vals, files)
-	vals = values.Merge(vals, values.Generate(values.Inputs{Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
+	vals = values.Merge(vals, values.Generate(values.Inputs{Mode: mode, Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
 	if o.extra != nil {
 		vals = values.Merge(vals, copyMap(o.extra))
 	}
 	return vals, nil
+}
+
+// effectiveMode is the deployment mode the flags and files settle: --mode,
+// else the files' global.deploymentMode, else "" (the chart's default,
+// hybrid).
+func (o *opts) effectiveMode(files map[string]any) (string, error) {
+	if o.mode == "" {
+		m, _ := values.Get(files, "global", "deploymentMode").(string)
+		return m, nil
+	}
+	for _, m := range values.Modes {
+		if strings.EqualFold(o.mode, m) {
+			o.mode = m
+			return m, nil
+		}
+	}
+	return "", fmt.Errorf("--mode must be one of %s, not %q", strings.Join(values.Modes, ", "), o.mode)
 }

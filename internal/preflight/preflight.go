@@ -378,7 +378,7 @@ func secrets(ctx context.Context, in Input) ([]Result, error) {
 			parts = append(parts, "missing keys: "+strings.Join(missingKeys, ", "))
 		}
 		r.Message = strings.Join(parts, "; ")
-		r.Fix = "`ntctl install` creates the registry and token Secrets from --registry-key and your console tokens. Create any other Secret your values reference in namespace " + in.Namespace + "."
+		r.Fix = "`ntctl install` creates the registry and token Secrets from --registry-key and your console tokens, and the first admin's (onprem-superadmin) in external and saas installs. Create any other Secret your values reference in namespace " + in.Namespace + "."
 		if in.Mode == ForUpgrade {
 			r.Fix = "`ntctl upgrade --products <product>` creates the token Secrets of a product it adds, from your console tokens. Create any other Secret your values reference in namespace " + in.Namespace + "."
 		}

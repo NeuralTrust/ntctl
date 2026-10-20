@@ -23,8 +23,14 @@ import (
 // upgrades in place on the installed chart, as `ntctl upgrade --products`
 // does. Running it again with nothing new changes nothing.
 func (o *opts) addProducts(ctx context.Context, in *prompt.Prompter, out io.Writer, f installFlags, sess *session, rel *release.Release) error {
+	if err := interrupted(rel, o.kube.Namespace); err != nil {
+		return err
+	}
+	if failed(rel) {
+		return fmt.Errorf("release %q in namespace %q is installed but revision %d failed, so nothing is added to it: %s", o.release, o.kube.Namespace, rel.Version, fixThenUpgrade)
+	}
 	if f.print() {
-		return fmt.Errorf("release %q already exists in namespace %q, and --secrets-mode print is for a new install; add a product with `ntctl install --products <product>`, or create its Secrets yourself and run `ntctl upgrade -f <values>`", o.release, o.kube.Namespace)
+		return fmt.Errorf("release %q already exists in namespace %q, and --secrets-mode print is for a new install. To add a product, create its token Secrets yourself (see `ntctl install -h` for their names), then run `ntctl upgrade --products <product>`", o.release, o.kube.Namespace)
 	}
 	files, err := values.Files(o.kube.Settings(), o.valueFiles)
 	if err != nil {
@@ -35,9 +41,13 @@ func (o *opts) addProducts(ctx context.Context, in *prompt.Prompter, out io.Writ
 	fmt.Fprintf(out, "Release %q is already installed in namespace %q: chart %s, products %s.\n"+
 		"Adding products keeps every other setting of the release; change those with `ntctl upgrade`.\n\n",
 		o.release, o.kube.Namespace, rel.Chart.Metadata.Version, list(installed))
-	if err := o.sameAsRelease(out, f, base); err != nil {
+	if err := o.sameAsRelease(out, f, rel.Config); err != nil {
 		return err
 	}
+	if err := filesMatchRelease(files, rel.Config); err != nil {
+		return err
+	}
+	o.addingOnly = true
 
 	var missing []string
 	for _, p := range values.Products {
@@ -115,6 +125,9 @@ func (o *opts) sameAsRelease(out io.Writer, f installFlags, current map[string]a
 	if err := differs("platform", o.platform, "global.platform"); err != nil {
 		return err
 	}
+	if err := o.sameMode(current); err != nil {
+		return err
+	}
 	if err := differs("image-registry", f.imageRegistry, "global.imageRegistry"); err != nil {
 		return err
 	}
@@ -133,6 +146,23 @@ func (o *opts) sameAsRelease(out io.Writer, f installFlags, current map[string]a
 	return nil
 }
 
+// filesMatchRelease refuses -f values that would change a setting of the
+// release, as sameAsRelease does for flags: re-running the first install's
+// command with its values file must add products and change nothing else.
+func filesMatchRelease(files, current map[string]any) error {
+	for _, path := range [][]string{{"global", "domain"}, {"global", "platform"}, {"global", "imageRegistry"}} {
+		want, _ := values.Get(files, path...).(string)
+		have, _ := values.Get(current, path...).(string)
+		if want != "" && want != have {
+			return fmt.Errorf("your -f values set %s to %q, but the release has %q. Adding a product keeps the release's settings; change it with `ntctl upgrade -f`, then add the product", strings.Join(path, "."), want, have)
+		}
+	}
+	if m, _ := values.Get(files, "global", "deploymentMode").(string); m != "" && m != values.DeploymentMode(current) {
+		return fmt.Errorf("your -f values set global.deploymentMode to %q, but the release runs %q; a release cannot change where its control plane runs in place", m, values.DeploymentMode(current))
+	}
+	return nil
+}
+
 // configSyncFits refuses a TrustGate and TrustGuard pair behind one
 // global.controlPlane.configSyncAddr, which the chart cannot render: each
 // product has its own config-sync listener and certificate.
@@ -143,7 +173,7 @@ func configSyncFits(current map[string]any, products []string) error {
 	}
 	return errors.New("the release dials config sync at one address, global.controlPlane.configSyncAddr, which serves a single product; " +
 		"TrustGate and TrustGuard each need their own. Unset it and set agentgateway.configSync.endpoint and trustguard.configSync.endpoint " +
-		"(or rely on DNS, <product>-configsync.<domain>:443) with `ntctl upgrade -f`, then add the product")
+		"(or rely on DNS, agentgateway-configsync.<domain>:443 and trustguard-configsync.<domain>:443) with `ntctl upgrade -f`, then add the product")
 }
 
 // updateSavedValues rewrites the values file the install saved, when it is

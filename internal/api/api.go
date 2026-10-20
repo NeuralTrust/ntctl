@@ -91,6 +91,10 @@ type InstallConfig struct {
 	TenantID        string `json:"tenantId"`
 	ConfigSyncToken string `json:"configSyncToken"`
 	EnrolmentToken  string `json:"enrolmentToken"`
+	// ConfigSyncEndpoint and DataBridgeAddr are where the console's control
+	// plane listens, host:port: the tokens are valid only there.
+	ConfigSyncEndpoint string `json:"configSyncGrpcEndpoint,omitempty"`
+	DataBridgeAddr     string `json:"databridgeAddr,omitempty"`
 }
 
 // String keeps the tokens out of any formatted output.

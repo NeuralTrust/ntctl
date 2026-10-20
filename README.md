@@ -46,6 +46,7 @@ default, so pressing Enter takes a working choice:
 
 | Question | Default | Alternative |
 |---|---|---|
+| Where the control plane runs | NeuralTrust hosts it (hybrid) | in this cluster (external), or in this cluster serving data planes elsewhere (saas); see [Deployment modes](#deployment-modes) |
 | Base domain for the endpoints | (required) | |
 | Platform | detected from the cluster | aws, gcp, azure, openshift, kubernetes |
 | How the endpoints are exposed (asked only when the cluster has a Gateway API Gateway) | Ingresses; a Gateway when the cluster has no IngressClass and is not GKE | HTTPRoutes on one of the cluster's Gateways |
@@ -54,7 +55,8 @@ default, so pressing Enter takes a working choice:
 | Where images come from | the NeuralTrust registry, with your key file | your own registry: its address, and either a username and password or the nodes' own identity (ECR, Artifact Registry, ACR) |
 | PostgreSQL | run it in the cluster | your own, as a connection string `postgres://user:password@host:5432/database?sslmode=require` |
 | Redis | run it in the cluster | your own, as `redis://:password@host:6379`, or `rediss://` for TLS |
-| Console tokens | from the console, when signed in | asked for each product you install |
+| Console tokens | from the console, when signed in | asked for each product you install (hybrid only) |
+| The console's first admin (external and saas only) | (required) | an existing `onprem-superadmin` Secret, or your own named in `global.superadmin.existingSecret.name` |
 
 Passwords, tokens and connection strings are typed with input hidden. They are
 stored only in Kubernetes Secrets in the install namespace: never in a file, a
@@ -102,10 +104,12 @@ ntctl install --products trustguard --yes
 - When every product you chose is already installed, it says so and changes
   nothing, so running the same command twice is safe. Without a terminal it
   adds only what `--products` names.
-- `--domain`, `--platform`, `--gateway` or `--image-registry` with a value that
-  differs from the install is refused rather than applied. Change those with
-  `ntctl upgrade`. A registry key is not needed, since the install keeps its
-  pull settings.
+- `--domain`, `--platform`, `--gateway`, `--image-registry` or `--mode` with a
+  value that differs from the install, or `-f` values that do, are refused
+  rather than applied. Change those with `ntctl upgrade`. A registry key is not
+  needed, since the install keeps its pull settings.
+- An install that failed, or was interrupted, gets nothing added: it says how
+  to recover first (`ntctl doctor`, then `ntctl upgrade`).
 - When `neuraltrust-values.yaml` (or `--save-values`) is still there, it is
   updated to match.
 
@@ -125,6 +129,8 @@ export NT_TRUSTGUARD_CONFIG_SYNC_TOKEN=...  NT_TRUSTGUARD_ENROLMENT_TOKEN=...
 export NT_POSTGRES_URL='postgres://user:password@db.example.com:5432/neuraltrust?sslmode=require'
 export NT_REDIS_URL='rediss://:password@cache.example.com:6380'
 export NT_REGISTRY_USERNAME=robot NT_REGISTRY_PASSWORD=...
+# external and saas installs only:
+export ONPREM_SUPERADMIN_EMAIL=admin@example.com ONPREM_SUPERADMIN_PASSWORD=...
 
 ntctl install --yes --domain platform.example.com \
   --image-registry registry.example.com/neuraltrust
@@ -136,6 +142,8 @@ ntctl install --yes --domain platform.example.com \
 | Your own registry | `--image-registry`, plus `--image-registry-node-auth` when nodes authenticate themselves | `NT_REGISTRY_USERNAME`, `NT_REGISTRY_PASSWORD` |
 | Your own PostgreSQL | | `NT_POSTGRES_URL` |
 | Your own Redis | | `NT_REDIS_URL` |
+| Where the control plane runs | `--mode` | |
+| The console's first admin (external and saas) | | `ONPREM_SUPERADMIN_EMAIL`, `ONPREM_SUPERADMIN_PASSWORD` |
 
 Connection strings and passwords are environment-only, so they stay out of
 shell history.
@@ -189,13 +197,40 @@ instance:
 ntctl install --yes --domain platform.example.com --trustgate-instance edge-1
 ```
 
+For each instance, an instance already named like the one install would
+create (the domain, by default) is used instead of creating a second one, so
+running an install again after a failure keeps one instance. A name shared by
+several instances is refused; name one by its ID.
+
 The tokens go straight into the Kubernetes Secrets, as when you type them in.
+They are valid only at the control plane of the console that issued them, so
+the data plane dials that one: a console other than a region's (a dev or
+self-hosted console) points the install at its own control plane
+(`global.controlPlane.domain`), and the summary shows it as `Connects:`.
 The sign-in is saved in `~/.config/ntctl/credentials.json`, which only you can
 read. It is renewed as needed until it expires or you run `ntctl logout`. Tokens
 in the environment still take precedence.
 
 This needs a console that offers CLI sign-in. Without one, `ntctl login` says so
 and everything else works as described above.
+
+## Deployment modes
+
+`--mode` (or `global.deploymentMode` in your values, or the first question)
+says where the control plane runs:
+
+| Mode | This cluster runs | Tokens from NeuralTrust | Asks for |
+|---|---|---|---|
+| `hybrid` (default) | the data plane; NeuralTrust hosts the control plane | yes | PostgreSQL and Redis (shared by every service) |
+| `external` | everything, with its own console; nothing leaves the cluster | no | the console's first admin |
+| `saas` | a control plane, with its own console, that data planes elsewhere connect to | no | the console's first admin |
+
+In external and saas installs every service has its own PostgreSQL role, so
+your own PostgreSQL and Redis are configured with `-f`, following
+`values-managed-datastores.yaml.example` in the chart repository. After a saas
+install, ntctl prints the DNS records data planes dial (`databridge.`,
+`agentgateway-configsync.`, `trustguard-configsync.`) and the steps to connect
+one. The mode of an install cannot change in place.
 
 ## Commands
 
@@ -205,7 +240,8 @@ and everything else works as described above.
 | `ntctl upgrade` | Upgrades to the latest (or `--version`) chart, keeping the install's values: shows the release notes and every change first, stops on unsafe ones, rolls back if it does not become ready |
 | `ntctl rollback` | Returns an install to an earlier revision (`--to N`), showing what changes first |
 | `ntctl history` | The revisions of an install |
-| `ntctl adopt` | Checks that an install made with plain `helm` can be managed with ntctl, changing nothing |
+| `ntctl adopt` | Checks that an install made with plain `helm` can be managed with ntctl, changing nothing (`--chart` for air-gapped clusters) |
+| `ntctl uninstall` | Removes an install; its volumes and the Secrets ntctl created are kept unless you pass `--delete-data` / `--delete-secrets` |
 | `ntctl status` | Workload readiness, pods that need attention, and DNS records |
 | `ntctl doctor` | Says what is wrong with an install and how to fix it (`--output json`) |
 | `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
@@ -275,6 +311,12 @@ cannot do in place:
 Pass `--allow-breaking` only when you accept that those resources are deleted
 and recreated. If the upgrade does not become ready, the last working revision
 is restored.
+
+When an install or upgrade did not become ready, `ntctl doctor` says why. Once
+the cause is fixed, `ntctl upgrade` applies the failed revision again, even
+when nothing in the values changed. An install or upgrade that was interrupted
+(Ctrl+C, a lost connection) leaves the release locked: `ntctl rollback`
+clears an interrupted upgrade, and `ntctl uninstall` an interrupted install.
 
 ### Adding or removing a product
 
@@ -372,6 +414,7 @@ and a fix for each finding:
 | `NT-DR-012` | A container keeps crashing; its last log lines are shown |
 | `NT-DR-013` | Pods cannot be scheduled, with the scheduler's reason |
 | `NT-DR-014` | A container was killed for exceeding its memory limit |
+| `NT-DR-015` | A container runs but never becomes ready; the probe's failures and the container's last errors are shown, with a fix for causes it recognises (a config-sync token from another control plane, refused database credentials, an untrusted certificate) |
 | `NT-DR-020` | A volume is not bound |
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
@@ -402,6 +445,18 @@ sending it:
 ```sh
 tar -tzf ntctl-support-*.tar.gz
 ```
+
+## Starting over
+
+```sh
+ntctl uninstall                                  # asks you to type the namespace
+ntctl uninstall --yes --delete-data --delete-secrets
+```
+
+`uninstall` removes the release and every resource it created. Your volumes
+and the Secrets ntctl created stay unless you ask, and so does the namespace.
+Private TrustGate and TrustGuard instances stay in the console; delete them
+there if you no longer need them.
 
 ## Exit codes
 

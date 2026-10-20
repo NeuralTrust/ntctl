@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,15 @@ type Input struct {
 	Cluster *detect.Cluster
 	// LogLines is how many log lines a crashing container's finding carries.
 	LogLines int64
+	// Now is the time readiness is judged at; nil means time.Now.
+	Now func() time.Time
+}
+
+func (in Input) now() time.Time {
+	if in.Now != nil {
+		return in.Now()
+	}
+	return time.Now()
 }
 
 // Run returns every finding, most important first within each area.
@@ -68,6 +78,11 @@ func Run(ctx context.Context, in Input) ([]preflight.Result, error) {
 		return nil, err
 	}
 	out = append(out, more...)
+	// A failed release with nothing else wrong points at the evidence, not
+	// at findings that are not there.
+	if in.Current != nil && in.Current.Info != nil && in.Current.Info.Status == rcommon.StatusFailed && !preflight.Failed(out[1:]) {
+		out[0].Fix = "No other finding explains it. `ntctl support-bundle` collects the logs and events for NeuralTrust support; once the cause is fixed, run `ntctl upgrade` to apply the release again."
+	}
 	// Log lines and events can carry credentials; they are printed, so they
 	// go through the same redaction as a support bundle.
 	for i := range out {
@@ -94,11 +109,15 @@ func releaseCheck(in Input) preflight.Result {
 	case rcommon.StatusFailed:
 		r.Severity = preflight.Fail
 		r.Detail = lines(rel.Info.Description, 8)
-		r.Fix = "Fix the cause shown by the other findings, then run `ntctl upgrade` again."
-	case rcommon.StatusPendingInstall, rcommon.StatusPendingUpgrade, rcommon.StatusPendingRollback:
+		r.Fix = "Fix the cause shown by the findings below, then run `ntctl upgrade` to apply the release again."
+	case rcommon.StatusPendingInstall:
 		r.Severity = preflight.Fail
-		r.Message += " (an operation was interrupted, or is still running)"
-		r.Fix = "If no install or upgrade is running, roll back to the last working revision with `helm rollback " + rel.Name + " -n " + in.Namespace + "`, then upgrade again."
+		r.Message += " (an install was interrupted, or is still running)"
+		r.Fix = "If no install is running, remove the release with `ntctl uninstall -n " + in.Namespace + "`, then install again."
+	case rcommon.StatusPendingUpgrade, rcommon.StatusPendingRollback:
+		r.Severity = preflight.Fail
+		r.Message += " (a change was interrupted, or is still running)"
+		r.Fix = "If no upgrade or rollback is running, return to the last working revision with `ntctl rollback -n " + in.Namespace + "`, then upgrade again."
 	default:
 		r.Severity = preflight.Warn
 	}
@@ -185,7 +204,26 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod) []preflight.R
 						Fix:     "The last log lines are above. `ntctl support-bundle` collects the full logs for NeuralTrust support.",
 					}, p.Name)
 					if len(g.pods) == 1 {
-						g.r.Detail = lastLogs(ctx, in, p.Name, c.Name)
+						logs := lastLogs(ctx, in, p.Name, c.Name, true, in.LogLines)
+						g.r.Detail = clipAll(logs)
+						if fix := knownCause(logs, env(p, c.Name)); fix != "" {
+							g.r.Fix = fix
+						}
+					}
+				}
+			}
+			if notReady(p, c, in.now()) {
+				g := add(w, preflight.Result{
+					Code: "NT-DR-015", Check: "readiness", Severity: preflight.Fail,
+					Message: fmt.Sprintf("%s container %s runs but never becomes ready", w, c.Name),
+					Fix:     "The readiness probe's failures and the container's last errors are above. `ntctl support-bundle` collects the full logs for NeuralTrust support.",
+				}, p.Name)
+				if len(g.pods) == 1 {
+					events := filter(eventsFor(ctx, in, "Pod", p.Name), "Unhealthy: Readiness probe failed", "Unhealthy: Startup probe failed")
+					raw := lastLogs(ctx, in, p.Name, c.Name, false, 200)
+					g.r.Detail = append(events, notableLines(raw, int(in.LogLines))...)
+					if fix := knownCause(raw, env(p, c.Name)); fix != "" {
+						g.r.Fix = fix
 					}
 				}
 			}
@@ -398,10 +436,11 @@ func pullFix(p corev1.Pod) string {
 	return "Check that pull Secret " + strings.Join(names, ", ") + " holds a valid key for this registry (`ntctl install --registry-key` creates it), or that the image is mirrored under the same tag."
 }
 
-// lastLogs returns the last lines the crashed container wrote.
-func lastLogs(ctx context.Context, in Input, pod, container string) []string {
-	n := in.LogLines
-	req := in.Clientset.CoreV1().Pods(in.Namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container, Previous: true, TailLines: &n})
+// lastLogs returns the last n lines a container wrote, whole and not yet
+// redacted, for the caller to read and clip: the previous instance's for a
+// container that crashed, else the running one's.
+func lastLogs(ctx context.Context, in Input, pod, container string, previous bool, n int64) []string {
+	req := in.Clientset.CoreV1().Pods(in.Namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container, Previous: previous, TailLines: &n})
 	rc, err := req.Stream(ctx)
 	if err != nil {
 		return []string{"(no logs: " + err.Error() + ")"}
@@ -411,9 +450,18 @@ func lastLogs(ctx context.Context, in Input, pod, container string) []string {
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
-		lines = append(lines, clip(sc.Text(), 300))
+		lines = append(lines, sc.Text())
 	}
 	return lines
+}
+
+// clipAll clips every line, as anything printed must be.
+func clipAll(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = clip(l, 300)
+	}
+	return out
 }
 
 func jobLogs(ctx context.Context, in Input, job string) []string {
@@ -448,7 +496,8 @@ func eventsFor(ctx context.Context, in Input, kind, name string) []string {
 	}
 	var out []string
 	for _, e := range evs.Items {
-		if e.Type == corev1.EventTypeWarning {
+		// Matched here too: not every client applies the field selector.
+		if e.Type == corev1.EventTypeWarning && e.InvolvedObject.Kind == kind && e.InvolvedObject.Name == name {
 			out = append(out, clip(e.Reason+": "+e.Message, 300))
 		}
 	}

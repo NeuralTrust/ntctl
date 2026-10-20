@@ -28,9 +28,16 @@ const (
 	EnrolmentKey         = "ENROLMENT_TOKEN"
 )
 
+// Modes are the deployment modes the chart knows, the default first.
+var Modes = []string{"hybrid", "external", "saas"}
+
 // Inputs are the convenience flags. Empty fields generate nothing, so a render
 // driven only by -f files matches `helm template` with the same files.
 type Inputs struct {
+	// Mode is global.deploymentMode. Only a hybrid data plane reads the
+	// console's tokens, so the token Secret references are generated for
+	// hybrid (or an unset mode) only.
+	Mode     string
 	Domain   string
 	Platform string
 	Products []string
@@ -45,6 +52,9 @@ type Inputs struct {
 // Generate returns the values the flags stand for.
 func Generate(in Inputs) map[string]any {
 	global := map[string]any{}
+	if in.Mode != "" {
+		global["deploymentMode"] = in.Mode
+	}
 	if in.Domain != "" {
 		global["domain"] = in.Domain
 	}
@@ -71,10 +81,11 @@ func Generate(in Inputs) map[string]any {
 			enabled[p] = contains(in.Products, p)
 		}
 		global["products"] = enabled
-		if contains(in.Products, "trustgate") {
+		hybrid := in.Mode == "" || in.Mode == "hybrid"
+		if hybrid && contains(in.Products, "trustgate") {
 			out["agentgateway"] = tokenRefs(TrustGateConfigSync, TrustGateEnrolment)
 		}
-		if contains(in.Products, "trustguard") {
+		if hybrid && contains(in.Products, "trustguard") {
 			out["trustguard"] = tokenRefs(TrustGuardConfigSync, TrustGuardEnrolment)
 		}
 	}
@@ -97,8 +108,9 @@ func secretRef(name string) map[string]any {
 
 // ProductDelta returns the values that turn the products in add on and those
 // in remove off, leaving every other product as it is: what an upgrade applies
-// over the release's own values. An added TrustGate or TrustGuard reads ntctl's
-// token Secrets, unless current already names Secrets of its own.
+// over the release's own values. In hybrid an added TrustGate or TrustGuard
+// reads ntctl's token Secrets, unless current already names Secrets of its
+// own; other modes need no token.
 func ProductDelta(current map[string]any, add, remove []string) map[string]any {
 	out := map[string]any{}
 	if len(add) == 0 && len(remove) == 0 {
@@ -112,6 +124,9 @@ func ProductDelta(current map[string]any, add, remove []string) map[string]any {
 		products[p] = false
 	}
 	out["global"] = map[string]any{"products": products}
+	if DeploymentMode(current) != "hybrid" {
+		return out
+	}
 	for _, p := range add {
 		var root, configSync, enrolment string
 		switch p {

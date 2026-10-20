@@ -90,6 +90,10 @@ func (c productChange) print(out io.Writer) {
 func tokenSecrets(ctx context.Context, in *prompt.Prompter, cs kubernetes.Interface, ns string, sess *session, vals map[string]any, products []string, replace, placeholders bool) ([]*corev1.Secret, map[api.Product][]secrets.Spec, error) {
 	var create []*corev1.Secret
 	need := map[api.Product][]secrets.Spec{}
+	// Only a hybrid data plane dials NeuralTrust with tokens.
+	if values.DeploymentMode(vals) != "hybrid" {
+		return nil, need, nil
+	}
 	for _, spec := range secrets.TokenSpecs(products) {
 		if !referenced(vals, spec.Name) {
 			continue

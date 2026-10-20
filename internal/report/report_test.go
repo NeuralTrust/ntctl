@@ -89,3 +89,44 @@ func TestCollectHTTPRouteRecords(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectControlPlaneServices: a central control plane's config-sync and
+// DataBridge Services are what data planes elsewhere dial.
+func TestCollectControlPlaneServices(t *testing.T) {
+	lb := func(name, host string, ingress corev1.LoadBalancerIngress) *corev1.Service {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "nt"}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+			Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{ingress}}}}
+		if host != "" {
+			svc.Annotations = map[string]string{configSyncHost: host}
+		}
+		return svc
+	}
+	cs := fake.NewSimpleClientset(
+		lb("agentgateway-admin-configsync", "agentgateway-configsync.cp.example.com", corev1.LoadBalancerIngress{IP: "10.0.0.5"}),
+		lb("trustguard-control-plane-configsync", "trustguard-configsync.cp.example.com", corev1.LoadBalancerIngress{Hostname: "lb.elb.amazonaws.com"}),
+		lb("databridge-southbound", "", corev1.LoadBalancerIngress{}),
+		lb("unrelated", "", corev1.LoadBalancerIngress{IP: "10.0.0.9"}),
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "nt"}},
+	)
+	st, err := Collect(context.Background(), cs, nil, "nt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Record{}
+	for _, r := range st.Records {
+		got[r.Host] = r
+	}
+	want := map[string]Record{
+		"agentgateway-configsync.cp.example.com": {Host: "agentgateway-configsync.cp.example.com", Type: "A", Target: "10.0.0.5"},
+		"trustguard-configsync.cp.example.com":   {Host: "trustguard-configsync.cp.example.com", Type: "CNAME", Target: "lb.elb.amazonaws.com"},
+		"databridge.cp.example.com":              {Host: "databridge.cp.example.com"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("records = %+v", st.Records)
+	}
+	for h, w := range want {
+		if got[h] != w {
+			t.Errorf("%s = %+v, want %+v", h, got[h], w)
+		}
+	}
+}
