@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,7 +73,8 @@ func Run(ctx context.Context, in Input) ([]preflight.Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing pods: %w", err)
 	}
-	out = append(out, podFindings(ctx, in, pods.Items)...)
+	current, stale := currentRevision(ctx, in, pods.Items)
+	out = append(out, podFindings(ctx, in, current, stale)...)
 	more, err := resourceFindings(ctx, in)
 	if err != nil {
 		return nil, err
@@ -164,11 +166,73 @@ func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 
 // group collects pods that share a workload and a problem into one finding.
 type group struct {
-	r    preflight.Result
-	pods []string
+	r        preflight.Result
+	workload string
+	pods     []string
 }
 
-func podFindings(ctx context.Context, in Input, pods []corev1.Pod) []preflight.Result {
+// currentRevision keeps the pods of each workload's current revision and
+// counts, per workload, the pods of earlier ones. A rollout that never
+// becomes ready leaves the previous revision's pods running, and their logs
+// describe a configuration that is no longer applied: diagnosing them sends
+// the operator after a cause already fixed. When the controllers cannot be
+// read, every pod is kept.
+func currentRevision(ctx context.Context, in Input, pods []corev1.Pod) (current []corev1.Pod, stale map[string]int) {
+	stale = map[string]int{}
+	// The newest ReplicaSet of each Deployment, by its revision annotation.
+	newest := map[string]string{}
+	revision := map[string]int{}
+	byRS := map[string]string{}
+	if list, err := in.Clientset.AppsV1().ReplicaSets(in.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, rs := range list.Items {
+			owner := ""
+			for _, o := range rs.OwnerReferences {
+				if o.Kind == "Deployment" {
+					owner = o.Name
+				}
+			}
+			if owner == "" {
+				continue
+			}
+			byRS[rs.Name] = owner
+			n, _ := strconv.Atoi(rs.Annotations["deployment.kubernetes.io/revision"])
+			if _, seen := newest[owner]; !seen || n > revision[owner] {
+				newest[owner], revision[owner] = rs.Name, n
+			}
+		}
+	}
+	update := map[string]string{}
+	if list, err := in.Clientset.AppsV1().StatefulSets(in.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, s := range list.Items {
+			if s.Status.UpdateRevision != "" {
+				update[s.Name] = s.Status.UpdateRevision
+			}
+		}
+	}
+	for _, p := range pods {
+		old := false
+		if len(p.OwnerReferences) > 0 {
+			switch o := p.OwnerReferences[0]; o.Kind {
+			case "ReplicaSet":
+				if d, ok := byRS[o.Name]; ok && newest[d] != o.Name {
+					old = true
+				}
+			case "StatefulSet":
+				if u, ok := update[o.Name]; ok && p.Labels["controller-revision-hash"] != u {
+					old = true
+				}
+			}
+		}
+		if old {
+			stale[workloadOf(p)]++
+			continue
+		}
+		current = append(current, p)
+	}
+	return current, stale
+}
+
+func podFindings(ctx context.Context, in Input, pods []corev1.Pod, stale map[string]int) []preflight.Result {
 	pulls := &pullFailures{}
 	groups := map[string]*group{}
 	var order []string
@@ -176,7 +240,7 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod) []preflight.R
 		k := r.Code + "/" + workload
 		g, ok := groups[k]
 		if !ok {
-			g = &group{r: r}
+			g = &group{r: r, workload: workload}
 			groups[k] = g
 			order = append(order, k)
 		}
@@ -252,6 +316,13 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod) []preflight.R
 		g := groups[k]
 		if n := len(g.pods); n > 1 {
 			g.r.Message += fmt.Sprintf(" [%d pods]", n)
+		}
+		if n := stale[g.workload]; n > 0 {
+			what := "pod"
+			if n > 1 {
+				what = "pods"
+			}
+			g.r.Detail = append([]string{fmt.Sprintf("from the current rollout; %d %s of earlier revisions still running, not diagnosed", n, what)}, g.r.Detail...)
 		}
 		out = append(out, g.r)
 	}

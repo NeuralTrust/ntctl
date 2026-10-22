@@ -142,3 +142,26 @@ func TestUpgradeTelemetryFromFileIsNotAsked(t *testing.T) {
 		t.Errorf("an -f value should settle it without asking: on=%v\n%s", on, out)
 	}
 }
+
+func TestConnects(t *testing.T) {
+	implicit := map[string]any{"global": map[string]any{"saasRegion": "eu"}}
+	explicit := map[string]any{"global": map[string]any{"controlPlane": map[string]any{"domain": "cp.example.com"}}}
+	for _, tc := range []struct {
+		name, appURL string
+		vals         map[string]any
+		want, not    string
+	}{
+		{"not signed in", "", implicit, "Connects to the control plane at neuraltrust.ai.", "signed in"},
+		{"signed in to the region's console", "https://app.neuraltrust.ai", implicit, "at neuraltrust.ai.", "signed in"},
+		{"signed in elsewhere", "https://app.dev.example.com/", implicit, "add --control-plane dev.example.com", ""},
+		{"explicit domain is kept", "https://app.dev.example.com", explicit, "at cp.example.com.", "signed in"},
+		{"not hybrid", "https://app.dev.example.com", map[string]any{"global": map[string]any{"deploymentMode": "external"}}, "", "Connects"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := connects(tc.vals, tc.appURL)
+			if !strings.Contains(got, tc.want) || (tc.not != "" && strings.Contains(got, tc.not)) {
+				t.Errorf("connects = %q, want %q and not %q", got, tc.want, tc.not)
+			}
+		})
+	}
+}

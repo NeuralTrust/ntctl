@@ -39,6 +39,8 @@ type changeFlags struct {
 	showDiff      bool
 	allowBreaking bool
 	timeout       time.Duration
+	// fullNotes is upgrade's --release-notes: every release's notes whole.
+	fullNotes bool
 }
 
 func (f *changeFlags) register(fs interface {
@@ -71,10 +73,12 @@ func (f *changeFlags) review(out io.Writer, res diff.Result) (done bool, err err
 }
 
 const upgradeSummary = `Upgrade an existing install to a new chart version, keeping the values it
-was installed with. -f files and flags are layered on top.
+was installed with over the new chart's defaults, so new image tags apply.
+-f files and flags are layered on top.
 
 Before changing anything it shows the chart's release notes between the two
-versions and every resource that changes, rendered by the cluster in a dry
+versions (--release-notes for every release in full), the image versions that
+change, and every resource that changes, rendered by the cluster in a dry
 run. Changes Kubernetes cannot apply in place (a new selector, a removed
 Secret or volume) stop the upgrade unless --allow-breaking is given. If the
 upgrade does not become ready, it is rolled back.
@@ -103,6 +107,7 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	var remove, org, gate, guard string
 	fs := newFlags("upgrade", upgradeSummary, out, &o, true)
 	f.register(fs, "upgrade")
+	fs.BoolVar(&f.fullNotes, "release-notes", false, "print every release's notes in full, with its commits, instead of only the releases that have notes")
 	fs.StringVar(&remove, "remove-products", "", "comma-separated products to turn off; their workloads are deleted")
 	fs.StringVar(&org, "org", "", "signed in: organization ID for the tokens of an added product (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to add (default: create one)")
@@ -233,8 +238,11 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	}
 	from, to := p.current.Chart.Metadata.Version, p.chart.Version
 	fmt.Fprintf(out, "\nUpgrade %q in namespace %q from chart %s to %s\non %s.\n", o.release, o.kube.Namespace, from, to, o.kube.Target())
+	if line := connects(reuse(p.current.Config, p.values), signedInConsole()); line != "" {
+		fmt.Fprintln(out, line)
+	}
 	if o.chartPath == "" && from != to {
-		releaseNotes(ctx, out, from, to)
+		releaseNotes(ctx, out, from, to, f.fullNotes)
 	}
 
 	planned, err := helm.Plan(ctx, p.cfg, p.chart.Chart, p.values, o.release, o.kube.Namespace, true)
@@ -329,20 +337,26 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 
 // releaseNotes prints the chart's notes between two versions. They help but
 // are not required, so a failure to fetch them is only reported.
-func releaseNotes(ctx context.Context, out io.Writer, from, to string) {
+func releaseNotes(ctx context.Context, out io.Writer, from, to string, full bool) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	text, err := changelog.Fetch(ctx, &http.Client{Timeout: 15 * time.Second}, to)
+	entries, err := changelog.Notes(ctx, &http.Client{Timeout: 15 * time.Second}, from, to)
 	if err != nil {
 		fmt.Fprintf(out, "\nRelease notes are unavailable (%v).\n", err)
 		return
 	}
-	entries, err := changelog.Between(text, from, to)
-	if err != nil || len(entries) == 0 {
+	if len(entries) == 0 {
 		return
 	}
-	fmt.Fprintln(out, "\nRelease notes:")
-	changelog.Print(out, entries, 20)
+	what := "releases"
+	if len(entries) == 1 {
+		what = "release"
+	}
+	fmt.Fprintf(out, "\nRelease notes, %s to %s (%d %s):\n", from, to, len(entries), what)
+	changelog.Print(out, entries, full)
+	if !full {
+		fmt.Fprintf(out, "  Every release in full: --release-notes, or %s\n", changelog.NotesURL)
+	}
 }
 
 func compare(current, target string) (diff.Result, error) {

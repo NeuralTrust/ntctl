@@ -147,8 +147,16 @@ func knownCause(lines []string, env map[string]string) string {
 		return "Redis refuses the credentials: check REDIS_PASSWORD (and REDIS_USERNAME) in the external-redis Secret, then run `ntctl upgrade`."
 	case has("x509:"):
 		return "A TLS certificate is not trusted (see the x509 error above): with a private CA, give its bundle to the chart (global.controlPlane.caSecretName for the control plane), or use the server's public certificate."
-	case has("no such host"):
-		return "A host name does not resolve (see above): check the DNS records and the addresses in your values."
+	case has("no such host"), has("produced zero addresses"):
+		// gRPC reports a name that does not resolve as a resolver that
+		// produced zero addresses.
+		if ep := env["CONFIG_SYNC_GRPC_ENDPOINT"]; ep != "" && has("configsync") {
+			return fmt.Sprintf("The cluster cannot resolve %s, where the data plane fetches its configuration. "+
+				"It must resolve and be reachable from inside the cluster, not only from your machine: a name served only by a VPN such as Twingate "+
+				"resolves for its clients, never for pods. Publish it in DNS the cluster uses, or point the data plane at a control plane the cluster reaches "+
+				"(`ntctl upgrade --control-plane <domain> --version <installed version>`).", ep)
+		}
+		return "A host name does not resolve (see above): check the DNS records and the addresses in your values, and that the cluster uses DNS that serves them."
 	case has("connection refused"), has("i/o timeout"):
 		return "A dependency cannot be reached (see above): check that it runs, and that network policies, firewalls and egress allow the connection."
 	}

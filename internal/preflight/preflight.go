@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -74,6 +77,12 @@ type Input struct {
 	// IgnoreCapacity turns a capacity failure into a warning, for clusters
 	// meant to run short (a test cluster, or capacity added out of band).
 	IgnoreCapacity bool
+	// DeploymentMode is the effective global.deploymentMode: only a hybrid
+	// data plane dials a control plane outside the cluster.
+	DeploymentMode string
+	// Resolve looks a host name up from where ntctl runs; nil skips the
+	// control-plane check.
+	Resolve func(ctx context.Context, host string) ([]string, error)
 }
 
 // Run executes every check.
@@ -93,7 +102,70 @@ func Run(ctx context.Context, in Input) ([]Result, error) {
 	if r, ok := exposure(in); ok {
 		rs = append(rs, r)
 	}
+	if r, ok := controlPlane(ctx, in); ok {
+		rs = append(rs, r)
+	}
 	return rs, nil
+}
+
+// vpnRange holds the shared address space (RFC 6598) that VPN clients such as
+// Twingate and Tailscale hand out for the names they serve. A name that
+// resolves only into it here resolves for this machine alone, never for pods.
+var vpnRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// controlPlane warns when the control plane a hybrid data plane dials does
+// not resolve here, or resolves only to a VPN client's address. It only
+// warns: the cluster may use DNS this machine does not (split DNS).
+func controlPlane(ctx context.Context, in Input) (Result, bool) {
+	if in.Resolve == nil || in.DeploymentMode != "hybrid" || len(in.Needs.Dials) == 0 {
+		return Result{}, false
+	}
+	var hosts []string
+	seen := map[string]bool{}
+	for _, addr := range in.Needs.Dials {
+		host := addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			host = h
+		}
+		if !seen[host] {
+			seen[host] = true
+			hosts = append(hosts, host)
+		}
+	}
+	sort.Strings(hosts)
+	r := Result{Code: "NT-PF-010", Check: "dial", Severity: OK,
+		Message: "the control plane resolves: " + strings.Join(hosts, ", ")}
+	for _, h := range hosts {
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		addrs, err := in.Resolve(lctx, h)
+		cancel()
+		switch {
+		case err != nil || len(addrs) == 0:
+			r.Detail = append(r.Detail, h+" does not resolve from this machine")
+		case onlyVPN(addrs):
+			r.Detail = append(r.Detail, fmt.Sprintf("%s resolves here only to %s, an address a VPN client such as Twingate or Tailscale hands out", h, strings.Join(addrs, ", ")))
+		}
+	}
+	if len(r.Detail) == 0 {
+		return r, true
+	}
+	r.Severity = Warn
+	r.Message = fmt.Sprintf("the data plane may not reach its control plane: %d of %d names resolve only here or not at all", len(r.Detail), len(hosts))
+	r.Fix = "The data plane dials these names from inside the cluster, so the cluster's DNS must resolve them to addresses its pods can reach. " +
+		"Publish them in DNS the cluster uses, or point the data plane at a control plane the cluster reaches (--control-plane). " +
+		"If the cluster resolves them differently from this machine, ignore this."
+	return r, true
+}
+
+// onlyVPN reports whether every address is in the VPN range.
+func onlyVPN(addrs []string) bool {
+	for _, a := range addrs {
+		ip, err := netip.ParseAddr(a)
+		if err != nil || !vpnRange.Contains(ip.Unmap()) {
+			return false
+		}
+	}
+	return true
 }
 
 // internalLB are, per platform, the Service annotations that keep a

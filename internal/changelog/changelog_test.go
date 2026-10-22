@@ -72,8 +72,9 @@ func TestBetweenSameVersion(t *testing.T) {
 func TestPrintCutsLongEntries(t *testing.T) {
 	var out bytes.Buffer
 	entries, _ := Between(sample, "3.0.1", "3.1.0")
-	Print(&out, entries, 2)
-	for _, want := range []string{"v3.1.0 (2026-11-02)  READ BEFORE UPGRADING", "more lines in the chart CHANGELOG"} {
+	entries[1].Body = strings.TrimSpace(strings.Repeat("line\n", maxLines+3))
+	Print(&out, entries, false)
+	for _, want := range []string{"v3.1.0 (2026-11-02)  READ BEFORE UPGRADING", "3 more lines in the release notes"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output lacks %q:\n%s", want, out.String())
 		}
@@ -100,14 +101,36 @@ func TestFetch(t *testing.T) {
 }
 
 // rewrite sends every request to the test server, keeping the path after the
-// repository name.
+// repository name: /<tag>/CHANGELOG.md, or /releases for the API.
 type rewrite struct{ base string }
 
 func (r rewrite) RoundTrip(req *http.Request) (*http.Response, error) {
-	path := req.URL.Path[strings.Index(req.URL.Path, "/v"):]
+	path := "/releases"
+	if i := strings.Index(req.URL.Path, "/v"); i >= 0 {
+		path = req.URL.Path[i:]
+	}
 	out, err := http.NewRequestWithContext(req.Context(), req.Method, r.base+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	return http.DefaultTransport.RoundTrip(out)
+}
+
+func TestPrintCutsManyReleasesToHeadlines(t *testing.T) {
+	body := "### Added\n\n- **A feature\n  that wraps.** With a long\n  explanation.\n\n### Fixes\n\n- Redis starts again. It crash-looped before.\n"
+	entries := []Entry{
+		{Version: "3.0.4", Body: body},
+		{Version: "3.0.3", Body: body, Breaking: true},
+		{Version: "3.0.2", Body: body},
+		{Version: "3.0.1", Body: body},
+	}
+	var out bytes.Buffer
+	Print(&out, entries, false)
+	s := out.String()
+	if !strings.Contains(s, "  v3.0.4\n    Added: A feature that wraps.\n    Fixes: Redis starts again.\n") {
+		t.Errorf("headlines missing:\n%s", s)
+	}
+	if !strings.Contains(s, "v3.0.3  READ BEFORE UPGRADING\n    ### Added") {
+		t.Errorf("a release to read before upgrading is written whole:\n%s", s)
+	}
 }

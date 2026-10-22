@@ -304,15 +304,26 @@ ntctl upgrade --dry-run     # what would change, then stop
 ntctl upgrade
 ```
 
-`upgrade` keeps the values the install was made with. Before it changes
+`upgrade` keeps the values you set when installing and takes everything else,
+image tags included, from the new chart's defaults. Before it changes
 anything:
 
 1. It runs the preflight checks.
-2. It shows the chart's release notes between your version and the target, and
-   flags releases to read before upgrading.
-3. It asks the cluster to render the upgrade in a dry run, and lists every
-   resource that is added, changed or removed (`--show-diff` for the full
-   diff). Secret values are compared but never shown.
+2. It shows the chart's release notes between your version and the target,
+   from the chart's CHANGELOG and GitHub Releases. Releases with notes are
+   shown, and those to read before upgrading are flagged. Past three such
+   releases, each change is cut to one line, except in flagged releases.
+   Releases with nothing beyond their commits, usually image updates, are
+   named on one line.
+   `--release-notes` prints every release in full, with its commits.
+3. It asks the cluster to render the upgrade in a dry run. It lists every
+   image version that changes, once per image, and every resource that is
+   added, changed or removed (`--show-diff` for the full diff). Secret values
+   are compared but never shown.
+4. For a hybrid install, it names the control plane the data plane connects
+   to. If you are signed in to the console of a different one, it tells you to
+   add `--control-plane`, because tokens are accepted only by the control
+   plane whose console issued them.
 
 It stops, changing nothing, when the upgrade would need something Kubernetes
 cannot do in place:

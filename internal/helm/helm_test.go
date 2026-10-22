@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,5 +201,50 @@ func TestInstallStoppedEarlyIsFailedNotPending(t *testing.T) {
 	cur, err := Current(f.cfg, "rel")
 	if err != nil || cur == nil || cur.Info.Status != rcommon.StatusFailed {
 		t.Fatalf("after a stopped install: %v, %v; want a failed release", cur, err)
+	}
+}
+
+// taggedChart renders one Deployment whose image tag defaults to tag, as the
+// platform chart's values.yaml sets each component's default.
+func taggedChart(version, tag string) *chart.Loaded {
+	ch := &chartv2.Chart{
+		Metadata: &chartv2.Metadata{APIVersion: "v2", Name: "tagged", Version: version},
+		Values:   map[string]any{"image": map[string]any{"tag": tag}},
+		Templates: []*common.File{{Name: "templates/deploy.yaml", Data: []byte(
+			"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        image: \"app:{{ .Values.image.tag }}\"\n")}},
+	}
+	return &chart.Loaded{Chart: ch, Name: "tagged", Version: version}
+}
+
+func TestUpgradeTakesTheNewChartsDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		vals map[string]any
+		want string
+	}{
+		{"default tag moves", map[string]any{"other": "x"}, "app:2"},
+		{"pinned tag stays", map[string]any{"image": map[string]any{"tag": "pinned"}}, "app:pinned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFakeCluster()
+			if _, err := Install(ctx, f.cfg, taggedChart("1.0.0", "1"), tc.vals, "rel", "ns", time.Minute, nil); err != nil {
+				t.Fatal(err)
+			}
+			planned, err := Plan(ctx, f.cfg, taggedChart("2.0.0", "2").Chart, nil, "rel", "ns", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(planned, tc.want) {
+				t.Fatalf("plan renders %q, want %s", planned, tc.want)
+			}
+			if _, err := Upgrade(ctx, f.cfg, taggedChart("2.0.0", "2"), nil, "rel", "ns", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			cur, _ := Current(f.cfg, "rel")
+			if !strings.Contains(cur.Manifest, tc.want) {
+				t.Fatalf("upgrade applied %q, want %s", cur.Manifest, tc.want)
+			}
+		})
 	}
 }

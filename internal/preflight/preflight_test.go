@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -213,5 +214,62 @@ func TestExposure(t *testing.T) {
 		case r.Severity == Warn && r.Fix == "":
 			t.Errorf("%s: a warning without a fix", c.name)
 		}
+	}
+}
+
+func TestControlPlane(t *testing.T) {
+	answers := map[string][]string{
+		"agentgateway-configsync.cp.example.com":  {"203.0.113.10"},
+		"databridge.cp.example.com":               {"203.0.113.11"},
+		"agentgateway-configsync.vpn.example.com": {"100.110.196.14"},
+		"databridge.vpn.example.com":              {"100.110.196.16", "203.0.113.12"},
+	}
+	resolve := func(_ context.Context, host string) ([]string, error) {
+		if a, ok := answers[host]; ok {
+			return a, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	cases := []struct {
+		name, mode string
+		dials      []string
+		want       Severity // "" when the check does not apply
+		says       string
+	}{
+		{name: "not hybrid", mode: "external", dials: []string{"agentgateway-configsync.vpn.example.com:443"}},
+		{name: "nothing dialled", mode: "hybrid"},
+		{name: "public names", mode: "hybrid", dials: []string{"agentgateway-configsync.cp.example.com:443", "databridge.cp.example.com:443"}, want: OK,
+			says: "the control plane resolves: agentgateway-configsync.cp.example.com, databridge.cp.example.com"},
+		{name: "VPN only", mode: "hybrid", dials: []string{"agentgateway-configsync.vpn.example.com:443", "databridge.vpn.example.com:443"}, want: Warn,
+			says: "1 of 2 names resolve only here or not at all"},
+		{name: "unresolved", mode: "hybrid", dials: []string{"trustguard-configsync.gone.example.com:443"}, want: Warn,
+			says: "1 of 1 names"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in := base()
+			in.DeploymentMode, in.Resolve = c.mode, resolve
+			in.Needs.Dials = c.dials
+			r, ok := controlPlane(context.Background(), in)
+			if c.want == "" {
+				if ok {
+					t.Fatalf("the check should not apply: %+v", r)
+				}
+				return
+			}
+			if !ok || r.Severity != c.want || !strings.Contains(r.Message, c.says) {
+				t.Fatalf("result = %+v, want %s saying %q", r, c.want, c.says)
+			}
+			if c.want == Warn && (r.Fix == "" || len(r.Detail) == 0) {
+				t.Errorf("a warning names the host and the fix: %+v", r)
+			}
+		})
+	}
+	in := base()
+	in.DeploymentMode, in.Resolve = "hybrid", resolve
+	in.Needs.Dials = []string{"agentgateway-configsync.vpn.example.com:443"}
+	r, _ := controlPlane(context.Background(), in)
+	if r.Detail[0] != "agentgateway-configsync.vpn.example.com resolves here only to 100.110.196.14, an address a VPN client such as Twingate or Tailscale hands out" {
+		t.Errorf("detail = %q", r.Detail)
 	}
 }
