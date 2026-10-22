@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/api"
+	"github.com/NeuralTrust/ntctl/internal/config"
 	"github.com/NeuralTrust/ntctl/internal/prompt"
 	"github.com/NeuralTrust/ntctl/internal/secrets"
 	"github.com/NeuralTrust/ntctl/internal/values"
@@ -107,6 +108,34 @@ func pointAtConsole(vals map[string]any, domain string, fresh bool) (map[string]
 			"sign in to the console of %s (`ntctl login`) to add products to this release", have, domain, have)
 	}
 	return values.ControlPlaneValues(domain), nil
+}
+
+// connects describes the control plane a hybrid release dials with vals, and
+// when the operator is signed in to the console of another one, how to
+// point it there. It never retargets the release itself: a sign-in to one
+// console must not move a data plane whose tokens came from another. It
+// returns "" for other modes.
+func connects(vals map[string]any, appURL string) string {
+	if values.DeploymentMode(vals) != "hybrid" {
+		return ""
+	}
+	have, explicit := values.DialedControlPlane(vals)
+	line := fmt.Sprintf("Connects to the control plane at %s.", have)
+	console, ok := values.ControlPlaneFromConsole(appURL)
+	if !ok || console == have || explicit {
+		return line
+	}
+	return line + fmt.Sprintf(" You are signed in to the console of %s. If this install's tokens came from that console,\n"+
+		"add --control-plane %s: no other control plane accepts them, and config sync stays Unauthenticated.", console, console)
+}
+
+// signedInConsole is the URL of the console ntctl is signed in to, or "".
+func signedInConsole() string {
+	cfg, err := config.Load()
+	if err != nil {
+		return ""
+	}
+	return cfg.AppURL
 }
 
 // describe prints a summary line per instance.

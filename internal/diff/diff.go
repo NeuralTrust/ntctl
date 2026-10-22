@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
@@ -58,8 +59,28 @@ type Change struct {
 	Blocking []string `json:"blocking,omitempty"`
 	// Secret keys added, removed or with a new value. Values are never kept.
 	SecretKeys *SecretKeys `json:"secretKeys,omitempty"`
+	// Images are the containers whose image changes.
+	Images []ImageChange `json:"images,omitempty"`
 	// Unified is the diff of the resource, with Secret values hidden.
 	Unified string `json:"-"`
+}
+
+// ImageChange is one container's image before and after.
+type ImageChange struct {
+	Container string `json:"container"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+}
+
+// String names the image once and shows the tag change, or both references
+// when the repository changes too.
+func (i ImageChange) String() string {
+	fr, ft := splitImage(i.From)
+	tr, tt := splitImage(i.To)
+	if fr != tr {
+		return i.From + " → " + i.To
+	}
+	return path.Base(fr) + " " + ft + " → " + tt
 }
 
 // SecretKeys summarises a Secret's change by key.
@@ -120,6 +141,7 @@ func Compare(from, to []manifest.Object) Result {
 			}
 			c.Op = Changed
 			c.SecretKeys = keys
+			c.Images = images(oldObj, newObj)
 			if keys != nil && len(keys.Removed) > 0 {
 				c.Blocking = append(c.Blocking, "removes Secret keys "+strings.Join(keys.Removed, ", ")+" that workloads may read")
 			}
@@ -135,12 +157,38 @@ func Compare(from, to []manifest.Object) Result {
 	return res
 }
 
+// Components returns each image whose version changes, once however many
+// workloads run it: what an upgrade moves, independent of how many releases
+// it spans. Images of added or removed workloads are not counted.
+func (r Result) Components() []ImageChange {
+	seen := map[string]bool{}
+	var out []ImageChange
+	for _, c := range r.Changes {
+		for _, i := range c.Images {
+			k := i.From + " " + i.To
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, ImageChange{From: i.From, To: i.To})
+			}
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].String() < out[b].String() })
+	return out
+}
+
 // Print writes a summary grouped by kind, the blocking changes, and with
 // full set, each changed resource's diff.
 func (r Result) Print(w io.Writer, full bool) {
 	if r.Empty() {
 		fmt.Fprintln(w, "No resource changes.")
 		return
+	}
+	if comps := r.Components(); len(comps) > 0 {
+		fmt.Fprintln(w, "Image versions:")
+		for _, i := range comps {
+			fmt.Fprintf(w, "  %s\n", i)
+		}
+		fmt.Fprintln(w)
 	}
 	counts := map[Op]int{}
 	for _, c := range r.Changes {
@@ -152,6 +200,13 @@ func (r Result) Print(w io.Writer, full bool) {
 		line := fmt.Sprintf("  %s %s/%s", mark[c.Op], c.Kind, c.Name)
 		if k := c.SecretKeys; k != nil {
 			line += " (" + k.String() + ")"
+		}
+		if len(c.Images) > 0 {
+			var parts []string
+			for _, i := range c.Images {
+				parts = append(parts, i.String())
+			}
+			line += "  " + strings.Join(parts, ", ")
 		}
 		if len(c.Blocking) > 0 {
 			line += "  BLOCKING"
@@ -188,6 +243,50 @@ func (k *SecretKeys) String() string {
 		parts = append(parts, "new values: "+strings.Join(k.Changed, ", "))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// images lists the containers, init containers included, whose image differs
+// between two versions of a workload.
+func images(a, b manifest.Object) []ImageChange {
+	before := containerImages(a)
+	var out []ImageChange
+	for _, ci := range containerImages(b) {
+		for _, old := range before {
+			if old.Container == ci.Container && old.To != ci.To {
+				out = append(out, ImageChange{Container: ci.Container, From: old.To, To: ci.To})
+			}
+		}
+	}
+	return out
+}
+
+// containerImages returns each container's image in To.
+func containerImages(o manifest.Object) []ImageChange {
+	spec := o.PodSpec()
+	var out []ImageChange
+	for _, field := range []string{"initContainers", "containers"} {
+		list, _ := spec[field].([]any)
+		for _, c := range list {
+			m, _ := c.(map[string]any)
+			name, _ := m["name"].(string)
+			img, _ := m["image"].(string)
+			if img != "" {
+				out = append(out, ImageChange{Container: name, To: img})
+			}
+		}
+	}
+	return out
+}
+
+// splitImage splits a reference into repository and tag (or digest).
+func splitImage(ref string) (repo, tag string) {
+	if i := strings.LastIndex(ref, "@"); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		return ref[:i], ref[i+1:]
+	}
+	return ref, "latest"
 }
 
 func key(o manifest.Object) string {

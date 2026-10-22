@@ -177,3 +177,76 @@ func TestPrintShowsDiff(t *testing.T) {
 		}
 	}
 }
+
+func TestImageChanges(t *testing.T) {
+	to := strings.Replace(base, "registry.example.com/proxy:1.0.0", "registry.example.com/proxy:1.1.0", 1) + `---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: registry.example.com/worker:2.0.0
+`
+	from := base + `---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: migrate
+        image: registry.example.com/proxy:1.0.0
+      containers:
+      - name: worker
+        image: other.example.com/worker:2.0.0
+`
+	res := Compare(parse(t, from), parse(t, to))
+	var proxy, worker Change
+	for _, c := range res.Changes {
+		switch c.Name {
+		case "proxy":
+			proxy = c
+		case "worker":
+			worker = c
+		}
+	}
+	if len(proxy.Images) != 1 || proxy.Images[0].String() != "proxy 1.0.0 → 1.1.0" {
+		t.Fatalf("proxy images = %+v", proxy.Images)
+	}
+	// A new registry shows both references; the removed init container is
+	// not an image change.
+	if len(worker.Images) != 1 || worker.Images[0].String() != "other.example.com/worker:2.0.0 → registry.example.com/worker:2.0.0" {
+		t.Fatalf("worker images = %+v", worker.Images)
+	}
+	if got := len(res.Components()); got != 2 {
+		t.Fatalf("components = %+v, want 2", res.Components())
+	}
+	var out bytes.Buffer
+	res.Print(&out, false)
+	for _, want := range []string{"Image versions:\n  other.example.com", "  proxy 1.0.0 → 1.1.0\n", "~ Deployment/proxy  proxy 1.0.0 → 1.1.0"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestComponentsCountsAnImageOnce(t *testing.T) {
+	two := func(tag string) string {
+		var b strings.Builder
+		for _, n := range []string{"a", "b"} {
+			b.WriteString("---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: " + n +
+				"\nspec:\n  template:\n    spec:\n      containers:\n      - name: w\n        image: example.com/fw@" + tag + "\n")
+		}
+		return b.String()
+	}
+	res := Compare(parse(t, two("sha256:aa")), parse(t, two("sha256:bb")))
+	if c := res.Components(); len(c) != 1 || c[0].String() != "fw sha256:aa → sha256:bb" {
+		t.Fatalf("components = %+v", c)
+	}
+}

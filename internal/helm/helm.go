@@ -137,8 +137,10 @@ type UpgradeResult struct {
 }
 
 // Upgrade upgrades an existing release, keeping the values it was installed
-// with and layering vals on top. If it does not become ready, Helm rolls back
-// to the last working revision when there is one.
+// with and layering vals on top. The new chart's defaults apply: only values
+// the operator set are carried over, so new image tags and defaults land. If
+// it does not become ready, Helm rolls back to the last working revision when
+// there is one.
 func Upgrade(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, vals map[string]any, name, namespace string, timeout time.Duration) (UpgradeResult, error) {
 	before, err := history(cfg, name)
 	if err != nil {
@@ -151,7 +153,9 @@ func Upgrade(ctx context.Context, cfg *action.Configuration, ch *chart.Loaded, v
 	working := LastWorking(before)
 	up := action.NewUpgrade(cfg)
 	up.Namespace = namespace
-	up.ReuseValues = true
+	// Not ReuseValues: Helm then renders the new chart with the old chart's
+	// defaults, so an upgrade never picks up a new image tag.
+	up.ResetThenReuseValues = true
 	// Follow whatever apply method the release was made with, as `helm
 	// upgrade` does, so releases installed by Helm 3 keep client-side apply.
 	up.ServerSideApply = "auto"
@@ -190,12 +194,13 @@ func LastWorking(hist []*release.Release) *release.Release {
 // applying anything. The cluster renders it in a server-side dry run, so
 // templates that look up live objects (generated Secrets that are reused, for
 // one) render as the real upgrade would. With reuse, vals are layered on the
-// release's values as `ntctl upgrade` does; without, vals replace them.
+// release's values over the new chart's defaults, as `ntctl upgrade` does;
+// without, vals replace them.
 func Plan(ctx context.Context, cfg *action.Configuration, ch chartapi.Charter, vals map[string]any, name, namespace string, reuse bool) (string, error) {
 	up := action.NewUpgrade(cfg)
 	up.Namespace = namespace
 	up.DryRunStrategy = action.DryRunServer
-	up.ReuseValues = reuse
+	up.ResetThenReuseValues = reuse
 	up.ResetValues = !reuse
 	up.ServerSideApply = "auto"
 	r, err := up.RunWithContext(ctx, name, ch, vals)

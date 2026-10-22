@@ -274,6 +274,9 @@ func group(groups map[string]*PodGroup, order *[]string, pod map[string]any) *Po
 	return &g
 }
 
+// PodSpec is the pod template's spec of a workload, or nil for other kinds.
+func (o Object) PodSpec() map[string]any { return podSpec(o) }
+
 func podSpec(o Object) map[string]any {
 	if o.Kind() == "CronJob" {
 		m, _ := dig(o, "spec", "jobTemplate", "spec", "template", "spec").(map[string]any)
