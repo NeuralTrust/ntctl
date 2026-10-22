@@ -1,6 +1,9 @@
 package manifest
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const rendered = `---
 # Source: c/templates/secret.yaml
@@ -211,5 +214,45 @@ spec:
 	if len(n.LoadBalancers) != 1 || n.LoadBalancers[0].Name != "databridge-southbound" ||
 		n.LoadBalancers[0].Annotations["service.beta.kubernetes.io/azure-load-balancer-internal"] != "true" {
 		t.Fatalf("load balancers = %+v", n.LoadBalancers)
+	}
+}
+
+func TestAnalyseDials(t *testing.T) {
+	objs, err := Parse(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+spec:
+  template:
+    spec:
+      containers:
+      - name: proxy
+        env:
+        - name: CONFIG_SYNC_GRPC_ENDPOINT
+          value: agentgateway-configsync.cp.example.com:443
+        - name: OTHER_ADDR
+          value: other.example.com:443
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dataagent-env-vars
+data:
+  DATABRIDGE_ADDR: databridge.cp.example.com:443
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guard-env-vars
+data:
+  CONFIG_SYNC_GRPC_ENDPOINT: trustguard-control.neuraltrust.svc.cluster.local:9090
+  DATABRIDGE_ADDR: databridge:443
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Analyse(objs).Dials
+	if strings.Join(got, " ") != "agentgateway-configsync.cp.example.com:443 databridge.cp.example.com:443" {
+		t.Fatalf("dials = %v, want the two control-plane addresses only", got)
 	}
 }

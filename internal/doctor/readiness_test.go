@@ -87,11 +87,13 @@ func TestKnownCause(t *testing.T) {
 	ep := map[string]string{"CONFIG_SYNC_GRPC_ENDPOINT": "agentgateway-configsync.neuraltrust.ai:443"}
 	cases := map[string]string{
 		"ERROR change stream watch failed: configsync: watch recv: rpc error: code = Unauthenticated desc = missing or invalid config-sync token": "Config sync at agentgateway-configsync.neuraltrust.ai:443 refuses this data plane's token",
-		`FATAL: password authentication failed for user "nt"`:  "PostgreSQL refuses",
-		"WRONGPASS invalid username-password pair":             "Redis refuses",
-		"x509: certificate signed by unknown authority":        "TLS certificate is not trusted",
-		"dial tcp: lookup db.example.com: no such host":        "does not resolve",
-		"dial tcp 192.0.2.1:5432: connect: connection refused": "cannot be reached",
+		`FATAL: password authentication failed for user "nt"`: "PostgreSQL refuses",
+		"WRONGPASS invalid username-password pair":            "Redis refuses",
+		"x509: certificate signed by unknown authority":       "TLS certificate is not trusted",
+		"dial tcp: lookup db.example.com: no such host":       "does not resolve",
+		"ERROR initial converge failed: configsync: fetch snapshot: configsync: get snapshot: rpc error: code = Unavailable desc = name resolver error: produced zero addresses": "The cluster cannot resolve agentgateway-configsync.neuraltrust.ai:443",
+		"rpc error: code = Unavailable desc = name resolver error: produced zero addresses":                                                                                      "does not resolve",
+		"dial tcp 192.0.2.1:5432: connect: connection refused":                                                                                                                   "cannot be reached",
 		"all good": "",
 	}
 	for line, want := range cases {

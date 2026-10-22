@@ -4,7 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -263,5 +265,43 @@ func TestHTTPRouteNotAccepted(t *testing.T) {
 	if !strings.Contains(found.Message, "1 of 2 HTTPRoutes") || !strings.Contains(found.Message, "trustguard") ||
 		len(found.Detail) != 1 || !strings.Contains(found.Detail[0], "BackendNotFound") {
 		t.Errorf("finding = %+v", found)
+	}
+}
+
+func TestOnlyTheCurrentRevisionIsDiagnosed(t *testing.T) {
+	rs := func(name string, rev string) *appsv1.ReplicaSet {
+		return &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+			Annotations:     map[string]string{"deployment.kubernetes.io/revision": rev},
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "proxy"}}}}
+	}
+	unready := func(p *corev1.Pod) {
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "app",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(time.Now().Add(-time.Hour))}}}}
+	}
+	crashing := pod("db-0", "db", func(p *corev1.Pod) {
+		p.OwnerReferences[0].Kind = "StatefulSet"
+		p.Labels = map[string]string{"controller-revision-hash": "db-1"}
+		waiting("CrashLoopBackOff", "")(p)
+	})
+	got := run(t, rel(rcommon.StatusFailed, ""),
+		rs("proxy-1a", "1"), rs("proxy-2b", "2"), rs("proxy-3c", "3"),
+		pod("proxy-1a-x", "proxy-1a", unready),
+		pod("proxy-2b-x", "proxy-2b", unready),
+		pod("proxy-3c-x", "proxy-3c", unready),
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: ns}, Status: appsv1.StatefulSetStatus{UpdateRevision: "db-2"}},
+		crashing,
+	)
+	r, ok := got["NT-DR-015"]
+	if !ok {
+		t.Fatalf("readiness finding missing: %v", got)
+	}
+	if strings.Contains(r.Message, "pods]") {
+		t.Errorf("only the current rollout's pod is diagnosed: %q", r.Message)
+	}
+	if len(r.Detail) == 0 || r.Detail[0] != "from the current rollout; 2 pods of earlier revisions still running, not diagnosed" {
+		t.Errorf("detail = %q", r.Detail)
+	}
+	if _, ok := got["NT-DR-012"]; ok {
+		t.Error("a StatefulSet pod of an earlier revision is not diagnosed")
 	}
 }

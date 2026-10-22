@@ -5,6 +5,7 @@ package manifest
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -81,6 +82,26 @@ type Needs struct {
 	// LoadBalancers are the Services of type LoadBalancer the release
 	// renders, which the cloud gives an address of their own.
 	LoadBalancers []LoadBalancer
+	// Dials are the control-plane addresses (host:port) a data plane dials
+	// from inside the cluster, such as its config-sync and DataBridge
+	// endpoints. Cluster-local names are left out.
+	Dials []string
+}
+
+// dialKeys are the environment variables and ConfigMap keys that carry a
+// control-plane address a data plane dials.
+var dialKeys = map[string]bool{"CONFIG_SYNC_GRPC_ENDPOINT": true, "DATABRIDGE_ADDR": true}
+
+// external reports whether addr names a host outside the cluster: a dotted
+// DNS name that is neither cluster-local nor an IP address.
+func external(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	return strings.Contains(host, ".") && net.ParseIP(host) == nil &&
+		!strings.HasSuffix(host, ".svc") && !strings.HasSuffix(host, ".cluster.local") && !strings.Contains(host, ".svc.")
 }
 
 // LoadBalancer is a Service of type LoadBalancer and its annotations, which
@@ -121,6 +142,12 @@ func Analyse(objs []Object) Needs {
 	gateways := map[gatewayapi.ParentRef]bool{}
 	groups := map[string]*PodGroup{}
 	var groupOrder []string
+	dials := map[string]bool{}
+	dial := func(key string, v any) {
+		if addr, _ := v.(string); dialKeys[key] && external(strings.TrimSpace(addr)) {
+			dials[strings.TrimSpace(addr)] = true
+		}
+	}
 
 	for _, o := range objs {
 		kind := o.Kind()
@@ -132,6 +159,12 @@ func Analyse(objs []Object) Needs {
 			noteClass(dig(o, "spec", "ingressClassName"), ingress, &n.DefaultIngress)
 		case kind == "Route":
 			n.Routes = true
+		case kind == "ConfigMap":
+			if d, ok := o["data"].(map[string]any); ok {
+				for k, v := range d {
+					dial(k, v)
+				}
+			}
 		case kind == "Service" && dig(o, "spec", "type") == "LoadBalancer":
 			lb := LoadBalancer{Name: o.Name(), Annotations: map[string]string{}}
 			if m, ok := dig(o, "metadata", "annotations").(map[string]any); ok {
@@ -185,6 +218,9 @@ func Analyse(objs []Object) Needs {
 			for _, field := range []string{"initContainers", "containers"} {
 				for _, c := range list(pod[field]) {
 					for _, e := range list(dig(c, "env")) {
+						if k, _ := dig(e, "name").(string); k != "" {
+							dial(k, dig(e, "value"))
+						}
 						name, _ := dig(e, "valueFrom", "secretKeyRef", "name").(string)
 						key, _ := dig(e, "valueFrom", "secretKeyRef", "key").(string)
 						optional, _ := dig(e, "valueFrom", "secretKeyRef", "optional").(bool)
@@ -225,6 +261,7 @@ func Analyse(objs []Object) Needs {
 	for _, k := range groupOrder {
 		n.Groups = append(n.Groups, *groups[k])
 	}
+	n.Dials = keys(dials)
 	n.PullSecrets = keys(pull)
 	n.StorageClasses = keys(storage)
 	n.IngressClasses = keys(ingress)
