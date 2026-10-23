@@ -269,7 +269,9 @@ Flags every command accepts:
 Flags for `install`, `upgrade`, `preflight` and `render`:
 
 - `-f values.yaml`: any chart value, as with `helm -f`. Repeat it to layer files.
-- `--domain`, `--platform`, `--products`. On `upgrade`, `--products` only
+- `--domain`, `--platform`, `--products`. `--products` is for hybrid installs:
+  external and saas installs run every product, so it is neither asked nor
+  accepted there. On `upgrade`, `--products` only
   turns products on and the others keep their state; `--remove-products`
   turns products off. See [Adding or removing a product](#adding-or-removing-a-product).
 - `--gateway <namespace>/<name>[:<listener>]`: expose the endpoints as Gateway
