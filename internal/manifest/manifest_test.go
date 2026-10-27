@@ -256,3 +256,66 @@ data:
 		t.Fatalf("dials = %v, want the two control-plane addresses only", got)
 	}
 }
+
+func TestAnalyseCountsSecretsAHookWrites(t *testing.T) {
+	objs, err := Parse(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin
+spec:
+  template:
+    spec:
+      containers:
+      - name: admin
+        env:
+        - name: ADMIN_M2M_PUBLIC_KEYS
+          valueFrom:
+            secretKeyRef: {name: m2m-keys, key: ADMIN_M2M_PUBLIC_KEYS}
+        - name: OTHER
+          valueFrom:
+            secretKeyRef: {name: read-only, key: X}
+        - name: LATER
+          valueFrom:
+            secretKeyRef: {name: post-hook, key: X}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: m2m-keys
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["m2m-keys"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["read-only"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: later
+  annotations:
+    helm.sh/hook: post-install
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["post-hook"]
+  verbs: ["patch"]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing []string
+	for _, s := range Analyse(objs).Secrets {
+		missing = append(missing, s.Name)
+	}
+	// A pre-install hook fills m2m-keys before the workload starts; a Role
+	// that only reads, or a hook that runs after install, does not.
+	if strings.Join(missing, " ") != "post-hook read-only" {
+		t.Fatalf("missing = %v, want post-hook and read-only only", missing)
+	}
+}

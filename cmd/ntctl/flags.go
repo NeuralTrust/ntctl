@@ -91,7 +91,7 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.controlPlane, "control-plane", "", "hybrid: the domain of the control plane the data plane dials (global.controlPlane.domain), when it is not NeuralTrust's for the region; tokens are valid only at the control plane whose console issued them")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
-		productsUsage := "comma-separated products: " + strings.Join(values.Products, ",")
+		productsUsage := "hybrid: comma-separated products, " + strings.Join(values.Products, ",") + " (external and saas installs run every product)"
 		if name == "upgrade" {
 			productsUsage = "comma-separated products to turn on: " + strings.Join(values.Products, ",") + "; the others keep their state (see --remove-products)"
 		}

@@ -390,3 +390,41 @@ func TestControlPlaneFlag(t *testing.T) {
 		t.Errorf("explicit control plane vs console: %v", err)
 	}
 }
+
+func TestAskProductsOnlyForHybrid(t *testing.T) {
+	t.Setenv("ONPREM_SUPERADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ONPREM_SUPERADMIN_PASSWORD", "correct-horse-battery")
+	files := func(mode string) map[string]any {
+		return map[string]any{"global": map[string]any{
+			"deploymentMode": mode, "domain": "p.example.com", "platform": "aws", "imageRegistry": "mirror.example.com",
+			"observability": map[string]any{"operationalTelemetry": false},
+			"postgresql":    map[string]any{"deploy": true}, "redis": map[string]any{"deploy": true},
+		}}
+	}
+	for _, mode := range []string{"external", "saas"} {
+		var out bytes.Buffer
+		o := opts{}
+		if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader(""), &out), &out,
+			fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files(mode)); err != nil {
+			t.Fatalf("%s: %v\n%s", mode, err, out.String())
+		}
+		if strings.Contains(out.String(), "Products") || o.products != "" {
+			t.Errorf("%s: every product runs, so none is asked:\n%s", mode, out.String())
+		}
+		o = opts{products: "trustgate"}
+		_, err := ask(context.Background(), prompt.Scripted(strings.NewReader(""), &out), &out,
+			fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files(mode))
+		if err == nil || !strings.Contains(err.Error(), "--products applies to hybrid installs") {
+			t.Errorf("%s: --products should be refused, got %v", mode, err)
+		}
+	}
+	var out bytes.Buffer
+	o := opts{}
+	if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader("\n\n"), &out), &out,
+		fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files("hybrid")); err != nil {
+		t.Fatalf("hybrid: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Products, comma-separated") {
+		t.Errorf("hybrid still asks for its products:\n%s", out.String())
+	}
+}

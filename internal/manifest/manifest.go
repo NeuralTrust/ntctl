@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 
@@ -132,6 +133,9 @@ func Analyse(objs []Object) Needs {
 	for _, o := range objs {
 		if o.Kind() == "Secret" {
 			created[o.Name()] = true
+		}
+		for _, name := range hookWrites(o) {
+			created[name] = true
 		}
 	}
 	var n Needs
@@ -266,6 +270,44 @@ func Analyse(objs []Object) Needs {
 	n.StorageClasses = keys(storage)
 	n.IngressClasses = keys(ingress)
 	return n
+}
+
+// writeVerbs are the verbs that let a hook fill in a Secret.
+var writeVerbs = map[string]bool{"create": true, "patch": true, "update": true, "*": true}
+
+// hookWrites returns the Secrets a pre-install hook Role lets its Job write,
+// by name: the chart generates key material such as a signing key pair in a
+// hook, so those Secrets exist before any workload starts although the chart
+// renders none of them.
+func hookWrites(o Object) []string {
+	if o.Kind() != "Role" {
+		return nil
+	}
+	hook, _ := dig(o, "metadata", "annotations", "helm.sh/hook").(string)
+	if !slices.Contains(strings.Split(strings.ReplaceAll(hook, " ", ""), ","), "pre-install") {
+		return nil
+	}
+	var out []string
+	for _, rule := range list(dig(o, "rules")) {
+		if !slices.Contains(list(dig(rule, "resources")), any("secrets")) {
+			continue
+		}
+		writes := false
+		for _, v := range list(dig(rule, "verbs")) {
+			if s, _ := v.(string); writeVerbs[s] {
+				writes = true
+			}
+		}
+		if !writes {
+			continue
+		}
+		for _, n := range list(dig(rule, "resourceNames")) {
+			if s, _ := n.(string); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 func addSecret(acc map[string]SecretRef, created map[string]bool, name, key string, optional bool, by string) {

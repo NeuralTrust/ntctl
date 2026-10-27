@@ -391,7 +391,12 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			return a, err
 		}
 	}
-	if o.products == "" && !set("global", "products") && in.Interactive {
+	// External and saas installs run every product: there is nothing to
+	// choose, and naming some would turn the others off.
+	if mode != "hybrid" && o.products != "" {
+		return a, fmt.Errorf("--products applies to hybrid installs; %s installs run every product", mode)
+	}
+	if mode == "hybrid" && o.products == "" && !set("global", "products") && in.Interactive {
 		for {
 			if o.products, err = in.Text("Products, comma-separated", strings.Join(values.Products, ",")); err != nil {
 				return a, err
