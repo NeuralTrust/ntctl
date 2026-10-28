@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/secrets"
+	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
 // Secret names and keys for a PostgreSQL and Redis the chart does not run.
@@ -163,8 +164,9 @@ func (a Answers) Secrets(ns string) ([]*corev1.Secret, error) {
 	return out, nil
 }
 
-// Summary describes the answers without any credential.
-func (a Answers) Summary() []string {
+// Summary describes the answers without any credential. vals are the
+// effective values, which describe a datastore the answers leave alone.
+func (a Answers) Summary(vals map[string]any) []string {
 	var out []string
 	switch {
 	case a.Images.Registry == "":
@@ -179,7 +181,7 @@ func (a Answers) Summary() []string {
 	if pg := a.Postgres; pg != nil {
 		out = append(out, fmt.Sprintf("PostgreSQL: %s@%s:%d/%s (sslmode=%s)", pg.User, pg.Host, pg.Port, pg.Database, pg.SSLMode))
 	} else {
-		out = append(out, "PostgreSQL: in the cluster")
+		out = append(out, "PostgreSQL: "+fromValues(vals, "postgresql"))
 	}
 	if r := a.Redis; r != nil {
 		tls := ""
@@ -188,7 +190,7 @@ func (a Answers) Summary() []string {
 		}
 		out = append(out, fmt.Sprintf("Redis:      %s:%d%s", r.Host, r.Port, tls))
 	} else {
-		out = append(out, "Redis:      in the cluster")
+		out = append(out, "Redis:      "+fromValues(vals, "redis"))
 	}
 	switch ad := a.Admin; {
 	case ad == nil:
@@ -278,4 +280,27 @@ func RegistryServer(addr string) string {
 	addr = strings.TrimPrefix(strings.TrimPrefix(addr, "https://"), "http://")
 	host, _, _ := strings.Cut(addr, "/")
 	return host
+}
+
+// fromValues describes global.<name> (postgresql or redis): in the cluster,
+// unless the values point it at one of their own.
+func fromValues(vals map[string]any, name string) string {
+	host, _ := values.Get(vals, "global", name, "host").(string)
+	if host == "" && fmt.Sprint(values.Get(vals, "global", name, "deploy")) != "false" {
+		return "in the cluster"
+	}
+	if host == "" {
+		host = "your own"
+	}
+	var how []string
+	if strings.EqualFold(fmt.Sprint(values.Get(vals, "global", name, "authMode")), "iam") {
+		how = append(how, "IAM")
+	}
+	if values.Get(vals, "global", name, "cluster") == true {
+		how = append(how, "cluster")
+	}
+	if len(how) > 0 {
+		host += " (" + strings.Join(how, ", ") + ")"
+	}
+	return host + ", from your values"
 }

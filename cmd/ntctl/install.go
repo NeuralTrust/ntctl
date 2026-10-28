@@ -216,7 +216,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if cp, _ := values.DialedControlPlane(p.values); cp != "" && values.DeploymentMode(p.values) == "hybrid" {
 		fmt.Fprintf(out, "  Connects:   control plane at %s\n", cp)
 	}
-	for _, line := range answers.Summary() {
+	for _, line := range answers.Summary(p.values) {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
 	consoles.describe(out)
@@ -469,7 +469,10 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		if !set("global", "postgresql") || !set("global", "redis") {
 			fmt.Fprintf(out, "  Mode %s: PostgreSQL and Redis run in the cluster unless your -f values configure them (see values-managed-datastores.yaml.example in the chart).\n", mode)
 		}
-		if !set("global", "superadmin", "existingSecret", "name") && !set("global", "superadmin", "email") {
+		// A values file naming ntctl's own admin Secret, as a saved one does,
+		// still gets it: kept when it exists, asked for when it does not.
+		adminSecret := values.Get(files, "global", "superadmin", "existingSecret", "name")
+		if (adminSecret == nil || adminSecret == setup.AdminSecret) && !set("global", "superadmin", "email") {
 			if a.Admin, err = askAdmin(ctx, in, out, cs, o.kube.Namespace, f); err != nil {
 				return a, err
 			}

@@ -144,3 +144,28 @@ func TestNodeIdentityHasNoPullSecret(t *testing.T) {
 		t.Errorf("node identity created Secrets: %v", s)
 	}
 }
+
+func TestSummaryDescribesDatastoresFromValues(t *testing.T) {
+	global := func(g map[string]any) map[string]any { return map[string]any{"global": g} }
+	cases := []struct {
+		name      string
+		vals      map[string]any
+		pg, redis string
+	}{
+		{"chart runs both", map[string]any{}, "PostgreSQL: in the cluster", "Redis:      in the cluster"},
+		{"own, with passwords", global(map[string]any{
+			"postgresql": map[string]any{"deploy": false, "host": "db.example.com"},
+			"redis":      map[string]any{"deploy": false, "host": "cache.example.com"},
+		}), "PostgreSQL: db.example.com, from your values", "Redis:      cache.example.com, from your values"},
+		{"own, with IAM", global(map[string]any{
+			"postgresql": map[string]any{"deploy": false, "host": "10.0.0.2", "authMode": "iam"},
+			"redis":      map[string]any{"deploy": false, "host": "10.0.0.3", "authMode": "iam", "cluster": true},
+		}), "PostgreSQL: 10.0.0.2 (IAM), from your values", "Redis:      10.0.0.3 (IAM, cluster), from your values"},
+	}
+	for _, c := range cases {
+		got := strings.Join(Answers{}.Summary(c.vals), "\n")
+		if !strings.Contains(got, c.pg) || !strings.Contains(got, c.redis) {
+			t.Errorf("%s:\n%s", c.name, got)
+		}
+	}
+}

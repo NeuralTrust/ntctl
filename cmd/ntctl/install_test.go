@@ -342,6 +342,15 @@ func TestAskAdmin(t *testing.T) {
 	if a, err = ask1(noTerminal(), &out, fake.NewClientset(), external(), installFlags{}, own); err != nil || a.Admin != nil {
 		t.Errorf("values with their own admin: %+v, %v", a.Admin, err)
 	}
+	// Values naming ntctl's own Secret, as a saved values file does: still
+	// created, here from the environment.
+	saved := values.Merge(adminFiles(), map[string]any{"global": map[string]any{"superadmin": map[string]any{"existingSecret": map[string]any{"name": setup.AdminSecret}}}})
+	t.Setenv("ONPREM_SUPERADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ONPREM_SUPERADMIN_PASSWORD", "correct-horse-battery")
+	if a, err = ask1(noTerminal(), &out, fake.NewClientset(), external(), installFlags{}, saved); err != nil || a.Admin == nil || a.Admin.Existing || a.Admin.Email != "admin@example.com" {
+		t.Errorf("values naming %s: %+v, %v", setup.AdminSecret, a.Admin, err)
+	}
+	t.Setenv("ONPREM_SUPERADMIN_PASSWORD", "")
 	// Print mode: no password asked.
 	t.Setenv("ONPREM_SUPERADMIN_EMAIL", "admin@example.com")
 	if a, err = ask1(noTerminal(), &out, fake.NewClientset(), external(), installFlags{secretsMode: "print"}, files); err != nil || a.Admin == nil || a.Admin.Password != "" {
