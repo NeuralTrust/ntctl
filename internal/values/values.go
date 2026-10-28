@@ -208,6 +208,21 @@ func DeploymentMode(vals map[string]any) string {
 	return "hybrid"
 }
 
+// ConsoleHost returns the host the chart serves the control-plane app on, as
+// its ingress helper picks it: the component's host, else <hostPrefix>.<domain>.
+func ConsoleHost(vals map[string]any) string {
+	app := []string{"control-plane-app", "controlPlane", "components", "app"}
+	if h, _ := Get(vals, append(app, "host")...).(string); h != "" {
+		return h
+	}
+	prefix, _ := Get(vals, append(app, "hostPrefix")...).(string)
+	if prefix == "" {
+		prefix = "app"
+	}
+	domain, _ := Get(vals, "global", "domain").(string)
+	return prefix + "." + domain
+}
+
 // InlineAdminPassword reports whether the values set the console admin's
 // password directly (global.superadmin.password) instead of through a Secret.
 func InlineAdminPassword(vals map[string]any) bool {

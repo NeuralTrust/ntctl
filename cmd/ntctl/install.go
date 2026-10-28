@@ -291,7 +291,7 @@ func installedMessage(vals map[string]any) string {
 		return "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console."
 	}
 	domain, _ := values.Get(vals, "global", "domain").(string)
-	msg := fmt.Sprintf("Installed. Create the DNS records above, then sign in to this install's console at https://app.%s.", domain)
+	msg := fmt.Sprintf("Installed. Create the DNS records above, then sign in to this install's console at https://%s.", values.ConsoleHost(vals))
 	if values.DeploymentMode(vals) == "saas" {
 		cp, _ := values.Get(vals, "global", "controlPlane", "domain").(string)
 		if cp == "" {
