@@ -749,6 +749,6 @@ func printSecrets(ctx context.Context, out io.Writer, cs kubernetes.Interface, n
 		}
 		fmt.Fprint(out, secrets.Commands(missing, keyFile))
 	}
-	fmt.Fprintf(out, "\nThen install with:\n  ntctl install -n %s -f %s\n", ns, file)
+	fmt.Fprintf(out, "\nThen install with:\n  ntctl install --namespace %s -f %s\n", ns, file)
 	return nil
 }

@@ -115,11 +115,11 @@ func releaseCheck(in Input) preflight.Result {
 	case rcommon.StatusPendingInstall:
 		r.Severity = preflight.Fail
 		r.Message += " (an install was interrupted, or is still running)"
-		r.Fix = "If no install is running, remove the release with `ntctl uninstall -n " + in.Namespace + "`, then install again."
+		r.Fix = "If no install is running, remove the release with `ntctl uninstall --namespace " + in.Namespace + "`, then install again."
 	case rcommon.StatusPendingUpgrade, rcommon.StatusPendingRollback:
 		r.Severity = preflight.Fail
 		r.Message += " (a change was interrupted, or is still running)"
-		r.Fix = "If no upgrade or rollback is running, return to the last working revision with `ntctl rollback -n " + in.Namespace + "`, then upgrade again."
+		r.Fix = "If no upgrade or rollback is running, return to the last working revision with `ntctl rollback --namespace " + in.Namespace + "`, then upgrade again."
 	default:
 		r.Severity = preflight.Warn
 	}
