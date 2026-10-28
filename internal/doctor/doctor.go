@@ -145,6 +145,7 @@ func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 	rs, err := preflight.Run(ctx, preflight.Input{
 		Mode: preflight.ForUpgrade, Release: in.Release, Namespace: in.Namespace, ReleaseExists: true,
 		Cluster: in.Cluster, Needs: manifest.Analyse(objs), Platform: platform, NamespaceLabels: nsLabels,
+		InlineAdminPassword: values.InlineAdminPassword(in.Current.Config),
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, in.Clientset, in.Namespace, name)
 		},

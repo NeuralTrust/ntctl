@@ -447,7 +447,7 @@ and a fix for each finding:
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
 | `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
-| `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP |
+| `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP, and `NT-PF-011` about a console admin password set in the values, which Helm keeps in the release history |
 
 If you need help, send NeuralTrust support a bundle:
 

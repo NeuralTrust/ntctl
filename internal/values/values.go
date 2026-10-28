@@ -208,6 +208,13 @@ func DeploymentMode(vals map[string]any) string {
 	return "hybrid"
 }
 
+// InlineAdminPassword reports whether the values set the console admin's
+// password directly (global.superadmin.password) instead of through a Secret.
+func InlineAdminPassword(vals map[string]any) bool {
+	v := Get(vals, "global", "superadmin", "password")
+	return v != nil && fmt.Sprint(v) != ""
+}
+
 // Installed lists the products the chart deploys for these values, by the
 // chart's own rule: in hybrid a product is on only when its flag is true; in
 // external and saas it is on unless its flag is false.

@@ -269,6 +269,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 		Cluster: cluster, Needs: manifest.Analyse(objs), Platform: platform, WillCreate: willCreate,
 		IngressProvider: provider, NamespaceLabels: nsLabels, IgnoreCapacity: o.ignoreCapacity,
 		DeploymentMode: values.DeploymentMode(renderVals), Resolve: net.DefaultResolver.LookupHost,
+		InlineAdminPassword: values.InlineAdminPassword(renderVals),
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, cs, o.kube.Namespace, name)
 		},
