@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -426,5 +427,29 @@ func TestAskProductsOnlyForHybrid(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Products, comma-separated") {
 		t.Errorf("hybrid still asks for its products:\n%s", out.String())
+	}
+}
+
+// The command print mode ends with is run as printed, so install must accept it.
+func TestPrintSecretsFollowUpParses(t *testing.T) {
+	var out bytes.Buffer
+	file := filepath.Join(t.TempDir(), "values.yaml")
+	if err := printSecrets(context.Background(), &out, fake.NewClientset(), "team-a", nil, "", file, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	_, cmd, ok := strings.Cut(out.String(), "Then install with:\n")
+	if !ok {
+		t.Fatalf("no follow-up command:\n%s", out.String())
+	}
+	args := strings.Fields(cmd)
+	if len(args) < 2 || args[0] != "ntctl" || args[1] != "install" {
+		t.Fatalf("follow-up is not an install: %q", cmd)
+	}
+	var o opts
+	if err := parse(newFlags("install", installSummary, &out, &o, true), args[2:]); err != nil {
+		t.Fatalf("%q does not parse: %v", cmd, err)
+	}
+	if o.kube.Namespace != "team-a" || len(o.valueFiles) != 1 || o.valueFiles[0] != file {
+		t.Errorf("parsed namespace %q and values %v from %q", o.kube.Namespace, o.valueFiles, cmd)
 	}
 }

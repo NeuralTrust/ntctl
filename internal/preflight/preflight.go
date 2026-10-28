@@ -83,6 +83,9 @@ type Input struct {
 	// Resolve looks a host name up from where ntctl runs; nil skips the
 	// control-plane check.
 	Resolve func(ctx context.Context, host string) ([]string, error)
+	// InlineAdminPassword is set when the values carry
+	// global.superadmin.password, which Helm keeps in every revision.
+	InlineAdminPassword bool
 }
 
 // Run executes every check.
@@ -105,7 +108,28 @@ func Run(ctx context.Context, in Input) ([]Result, error) {
 	if r, ok := controlPlane(ctx, in); ok {
 		rs = append(rs, r)
 	}
+	if r, ok := adminPassword(in); ok {
+		rs = append(rs, r)
+	}
 	return rs, nil
+}
+
+// adminPassword warns when the values carry the console admin's password:
+// Helm stores the values of every revision in the release history, where
+// anyone who can read Secrets in the namespace can read it.
+func adminPassword(in Input) (Result, bool) {
+	if !in.InlineAdminPassword {
+		return Result{}, false
+	}
+	r := Result{Code: "NT-PF-011", Check: "admin", Severity: Warn,
+		Message: "global.superadmin.password is set in the values, so Helm keeps it in plain text in every revision of the release"}
+	if in.Mode == ForInstall {
+		r.Fix = "Remove global.superadmin.email and password from your values and set ONPREM_SUPERADMIN_EMAIL and ONPREM_SUPERADMIN_PASSWORD instead: `ntctl install` keeps them in the Secret onprem-superadmin."
+		return r, true
+	}
+	r.Fix = "Create a Secret with the keys ONPREM_SUPERADMIN_EMAIL and ONPREM_SUPERADMIN_PASSWORD, set global.superadmin.existingSecret.name to it, and set global.superadmin.email and password to \"\" (an upgrade otherwise keeps the release's earlier values). " +
+		"Then change the password: earlier revisions keep the old one until they leave the release history."
+	return r, true
 }
 
 // vpnRange holds the shared address space (RFC 6598) that VPN clients such as

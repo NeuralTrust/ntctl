@@ -217,6 +217,23 @@ func TestExposure(t *testing.T) {
 	}
 }
 
+func TestAdminPassword(t *testing.T) {
+	if r, ok := adminPassword(Input{Mode: ForInstall}); ok {
+		t.Errorf("no inline password: should not apply, got %+v", r)
+	}
+	for _, mode := range []Mode{ForInstall, ForUpgrade} {
+		r, ok := adminPassword(Input{Mode: mode, InlineAdminPassword: true})
+		if !ok || r.Severity != Warn || r.Code != "NT-PF-011" || r.Fix == "" {
+			t.Errorf("%s: %+v", mode, r)
+		}
+		// An upgrade merges over the release's values, so dropping the key
+		// from a file keeps the old password; the fix must say to blank it.
+		if blanks := strings.Contains(r.Fix, `to ""`); blanks != (mode == ForUpgrade) {
+			t.Errorf("%s: fix %q", mode, r.Fix)
+		}
+	}
+}
+
 func TestControlPlane(t *testing.T) {
 	answers := map[string][]string{
 		"agentgateway-configsync.cp.example.com":  {"203.0.113.10"},

@@ -225,7 +225,7 @@ func TestE2EInstallPrintsTheSecrets(t *testing.T) {
 		"--from-literal=REDIS_PASSWORD='<REDIS_PASSWORD>'",
 		"create secret generic " + values.TrustGateConfigSync,
 		"create secret generic " + values.TrustGuardEnrolment,
-		"ntctl install -n " + ns + " -f " + saved,
+		"ntctl install --namespace " + ns + " -f " + saved,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)

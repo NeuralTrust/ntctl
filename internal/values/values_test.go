@@ -184,3 +184,28 @@ func TestNoTokenRefsOutsideHybrid(t *testing.T) {
 		}
 	}
 }
+
+func TestInlineAdminPassword(t *testing.T) {
+	sa := func(v map[string]any) map[string]any {
+		return map[string]any{"global": map[string]any{"superadmin": v}}
+	}
+	cases := []struct {
+		name string
+		vals map[string]any
+		want bool
+	}{
+		{"unset", map[string]any{}, false},
+		{"empty", sa(map[string]any{"email": "admin@example.com", "password": ""}), false},
+		{"existing Secret only", sa(map[string]any{"existingSecret": map[string]any{"name": "onprem-superadmin"}}), false},
+		{"inline", sa(map[string]any{"email": "admin@example.com", "password": "s3cret"}), true},
+		// The chart ignores it next to an existing Secret, but Helm still
+		// stores it with the release.
+		{"inline beside an existing Secret", sa(map[string]any{"password": "s3cret", "existingSecret": map[string]any{"name": "mine"}}), true},
+		{"not a string", sa(map[string]any{"password": 1234}), true},
+	}
+	for _, c := range cases {
+		if got := InlineAdminPassword(c.vals); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}

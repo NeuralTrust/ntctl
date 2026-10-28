@@ -115,11 +115,11 @@ func releaseCheck(in Input) preflight.Result {
 	case rcommon.StatusPendingInstall:
 		r.Severity = preflight.Fail
 		r.Message += " (an install was interrupted, or is still running)"
-		r.Fix = "If no install is running, remove the release with `ntctl uninstall -n " + in.Namespace + "`, then install again."
+		r.Fix = "If no install is running, remove the release with `ntctl uninstall --namespace " + in.Namespace + "`, then install again."
 	case rcommon.StatusPendingUpgrade, rcommon.StatusPendingRollback:
 		r.Severity = preflight.Fail
 		r.Message += " (a change was interrupted, or is still running)"
-		r.Fix = "If no upgrade or rollback is running, return to the last working revision with `ntctl rollback -n " + in.Namespace + "`, then upgrade again."
+		r.Fix = "If no upgrade or rollback is running, return to the last working revision with `ntctl rollback --namespace " + in.Namespace + "`, then upgrade again."
 	default:
 		r.Severity = preflight.Warn
 	}
@@ -145,6 +145,7 @@ func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 	rs, err := preflight.Run(ctx, preflight.Input{
 		Mode: preflight.ForUpgrade, Release: in.Release, Namespace: in.Namespace, ReleaseExists: true,
 		Cluster: in.Cluster, Needs: manifest.Analyse(objs), Platform: platform, NamespaceLabels: nsLabels,
+		InlineAdminPassword: values.InlineAdminPassword(in.Current.Config),
 		Secrets: func(ctx context.Context, name string) ([]string, bool, error) {
 			return secrets.Keys(ctx, in.Clientset, in.Namespace, name)
 		},
