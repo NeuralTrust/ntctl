@@ -527,6 +527,43 @@ func secrets(ctx context.Context, in Input) ([]Result, error) {
 	return []Result{r}, nil
 }
 
+// unfit returns the largest pod that fits no single node, CPU and memory
+// together.
+func unfit(pods []manifest.Pod, nodes []detect.Usage) (manifest.Pod, bool) {
+	var worst manifest.Pod
+	found := false
+	for _, pod := range pods {
+		fits := slices.ContainsFunc(nodes, func(n detect.Usage) bool {
+			return pod.CPUMilli <= n.CPUMilli && pod.Memory <= n.Memory
+		})
+		if !fits && (!found || pod.Memory > worst.Memory || pod.Memory == worst.Memory && pod.CPUMilli > worst.CPUMilli) {
+			worst, found = pod, true
+		}
+	}
+	return worst, found
+}
+
+// nodeShapes lists the distinct node sizes, largest first, at most three.
+func nodeShapes(nodes []detect.Usage) string {
+	sorted := slices.Clone(nodes)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Memory != sorted[j].Memory {
+			return sorted[i].Memory > sorted[j].Memory
+		}
+		return sorted[i].CPUMilli > sorted[j].CPUMilli
+	})
+	sorted = slices.Compact(sorted)
+	var parts []string
+	for i, n := range sorted {
+		if i == 3 {
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%.1f vCPU / %.1f GiB", cores(n.CPUMilli), gib(n.Memory)))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // capacityWarn is the share of free capacity above which requests are too
 // tight to absorb a rolling upgrade's extra pod (as in the chart's sizing guide).
 const capacityWarn = 0.85
@@ -559,11 +596,12 @@ func capacity(in Input) Result {
 		nodes      []string
 		label      string
 		need, room detect.Usage
-		maxPod     detect.Usage
-		// bigFree is the most room free on one node now; bigAlloc the most
-		// one node has in total, which bounds any pod whatever else runs.
-		bigFree  detect.Usage
-		bigAlloc detect.Usage
+		pods       []manifest.Pod
+		// free is each node's room now; alloc what each has in total, which
+		// bounds any pod whatever else runs. A pod must fit one node's CPU
+		// and memory together, so these stay per node.
+		free  []detect.Usage
+		alloc []detect.Usage
 	}
 	pools := map[string]*pool{}
 	var order []string
@@ -590,13 +628,11 @@ func capacity(in Input) Result {
 				f := free[name]
 				p.room.CPUMilli += f.CPUMilli
 				p.room.Memory += f.Memory
-				p.bigFree.CPUMilli = max(p.bigFree.CPUMilli, f.CPUMilli)
-				p.bigFree.Memory = max(p.bigFree.Memory, f.Memory)
+				p.free = append(p.free, f)
 			}
 			for _, n := range in.Cluster.NodeList {
 				if slices.Contains(nodes, n.Name) {
-					p.bigAlloc.CPUMilli = max(p.bigAlloc.CPUMilli, n.CPUMilli)
-					p.bigAlloc.Memory = max(p.bigAlloc.Memory, n.Memory)
+					p.alloc = append(p.alloc, detect.Usage{CPUMilli: n.CPUMilli, Memory: n.Memory})
 				}
 			}
 			pools[key] = p
@@ -606,8 +642,7 @@ func capacity(in Input) Result {
 		}
 		p.need.CPUMilli += g.CPUMilli
 		p.need.Memory += g.Memory
-		p.maxPod.CPUMilli = max(p.maxPod.CPUMilli, g.MaxPodCPUMilli)
-		p.maxPod.Memory = max(p.maxPod.Memory, g.MaxPodMemory)
+		p.pods = append(p.pods, g.Pods...)
 	}
 
 	worst, binding := 0.0, ""
@@ -624,20 +659,18 @@ func capacity(in Input) Result {
 			worst, binding = mem, fmt.Sprintf("memory for %s needs %.0f%% of the %.1f GiB free on its %s", p.label, mem*100, gib(p.room.Memory), plural(len(p.nodes), "node"))
 		}
 		// Larger than any node in total: no node, however empty, can take it.
-		if p.maxPod.CPUMilli > p.bigAlloc.CPUMilli || p.maxPod.Memory > p.bigAlloc.Memory {
+		if pod, ok := unfit(p.pods, p.alloc); ok {
 			r.Severity = Fail
-			r.Message = fmt.Sprintf("the largest pod of %s (%.1f vCPU, %.1f GiB) is bigger than any of its nodes (at most %.1f vCPU, %.1f GiB allocatable)",
-				p.label, cores(p.maxPod.CPUMilli), gib(p.maxPod.Memory), cores(p.bigAlloc.CPUMilli), gib(p.bigAlloc.Memory))
+			r.Message = fmt.Sprintf("a pod of %s (%.1f vCPU, %.1f GiB) is bigger than any of its nodes (allocatable: %s)",
+				pod.Workload, cores(pod.CPUMilli), gib(pod.Memory), nodeShapes(p.alloc))
 			r.Fix = "Use larger nodes for this pool, or lower that workload's requests in your values."
 			return r
 		}
 		// Larger than any node's free room now: a shortfall like any other.
-		if p.maxPod.CPUMilli > p.bigFree.CPUMilli || p.maxPod.Memory > p.bigFree.Memory {
-			if worst <= 1 {
-				worst = 1.01
-				binding = fmt.Sprintf("the largest pod of %s (%.1f vCPU, %.1f GiB) fits no node's free room (at most %.1f vCPU, %.1f GiB)",
-					p.label, cores(p.maxPod.CPUMilli), gib(p.maxPod.Memory), cores(p.bigFree.CPUMilli), gib(p.bigFree.Memory))
-			}
+		if pod, ok := unfit(p.pods, p.free); ok && worst <= 1 {
+			worst = 1.01
+			binding = fmt.Sprintf("a pod of %s (%.1f vCPU, %.1f GiB) fits no node's free room (free: %s)",
+				pod.Workload, cores(pod.CPUMilli), gib(pod.Memory), nodeShapes(p.free))
 		}
 	}
 

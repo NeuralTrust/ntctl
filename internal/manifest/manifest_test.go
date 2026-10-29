@@ -179,10 +179,13 @@ spec:
 		t.Fatalf("groups = %+v, want general and GPU", n.Groups)
 	}
 	g, w := n.Groups[0], n.Groups[1]
-	if g.CPUMilli != 1000 || g.MaxPodCPUMilli != 500 || len(g.Workloads) != 1 {
+	if g.CPUMilli != 1000 || len(g.Pods) != 1 || g.Pods[0].CPUMilli != 500 || len(g.Workloads) != 1 {
 		t.Errorf("general group = %+v", g)
 	}
-	if w.CPUMilli != 3000 || w.Memory != 6<<30 || w.MaxPodCPUMilli != 2000 || w.MaxPodMemory != 4<<30 || len(w.Workloads) != 2 {
+	// Each pod keeps its own CPU and memory: the largest CPU and the largest
+	// memory come from different workers, and no pod needs both.
+	if w.CPUMilli != 3000 || w.Memory != 6<<30 || len(w.Workloads) != 2 ||
+		len(w.Pods) != 2 || w.Pods[0] != (Pod{"Deployment/worker", 1000, 4 << 30}) || w.Pods[1] != (Pod{"Deployment/worker2", 2000, 2 << 30}) {
 		t.Errorf("GPU group = %+v", w)
 	}
 	if w.NodeSelector["accelerator"] != "nvidia" || len(w.Tolerations) != 1 || w.Tolerations[0].Key != "nvidia.com/gpu" {

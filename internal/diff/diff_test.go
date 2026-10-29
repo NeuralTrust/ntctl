@@ -139,6 +139,48 @@ func TestRemovingDataKindsBlocks(t *testing.T) {
 	}
 }
 
+func TestRemovingKeptResourcesDoesNotBlock(t *testing.T) {
+	keep := "\n  annotations:\n    helm.sh/resource-policy: keep"
+	cases := map[string]string{
+		"Secret":                "  name: tokens",
+		"StatefulSet":           "  name: db",
+		"PersistentVolumeClaim": "  name: data",
+	}
+	for kind, name := range cases {
+		t.Run(kind, func(t *testing.T) {
+			from := strings.Replace(base, "kind: "+kind+"\nmetadata:\n"+name, "kind: "+kind+"\nmetadata:\n"+name+keep, 1)
+			var to []string
+			for _, doc := range strings.Split(from, "---\n") {
+				if !strings.Contains(doc, "kind: "+kind+"\n") {
+					to = append(to, doc)
+				}
+			}
+			r := Compare(parse(t, from), parse(t, strings.Join(to, "---\n")))
+			if b := r.Blocking(); len(b) != 0 {
+				t.Fatalf("a kept %s should not block: %+v", kind, b)
+			}
+			if len(r.Changes) != 1 || r.Changes[0].Op != Removed || !r.Changes[0].Kept {
+				t.Fatalf("want one removed, kept %s: %+v", kind, r.Changes)
+			}
+			var out bytes.Buffer
+			r.Print(&out, false)
+			if !strings.Contains(out.String(), "kept in the cluster") {
+				t.Fatalf("output should say it is kept:\n%s", out.String())
+			}
+		})
+	}
+}
+
+func TestRemovingKeysFromAKeptSecretStillBlocks(t *testing.T) {
+	// keep only stops Helm deleting the object; a key that leaves a Secret
+	// still rendered is removed by the upgrade's patch.
+	from := strings.Replace(base, "metadata:\n  name: tokens", "metadata:\n  name: tokens\n  annotations:\n    helm.sh/resource-policy: keep", 1)
+	to := strings.Replace(from, "  OTHER: same\n", "", 1)
+	if b := Compare(parse(t, from), parse(t, to)).Blocking(); len(b) != 1 {
+		t.Fatalf("removing a key from a kept Secret should block: %+v", b)
+	}
+}
+
 func TestSecretValuesNeverShown(t *testing.T) {
 	r := compare(t, strings.Replace(base, "TOKEN: CANARY-old", "TOKEN: CANARY-new", 1))
 	if len(r.Changes) != 1 || r.Changes[0].SecretKeys == nil || r.Changes[0].SecretKeys.Changed[0] != "TOKEN" {

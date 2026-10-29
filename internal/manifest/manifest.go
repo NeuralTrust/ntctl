@@ -117,12 +117,19 @@ type PodGroup struct {
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
 	Workloads    []string
-	// CPUMilli and Memory are the group's total requests; MaxPodCPUMilli and
-	// MaxPodMemory those of its largest single pod, which must fit one node.
-	CPUMilli       int64
-	Memory         int64
-	MaxPodCPUMilli int64
-	MaxPodMemory   int64
+	// CPUMilli and Memory are the group's total requests.
+	CPUMilli int64
+	Memory   int64
+	// Pods are each workload's requests for one pod, which must fit a single
+	// node: its CPU and its memory together.
+	Pods []Pod
+}
+
+// Pod is the requests of one pod of a workload.
+type Pod struct {
+	Workload string
+	CPUMilli int64
+	Memory   int64
 }
 
 var workloadKinds = map[string]bool{"Deployment": true, "StatefulSet": true, "DaemonSet": true, "Job": true, "CronJob": true}
@@ -248,8 +255,7 @@ func Analyse(objs []Object) Needs {
 				g.Workloads = append(g.Workloads, by)
 				g.CPUMilli += replicas * podCPU
 				g.Memory += replicas * podMem
-				g.MaxPodCPUMilli = max(g.MaxPodCPUMilli, podCPU)
-				g.MaxPodMemory = max(g.MaxPodMemory, podMem)
+				g.Pods = append(g.Pods, Pod{Workload: by, CPUMilli: podCPU, Memory: podMem})
 			}
 		}
 	}

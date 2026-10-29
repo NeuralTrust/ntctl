@@ -333,8 +333,10 @@ cannot do in place:
 - a new selector on a Deployment, DaemonSet or StatefulSet;
 - a new StatefulSet service name or volume template;
 - a new storage class or access mode on a volume;
-- removing a Secret, a volume or a StatefulSet;
-- removing a key from a Secret.
+- removing a Secret, a volume or a StatefulSet, unless it carries
+  `helm.sh/resource-policy: keep`: Helm leaves those in the cluster, and the
+  diff lists them as kept, no longer managed;
+- removing a key from a Secret, even a kept one.
 
 Pass `--allow-breaking` only when you accept that those resources are deleted
 and recreated. If the upgrade does not become ready, the last working revision

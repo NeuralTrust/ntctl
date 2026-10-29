@@ -57,6 +57,9 @@ type Change struct {
 	// Blocking says why Kubernetes cannot apply the change in place, or why
 	// it loses data. Empty when the change is safe.
 	Blocking []string `json:"blocking,omitempty"`
+	// Kept says a removed resource carries helm.sh/resource-policy: keep, so
+	// Helm leaves it in the cluster, no longer managed by the release.
+	Kept bool `json:"kept,omitempty"`
 	// Secret keys added, removed or with a new value. Values are never kept.
 	SecretKeys *SecretKeys `json:"secretKeys,omitempty"`
 	// Images are the containers whose image changes.
@@ -127,7 +130,10 @@ func Compare(from, to []manifest.Object) Result {
 			c.Op = Added
 		case !inNew:
 			c.Op = Removed
-			if dataKinds[kind] {
+			switch {
+			case kept(oldObj):
+				c.Kept = true
+			case dataKinds[kind]:
 				c.Blocking = append(c.Blocking, fmt.Sprintf("removing a %s deletes what it holds", kind))
 			}
 		default:
@@ -208,6 +214,9 @@ func (r Result) Print(w io.Writer, full bool) {
 			}
 			line += "  " + strings.Join(parts, ", ")
 		}
+		if c.Kept {
+			line += "  (kept in the cluster, no longer managed)"
+		}
 		if len(c.Blocking) > 0 {
 			line += "  BLOCKING"
 		}
@@ -287,6 +296,14 @@ func splitImage(ref string) (repo, tag string) {
 		return ref[:i], ref[i+1:]
 	}
 	return ref, "latest"
+}
+
+// kept reports whether Helm leaves the object in place when the release stops
+// rendering it. Helm's upgrade compares the annotation exactly, so this does
+// too.
+func kept(o manifest.Object) bool {
+	p, _ := dig(map[string]any(o), []string{"metadata", "annotations", "helm.sh/resource-policy"}).(string)
+	return p == "keep"
 }
 
 func key(o manifest.Object) string {

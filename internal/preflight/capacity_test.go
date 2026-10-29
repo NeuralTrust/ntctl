@@ -23,7 +23,8 @@ var (
 )
 
 func general(cpuMilli, mem int64) manifest.PodGroup {
-	return manifest.PodGroup{Workloads: []string{"Deployment/a", "Deployment/b", "Deployment/c"}, CPUMilli: cpuMilli, Memory: mem, MaxPodCPUMilli: 1000, MaxPodMemory: 2 * gi}
+	return manifest.PodGroup{Workloads: []string{"Deployment/a", "Deployment/b", "Deployment/c"}, CPUMilli: cpuMilli, Memory: mem,
+		Pods: []manifest.Pod{{Workload: "Deployment/a", CPUMilli: 1000, Memory: 2 * gi}}}
 }
 
 func capIn(nodes []detect.Node, groups ...manifest.PodGroup) Input {
@@ -65,7 +66,8 @@ func TestCapacityGPUWorkersUseTheGPUPool(t *testing.T) {
 		cnode("gpu1", 4000, 16*gi, map[string]string{"accelerator": "nvidia"}, gpuTaint),
 	}
 	gpu := manifest.PodGroup{NodeSelector: map[string]string{"accelerator": "nvidia"}, Tolerations: []corev1.Toleration{gpuTol},
-		Workloads: []string{"Deployment/w"}, CPUMilli: 3000, Memory: 12 * gi, MaxPodCPUMilli: 1000, MaxPodMemory: 4 * gi}
+		Workloads: []string{"Deployment/w"}, CPUMilli: 3000, Memory: 12 * gi,
+		Pods: []manifest.Pod{{Workload: "Deployment/w", CPUMilli: 1000, Memory: 4 * gi}}}
 	r := capacity(capIn(nodes, general(4000, 10*gi), gpu))
 	if r.Severity != OK {
 		t.Fatalf("got %s: %s", r.Severity, r.Message)
@@ -95,7 +97,7 @@ func TestCapacitySubtractsRunningPods(t *testing.T) {
 func TestCapacityLargestPodMustFitANode(t *testing.T) {
 	nodes := []detect.Node{cnode("w1", 4000, 16*gi, nil), cnode("w2", 4000, 16*gi, nil)}
 	g := general(6000, 20*gi)
-	g.MaxPodMemory = 20 * gi
+	g.Pods[0].Memory = 20 * gi
 	in := capIn(nodes, g)
 	in.IgnoreCapacity = true
 	// Bigger than any node in total: no flag or autoscaler helps.
@@ -105,7 +107,7 @@ func TestCapacityLargestPodMustFitANode(t *testing.T) {
 	// Fits a node's total, but no node has that much free now: a shortfall.
 	nodes[0].Used["other"] = detect.Usage{Memory: 10 * gi}
 	nodes[1].Used["other"] = detect.Usage{Memory: 10 * gi}
-	g.MaxPodMemory = 8 * gi
+	g.Pods[0].Memory = 8 * gi
 	g.Memory = 8 * gi
 	in = capIn(nodes, g)
 	if r := capacity(in); r.Severity != Fail || !strings.Contains(r.Message, "fits no node's free room") {
@@ -114,6 +116,38 @@ func TestCapacityLargestPodMustFitANode(t *testing.T) {
 	in.IgnoreCapacity = true
 	if r := capacity(in); r.Severity != Warn {
 		t.Fatalf("--ignore-capacity should downgrade a free-room shortfall: %s %s", r.Severity, r.Message)
+	}
+}
+
+func TestCapacityPodNeedsCPUAndMemoryOnTheSameNode(t *testing.T) {
+	// One node has the CPU, the other the memory; neither has both. Taking
+	// the largest CPU and the largest memory separately would let it pass.
+	nodes := []detect.Node{cnode("cpu", 8000, 8*gi, nil), cnode("mem", 2000, 32*gi, nil)}
+	g := general(4000, 16*gi)
+	g.Pods = []manifest.Pod{{Workload: "Deployment/firewall", CPUMilli: 4000, Memory: 16 * gi}}
+	in := capIn(nodes, g)
+	in.IgnoreCapacity = true
+	r := capacity(in)
+	if r.Severity != Fail || !strings.Contains(r.Message, "a pod of Deployment/firewall (4.0 vCPU, 16.0 GiB) is bigger than any of its nodes") ||
+		!strings.Contains(r.Message, "2.0 vCPU / 32.0 GiB, 8.0 vCPU / 8.0 GiB") {
+		t.Fatalf("got %s: %s", r.Severity, r.Message)
+	}
+
+	// The same on free room: both nodes are large enough in total, but other
+	// pods leave the CPU free on one and the memory free on the other.
+	nodes = []detect.Node{cnode("a", 8000, 32*gi, nil), cnode("b", 8000, 32*gi, nil)}
+	nodes[0].Used["other"] = detect.Usage{Memory: 24 * gi}
+	nodes[1].Used["other"] = detect.Usage{CPUMilli: 6000}
+	r = capacity(capIn(nodes, g))
+	if r.Severity != Fail || !strings.Contains(r.Message, "fits no node's free room") {
+		t.Fatalf("got %s: %s", r.Severity, r.Message)
+	}
+
+	// Two pods that each fit a different node pass.
+	g.Pods = []manifest.Pod{{Workload: "Deployment/cpu", CPUMilli: 6000, Memory: 4 * gi}, {Workload: "Deployment/mem", CPUMilli: 1000, Memory: 20 * gi}}
+	g.CPUMilli, g.Memory = 7000, 24*gi
+	if r := capacity(capIn([]detect.Node{cnode("cpu", 8000, 8*gi, nil), cnode("mem", 2000, 32*gi, nil)}, g)); r.Severity == Fail {
+		t.Fatalf("each pod fits a node: %s %s", r.Severity, r.Message)
 	}
 }
 

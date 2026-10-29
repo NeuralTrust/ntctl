@@ -80,7 +80,9 @@ Before changing anything it shows the chart's release notes between the two
 versions (--release-notes for every release in full), the image versions that
 change, and every resource that changes, rendered by the cluster in a dry
 run. Changes Kubernetes cannot apply in place (a new selector, a removed
-Secret or volume) stop the upgrade unless --allow-breaking is given. If the
+Secret or volume) stop the upgrade unless --allow-breaking is given; a
+removed resource the chart marks helm.sh/resource-policy: keep stays in the
+cluster and does not stop it. If the
 upgrade does not become ready, it is rolled back.
 
 --products turns products on and leaves the others as they are, so naming one
