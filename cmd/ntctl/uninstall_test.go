@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	release "helm.sh/helm/v4/pkg/release/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -40,5 +41,37 @@ func TestUninstallFindsWhatItKeeps(t *testing.T) {
 	}
 	if left, _ := cs.CoreV1().Secrets("nt").List(ctx, metav1.ListOptions{}); len(left.Items) != 1 || left.Items[0].Name != "someone-elses" {
 		t.Errorf("left = %v; only the operator's own Secret should stay", left.Items)
+	}
+}
+
+func TestUninstallFindsTheKeptCredentials(t *testing.T) {
+	ctx := context.Background()
+	obj := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name, Namespace: "nt"} }
+	generated := obj("platform-secrets")
+	generated.Labels = map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}
+	taken := obj("trustguard-configsync-tls")
+	taken.Annotations = map[string]string{"neuraltrust.ai/secrets-generator": "managed"}
+	external := obj("operator-platform-secrets")
+	external.Annotations = map[string]string{"neuraltrust.ai/secrets-generator": "external"}
+	cs := fake.NewClientset(
+		&corev1.Secret{ObjectMeta: generated}, &corev1.Secret{ObjectMeta: taken}, &corev1.Secret{ObjectMeta: external},
+		&corev1.Secret{ObjectMeta: obj("postgresql-secrets")}, &corev1.Secret{ObjectMeta: obj("clickhouse-secrets")},
+		&corev1.Secret{ObjectMeta: obj("rendered")}, &corev1.Secret{ObjectMeta: obj("onprem-superadmin")},
+	)
+	rel := &release.Release{
+		Manifest: "apiVersion: v1\nkind: Secret\nmetadata:\n  name: postgresql-secrets\n  annotations: {helm.sh/resource-policy: keep}\n" +
+			"---\napiVersion: v1\nkind: Secret\nmetadata: {name: rendered}\n",
+		Hooks: []*release.Hook{
+			{Manifest: "apiVersion: v1\nkind: Secret\nmetadata: {name: clickhouse-secrets}\n"},
+			{Manifest: "apiVersion: v1\nkind: Secret\nmetadata: {name: onprem-superadmin}\n"},
+			{Manifest: "apiVersion: v1\nkind: Secret\nmetadata: {name: already-deleted-hook}\n"},
+		},
+	}
+	kept, err := keptSecrets(ctx, cs, "nt", rel, []string{"onprem-superadmin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(kept, ","); got != "clickhouse-secrets,platform-secrets,postgresql-secrets,trustguard-configsync-tls" {
+		t.Errorf("kept = %s; want the generator's, the kept and the hook-made Secrets, never ntctl's own, a rendered one or an operator's", got)
 	}
 }

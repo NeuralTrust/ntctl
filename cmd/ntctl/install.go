@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +58,14 @@ Credentials are read from the environment, or asked for with input hidden:
   NT_POSTGRES_URL   postgres://user:password@host:5432/database?sslmode=require
   NT_REDIS_URL      redis://:password@host:6379 (rediss:// for TLS)
   NT_REGISTRY_USERNAME / NT_REGISTRY_PASSWORD   for --image-registry
+External and saas installs also ask how the console sends email: none (the
+default, set up later with global.email), Resend, SMTP or Amazon SES. The
+provider's settings go in the values and its credential in the Secret
+email-credentials:
+  NT_EMAIL_PROVIDER  none, resend, smtp or ses     NT_EMAIL_FROM, NT_EMAIL_REPLY_TO
+  NT_RESEND_API_KEY
+  NT_SMTP_HOST  NT_SMTP_PORT (587)  NT_SMTP_SECURE (true)  NT_SMTP_USER  NT_SMTP_PASSWORD
+  NT_SES_REGION  NT_SES_ACCESS_KEY_ID  NT_SES_SECRET_ACCESS_KEY (empty: the pods' IAM role)
 They are written only to Kubernetes Secrets in the install namespace.
 
 Signed in with ntctl login, the TrustGate and TrustGuard tokens come from the
@@ -477,6 +487,11 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 				return a, err
 			}
 		}
+		if !set("global", "email") {
+			if a.Email, err = askEmail(in, f.print()); err != nil {
+				return a, err
+			}
+		}
 		return a, nil
 	}
 	if !set("global", "postgresql") {
@@ -499,6 +514,116 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 		}
 	}
 	return a, nil
+}
+
+// emailProviders are the providers askEmail offers, after none.
+var emailProviders = []string{"resend", "smtp", "ses"}
+
+// askEmail settles how the console of an external or saas install sends
+// email, from NT_EMAIL_* and the provider's own variables, else from the
+// operator. None is the default: the console then sends no email, which
+// can be set up later with global.email. With --secrets-mode print the
+// credential is left to the printed command.
+func askEmail(in *prompt.Prompter, print bool) (*setup.Email, error) {
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("NT_EMAIL_PROVIDER")))
+	if provider == "" {
+		i, err := in.Choose("Email, for invitations and alerts:", []string{"None: set it up later", "Resend", "SMTP", "Amazon SES"}, 0)
+		if err != nil || i == 0 {
+			return nil, err
+		}
+		provider = emailProviders[i-1]
+	}
+	if provider == "none" {
+		return nil, nil
+	}
+	if !slices.Contains(emailProviders, provider) {
+		return nil, fmt.Errorf("NT_EMAIL_PROVIDER must be none, %s, not %q", strings.Join(emailProviders, ", "), provider)
+	}
+	e := &setup.Email{Provider: provider, ReplyTo: os.Getenv("NT_EMAIL_REPLY_TO")}
+	var err error
+	if e.From, err = envOrText(in, "NT_EMAIL_FROM", "Sender address (From)", ""); err != nil {
+		return nil, err
+	}
+	if !strings.Contains(e.From, "@") {
+		return nil, fmt.Errorf("the sender address %q is not an email address", e.From)
+	}
+	credential := func(env, key, question string) (string, error) {
+		if print {
+			return "<" + key + ">", nil
+		}
+		if v := os.Getenv(env); v != "" {
+			return v, nil
+		}
+		return in.Secret(question)
+	}
+	switch provider {
+	case "resend":
+		e.APIKey, err = credential("NT_RESEND_API_KEY", setup.ResendKey, "Resend API key")
+	case "smtp":
+		if e.SMTPHost, err = envOrText(in, "NT_SMTP_HOST", "SMTP server", ""); err != nil {
+			return nil, err
+		}
+		var port string
+		if port, err = envOrText(in, "NT_SMTP_PORT", "SMTP port", "587"); err != nil {
+			return nil, err
+		}
+		if e.SMTPPort, err = strconv.Atoi(port); err != nil {
+			return nil, fmt.Errorf("invalid SMTP port %q", port)
+		}
+		e.SMTPSecure = !strings.EqualFold(os.Getenv("NT_SMTP_SECURE"), "false")
+		if os.Getenv("NT_SMTP_SECURE") == "" {
+			i, err := in.Choose("SMTP connection:", []string{"TLS", "Plain, without TLS"}, 0)
+			if err != nil {
+				return nil, err
+			}
+			e.SMTPSecure = i == 0
+		}
+		if e.SMTPUser = os.Getenv("NT_SMTP_USER"); e.SMTPUser == "" && in.Interactive {
+			login, err := in.YesNo("Does the SMTP server need a login?", true)
+			if err != nil {
+				return nil, err
+			}
+			if login {
+				if e.SMTPUser, err = in.Text("SMTP user", ""); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if e.SMTPUser != "" {
+			e.Password, err = credential("NT_SMTP_PASSWORD", setup.SMTPPasswordKey, "SMTP password")
+		}
+	case "ses":
+		if e.SESRegion, err = envOrText(in, "NT_SES_REGION", "SES region, e.g. eu-west-1", ""); err != nil {
+			return nil, err
+		}
+		keys := os.Getenv("NT_SES_ACCESS_KEY_ID") != ""
+		if !keys && in.Interactive {
+			i, err := in.Choose("SES credentials:", []string{"The pods' IAM role (IRSA or instance profile)", "An access key"}, 0)
+			if err != nil {
+				return nil, err
+			}
+			keys = i == 1
+		}
+		if keys {
+			if e.AccessKeyID, err = credential("NT_SES_ACCESS_KEY_ID", setup.SESKeyIDKey, "SES access key ID"); err != nil {
+				return nil, err
+			}
+			e.SecretAccessKey, err = credential("NT_SES_SECRET_ACCESS_KEY", setup.SESSecretKey, "SES secret access key")
+		}
+	}
+	return e, err
+}
+
+// envOrText returns the variable when set, else asks.
+func envOrText(in *prompt.Prompter, env, question, def string) (string, error) {
+	if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+		return v, nil
+	}
+	v, err := in.Text(question, def)
+	if err != nil {
+		return "", fmt.Errorf("%w; or set %s", err, env)
+	}
+	return strings.TrimSpace(v), nil
 }
 
 // minAdminPassword is the shortest first-admin password install accepts.

@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/NeuralTrust/ntctl/internal/detect"
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
+	"github.com/NeuralTrust/ntctl/internal/generator"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/redact"
@@ -93,6 +96,107 @@ func Run(ctx context.Context, in Input) ([]preflight.Result, error) {
 		}
 	}
 	return out, nil
+}
+
+// missingSecretPattern finds the Secret a container cannot start without, in
+// the kubelet's "secret "x" not found" and "couldn't find key k in Secret
+// ns/x".
+var missingSecretPattern = regexp.MustCompile(`secret "([^"]+)" not found|in Secret [^/\s]+/(\S+)`)
+
+func missingSecret(msg string) string {
+	m := missingSecretPattern.FindStringSubmatch(msg)
+	switch {
+	case m == nil:
+		return ""
+	case m[1] != "":
+		return m[1]
+	}
+	return m[2]
+}
+
+// generatorFix is NT-DR-011's fix when the missing Secret is one the chart's
+// secrets generator writes: the hook did not run, or failed.
+func generatorFix(name string) string {
+	return name + " is created by the chart's secrets generator, a Job that runs as a pre-install and pre-upgrade hook. " +
+		"It did not run: the release was applied with --no-hooks, or by a tool that skips Helm hooks; or it failed (see NT-DR-021). " +
+		"`ntctl upgrade` runs it again. Argo CD and Flux run it when hooks are left on. A tool that cannot run hooks needs the Secret " +
+		"created beforehand: `ntctl secrets create` makes the ones the generator would."
+}
+
+// hooks parses a release's hooks; a hook that does not parse is skipped, as
+// it says nothing about what the release reads.
+func hooks(rel *release.Release) []manifest.Object {
+	if rel == nil {
+		return nil
+	}
+	var out []manifest.Object
+	for _, h := range rel.Hooks {
+		if objs, err := manifest.Parse(h.Manifest); err == nil {
+			out = append(out, objs...)
+		}
+	}
+	return out
+}
+
+// leftovers reports the Secrets an earlier revision or the secrets generator
+// made that nothing in the release reads any more. Upgrades keep them on
+// purpose, so this is information, never a failure, and ntctl deletes none.
+// While the generator's own Secret is still missing, the old ones may be
+// where it copies credentials from, so none is reported.
+func leftovers(ctx context.Context, in Input) (*preflight.Result, error) {
+	if in.Current == nil {
+		return nil, nil
+	}
+	objs, err := manifest.Parse(in.Current.Manifest)
+	if err != nil {
+		return nil, fmt.Errorf("reading the deployed manifest: %w", err)
+	}
+	hk := hooks(in.Current)
+	needed := map[string]bool{}
+	for _, name := range generator.Writes(hk) {
+		needed[name] = true
+	}
+	why := "Nothing needs to change: upgrades keep them on purpose."
+	if t := generator.Target(hk); t != "" {
+		if _, err := in.Clientset.CoreV1().Secrets(in.Namespace).Get(ctx, t, metav1.GetOptions{}); err != nil {
+			return nil, nil
+		}
+		why = "Nothing needs to change: upgrades keep them on purpose, and the secrets generator has copied what it needed from them into " + t + "."
+	}
+	all := append(append([]manifest.Object{}, objs...), hk...)
+	for _, o := range all {
+		if o.Kind() == "Secret" {
+			needed[o.Name()] = true
+		}
+	}
+	for _, r := range manifest.References(all) {
+		needed[r.Name] = true
+	}
+	for _, name := range manifest.PullSecrets(all) {
+		needed[name] = true
+	}
+	list, err := in.Clientset.CoreV1().Secrets(in.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing Secrets: %w", err)
+	}
+	var names []string
+	for i := range list.Items {
+		sec := &list.Items[i]
+		ours := sec.Annotations["meta.helm.sh/release-name"] == in.Current.Name || sec.Labels["app.kubernetes.io/instance"] == in.Current.Name || generator.Owns(sec)
+		if ours && !needed[sec.Name] && sec.Type != "helm.sh/release.v1" {
+			names = append(names, sec.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	sort.Strings(names)
+	return &preflight.Result{
+		Code: "NT-DR-024", Check: "leftovers", Severity: preflight.OK,
+		Message: fmt.Sprintf("%d Secrets from earlier chart versions are no longer read: %s", len(names), strings.Join(names, ", ")),
+		Fix: why + " To remove them: kubectl -n " + in.Namespace + " delete secret " + strings.Join(names, " ") + ". " +
+			"A rollback to a revision that still read one stops until it is restored.",
+	}, nil
 }
 
 // releaseCheck reports the Helm release's own state.
@@ -234,6 +338,7 @@ func currentRevision(ctx context.Context, in Input, pods []corev1.Pod) (current 
 }
 
 func podFindings(ctx context.Context, in Input, pods []corev1.Pod, stale map[string]int) []preflight.Result {
+	gen := generator.Writes(hooks(in.Current))
 	pulls := &pullFailures{}
 	groups := map[string]*group{}
 	var order []string
@@ -257,10 +362,14 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod, stale map[str
 				case "ImagePullBackOff", "ErrImagePull", "InvalidImageName":
 					pulls.add(w, c.Image, reason, c.State.Waiting.Message, p)
 				case "CreateContainerConfigError", "CreateContainerError":
+					fix := "Create the Secret or ConfigMap named above in namespace " + in.Namespace + ", or fix the name in your values; the pod starts on its own once it exists."
+					if name := missingSecret(c.State.Waiting.Message); name != "" && slices.Contains(gen, name) {
+						fix = generatorFix(name)
+					}
 					add(w, preflight.Result{
 						Code: "NT-DR-011", Check: "config", Severity: preflight.Fail,
 						Message: fmt.Sprintf("%s cannot start container %s: %s", w, c.Name, c.State.Waiting.Message),
-						Fix:     "Create the Secret or ConfigMap named above in namespace " + in.Namespace + ", or fix the name in your values; the pod starts on its own once it exists.",
+						Fix:     fix,
 					}, p.Name)
 				case "CrashLoopBackOff":
 					g := add(w, preflight.Result{
@@ -333,6 +442,11 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod, stale map[str
 
 func resourceFindings(ctx context.Context, in Input) ([]preflight.Result, error) {
 	var out []preflight.Result
+	if r, err := leftovers(ctx, in); err != nil {
+		return nil, err
+	} else if r != nil {
+		out = append(out, *r)
+	}
 	pvcs, err := in.Clientset.CoreV1().PersistentVolumeClaims(in.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing volumes: %w", err)

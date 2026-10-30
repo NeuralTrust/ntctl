@@ -16,12 +16,16 @@ import (
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	release "helm.sh/helm/v4/pkg/release/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/api"
 	"github.com/NeuralTrust/ntctl/internal/auth"
 	"github.com/NeuralTrust/ntctl/internal/changelog"
 	"github.com/NeuralTrust/ntctl/internal/chart"
 	"github.com/NeuralTrust/ntctl/internal/diff"
+	"github.com/NeuralTrust/ntctl/internal/generator"
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
@@ -41,6 +45,9 @@ type changeFlags struct {
 	timeout       time.Duration
 	// fullNotes is upgrade's --release-notes: every release's notes whole.
 	fullNotes bool
+	// secretsGenerator is upgrade's --secrets-generator: move an install
+	// whose chart renders its credentials onto the secrets generator.
+	secretsGenerator bool
 }
 
 func (f *changeFlags) register(fs interface {
@@ -85,6 +92,12 @@ removed resource the chart marks helm.sh/resource-policy: keep stays in the
 cluster and does not stop it. If the
 upgrade does not become ready, it is rolled back.
 
+An install whose chart still renders its generated credentials is told when
+the target chart can keep them in platform-secrets instead, created once by
+the chart's secrets generator with their current values, which GitOps tools
+never re-render. --secrets-generator makes that move; ntctl never makes it
+unasked.
+
 --products turns products on and leaves the others as they are, so naming one
 never removes another. To add one on the installed chart:
   ntctl upgrade --products trustguard --version <installed version>
@@ -110,6 +123,7 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs := newFlags("upgrade", upgradeSummary, out, &o, true)
 	f.register(fs, "upgrade")
 	fs.BoolVar(&f.fullNotes, "release-notes", false, "print every release's notes in full, with its commits, instead of only the releases that have notes")
+	fs.BoolVar(&f.secretsGenerator, "secrets-generator", false, "move the install's generated credentials into platform-secrets, which the chart's secrets generator creates once, keeping their values")
 	fs.StringVar(&remove, "remove-products", "", "comma-separated products to turn off; their workloads are deleted")
 	fs.StringVar(&org, "org", "", "signed in: organization ID for the tokens of an added product (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to add (default: create one)")
@@ -145,6 +159,9 @@ func runUpgrade(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		if plan, err = o.planChange(ctx, in, out, rel, remove, sess, org, pick, false, f.dryRun); err != nil {
 			return err
 		}
+	}
+	if f.secretsGenerator {
+		o.extra = values.Merge(orEmpty(o.extra), map[string]any{"global": map[string]any{"secrets": map[string]any{"generator": map[string]any{"enabled": true}}}})
 	}
 	_, err = o.applyChange(ctx, in, out, f, plan)
 	return err
@@ -247,11 +264,14 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 		releaseNotes(ctx, out, from, to, f.fullNotes)
 	}
 
-	planned, err := helm.Plan(ctx, p.cfg, p.chart.Chart, p.values, o.release, o.kube.Namespace, true)
-	if err != nil {
-		return nil, fmt.Errorf("the cluster rejected a dry run of the upgrade: %w", err)
+	if p.planned == nil {
+		pl, err := helm.PlanWithHooks(ctx, p.cfg, p.chart.Chart, p.values, o.release, o.kube.Namespace, true)
+		if err != nil {
+			return nil, fmt.Errorf("the cluster rejected a dry run of the upgrade: %w", err)
+		}
+		p.planned = &pl
 	}
-	res, err := compare(p.current.Manifest, planned)
+	res, err := o.generatorChange(ctx, out, p, f.secretsGenerator)
 	if err != nil {
 		return nil, err
 	}
@@ -337,6 +357,52 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	return vals, nil
 }
 
+// generatorChange compares the deployed manifest with the planned one, and
+// settles the secrets generator. An install whose chart renders its own
+// credentials is told, in one line, that the target chart can move them onto
+// the generator; ntctl never does so unasked. With --secrets-generator, a
+// target chart that does not run the generator for this install is an error,
+// not a silent no-op.
+func (o *opts) generatorChange(ctx context.Context, out io.Writer, p *prepared, enable bool) (diff.Result, error) {
+	res, err := compare(p.current.Manifest, p.planned.Manifest)
+	if err != nil {
+		return res, err
+	}
+	planned := generator.Target(p.objects)
+	var deployedHooks []manifest.Object
+	for _, h := range p.current.Hooks {
+		if objs, err := manifest.Parse(h.Manifest); err == nil {
+			deployedHooks = append(deployedHooks, objs...)
+		}
+	}
+	optedOut := values.Get(reuse(p.current.Config, p.values), "global", "secrets", "generator", "enabled") == false
+	switch {
+	case enable && planned == "":
+		return res, fmt.Errorf("chart %s does not run the secrets generator for this install, so --secrets-generator changes nothing; upgrade to a newer chart, or leave the flag out", p.chart.Version)
+	case generator.Target(deployedHooks) != "":
+	case enable:
+		fmt.Fprintf(out, "\nThe secrets generator creates %s before the upgrade, with the values the install uses now; the Secrets the chart rendered\nthem in stay in the cluster, no longer read.\n", planned)
+	case planned == "" && !optedOut && o.generatorAvailable(ctx, p):
+		fmt.Fprintf(out, "\nThis install's chart renders its generated credentials on every upgrade. Chart %s can keep them instead in\n"+
+			"platform-secrets, created once by its secrets generator with their current values, which GitOps tools never re-render:\n"+
+			"add --secrets-generator to move them.\n", p.chart.Version)
+	}
+	return res, nil
+}
+
+// generatorAvailable reports whether the target chart runs the secrets
+// generator for this install once it is turned on, from a client render: the
+// chart, not ntctl, knows which installs it covers.
+func (o *opts) generatorAvailable(ctx context.Context, p *prepared) bool {
+	on := values.Merge(reuse(p.current.Config, p.values), map[string]any{"global": map[string]any{"secrets": map[string]any{"generator": map[string]any{"enabled": true}}}})
+	rendered, err := helm.Render(ctx, p.chart, on, helm.RenderOptions{Release: o.release, Namespace: o.kube.Namespace, KubeVersion: p.cluster.Version, IsUpgrade: true})
+	if err != nil {
+		return false
+	}
+	objs, err := manifest.Parse(rendered)
+	return err == nil && generator.Target(objs) != ""
+}
+
 // releaseNotes prints the chart's notes between two versions. They help but
 // are not required, so a failure to fetch them is only reported.
 func releaseNotes(ctx context.Context, out io.Writer, from, to string, full bool) {
@@ -415,6 +481,12 @@ func runHistory(_ context.Context, args []string, out io.Writer) error {
 const rollbackSummary = `Roll an install back to an earlier revision: by default the newest one that
 worked, or --to N (see "ntctl history"). It shows what changes and asks before
 applying, and stops on changes Kubernetes cannot make in place unless
+--allow-breaking is given.
+
+A rollback re-applies what the revision ran and runs none of the chart's
+install or upgrade hooks, the secrets generator among them. It therefore also
+stops when that revision reads a Secret no longer in the cluster, such as a
+generator Secret deleted as a leftover, until it is restored or
 --allow-breaking is given.`
 
 func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
@@ -454,6 +526,25 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 	if err != nil {
 		return err
 	}
+	cs, err := o.kube.Clientset()
+	if err != nil {
+		return err
+	}
+	missing, err := unresolved(ctx, cs, o.kube.Namespace, target)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(out, "\nRevision %d reads Secrets that are no longer in the cluster, and a rollback does not run the\n"+
+			"chart's secrets generator to create them, so its pods would start without these credentials:\n", target.Version)
+		for _, m := range missing {
+			fmt.Fprintf(out, "  %s\n", m)
+		}
+		if !f.allowBreaking {
+			fmt.Fprintln(out, "\nStopped: nothing was changed. Restore them from your backup first, or pass --allow-breaking to roll back anyway.")
+			return errPreflight
+		}
+	}
 	if done, err := f.review(out, res); done || err != nil {
 		return err
 	}
@@ -475,6 +566,66 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 	}
 	fmt.Fprintf(out, "\nRolled back: the new revision %d runs what revision %d ran.\n", cur.Version+1, target.Version)
 	return nil
+}
+
+// unresolved lists the Secrets, and keys, the workloads of revision rel read
+// that neither its manifest renders nor the cluster holds. A rollback applies
+// the stored manifest and runs no pre-install or pre-upgrade hook, so nothing
+// recreates them: a Secret the generator wrote and an operator deleted since
+// as a leftover is the case this catches. Optional references count only for
+// the Secret that revision's generator wrote, which the chart reads that way.
+func unresolved(ctx context.Context, cs kubernetes.Interface, ns string, rel *release.Release) ([]string, error) {
+	objs, err := manifest.Parse(rel.Manifest)
+	if err != nil {
+		return nil, fmt.Errorf("reading revision %d: %w", rel.Version, err)
+	}
+	var hooks []manifest.Object
+	for _, h := range rel.Hooks {
+		ho, err := manifest.Parse(h.Manifest)
+		if err != nil {
+			return nil, fmt.Errorf("reading revision %d's hooks: %w", rel.Version, err)
+		}
+		hooks = append(hooks, ho...)
+	}
+	gen := generator.Target(hooks)
+	rendered := map[string]bool{}
+	for _, o := range objs {
+		if o.Kind() == "Secret" {
+			rendered[o.Name()] = true
+		}
+	}
+	live := map[string]*corev1.Secret{}
+	gone := map[string]bool{}
+	var out []string
+	for _, r := range manifest.References(objs) {
+		if rendered[r.Name] || (r.Optional && r.Name != gen) {
+			continue
+		}
+		s, ok := live[r.Name]
+		if !ok {
+			got, err := cs.CoreV1().Secrets(ns).Get(ctx, r.Name, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(err):
+			case err != nil:
+				return nil, fmt.Errorf("reading Secret %s: %w", r.Name, err)
+			default:
+				s = got
+			}
+			live[r.Name] = s
+		}
+		switch {
+		case s == nil:
+			if !gone[r.Name] {
+				gone[r.Name] = true
+				out = append(out, fmt.Sprintf("Secret %s (read by %s)", r.Name, r.By))
+			}
+		case r.Key != "" && !r.Optional:
+			if _, ok := s.Data[r.Key]; !ok {
+				out = append(out, fmt.Sprintf("key %s of Secret %s (read by %s)", r.Key, r.Name, r.By))
+			}
+		}
+	}
+	return out, nil
 }
 
 // rollbackTarget returns revision to, or when to is 0 the newest revision

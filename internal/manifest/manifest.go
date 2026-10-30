@@ -316,6 +316,82 @@ func hookWrites(o Object) []string {
 	return out
 }
 
+// PullSecrets lists the imagePullSecrets the workloads and ServiceAccounts in
+// objs name, once each.
+func PullSecrets(objs []Object) []string {
+	var out []string
+	add := func(ps any) {
+		for _, p := range list(ps) {
+			if name, _ := dig(p, "name").(string); name != "" && !slices.Contains(out, name) {
+				out = append(out, name)
+			}
+		}
+	}
+	for _, o := range objs {
+		switch {
+		case o.Kind() == "ServiceAccount":
+			add(o["imagePullSecrets"])
+		case workloadKinds[o.Kind()]:
+			add(podSpec(o)["imagePullSecrets"])
+		}
+	}
+	return out
+}
+
+// Reference is a workload's use of a Secret, optional ones included.
+type Reference struct {
+	SecretRef
+	Optional bool
+}
+
+// References lists every Secret, and key, the workloads in objs read, once
+// per Secret and key, in the order met: env secretKeyRef, envFrom and secret
+// volumes, projected ones included.
+func References(objs []Object) []Reference {
+	var out []Reference
+	seen := map[string]bool{}
+	add := func(name, key string, optional bool, by string) {
+		if name == "" || seen[name+"/"+key] {
+			return
+		}
+		seen[name+"/"+key] = true
+		out = append(out, Reference{SecretRef: SecretRef{Name: name, Key: key, By: by}, Optional: optional})
+	}
+	for _, o := range objs {
+		if !workloadKinds[o.Kind()] {
+			continue
+		}
+		pod := podSpec(o)
+		by := o.Kind() + "/" + o.Name()
+		for _, v := range list(pod["volumes"]) {
+			name, _ := dig(v, "secret", "secretName").(string)
+			optional, _ := dig(v, "secret", "optional").(bool)
+			add(name, "", optional, by)
+			for _, p := range list(dig(v, "projected", "sources")) {
+				name, _ := dig(p, "secret", "name").(string)
+				optional, _ := dig(p, "secret", "optional").(bool)
+				add(name, "", optional, by)
+			}
+		}
+		for _, field := range []string{"initContainers", "containers"} {
+			for _, c := range list(pod[field]) {
+				for _, e := range list(dig(c, "env")) {
+					name, _ := dig(e, "valueFrom", "secretKeyRef", "name").(string)
+					key, _ := dig(e, "valueFrom", "secretKeyRef", "key").(string)
+					optional, _ := dig(e, "valueFrom", "secretKeyRef", "optional").(bool)
+					add(name, key, optional, by)
+				}
+				for _, e := range list(dig(c, "envFrom")) {
+					name, _ := dig(e, "secretRef", "name").(string)
+					optional, _ := dig(e, "secretRef", "optional").(bool)
+					add(name, "", optional, by)
+				}
+			}
+		}
+	}
+	return out
+}
+
 func addSecret(acc map[string]SecretRef, created map[string]bool, name, key string, optional bool, by string) {
 	if name == "" || optional || created[name] {
 		return

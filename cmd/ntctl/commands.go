@@ -204,6 +204,10 @@ type prepared struct {
 	// install, only the changes for an upgrade.
 	values  map[string]any
 	results []preflight.Result
+	// planned is the upgrade's server-side dry run, when the cluster allowed
+	// one; objects are what the checks ran against, hooks included.
+	planned *helm.Planned
+	objects []manifest.Object
 }
 
 // prepare reads the cluster, builds the values, renders the chart and runs the
@@ -248,10 +252,23 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	if willCreate == nil && mode == preflight.ForInstall {
 		willCreate = managedSecrets(renderVals)
 	}
-	rendered, err := helm.Render(ctx, ch, renderVals, helm.RenderOptions{
+	// An upgrade is checked against what the cluster renders in a dry run:
+	// templates that look up live objects (the secrets generator's auto
+	// mode, reused Secret values) then resolve as the upgrade will. A
+	// client-only render is the fallback when the dry run is refused, and
+	// the upgrade itself reports why.
+	var planned *helm.Planned
+	if mode == preflight.ForUpgrade {
+		if pl, err := helm.PlanWithHooks(ctx, cfg, ch.Chart, vals, o.release, o.kube.Namespace, true); err == nil {
+			planned = &pl
+		}
+	}
+	rendered := ""
+	if planned != nil {
+		rendered = planned.Rendered
+	} else if rendered, err = helm.Render(ctx, ch, renderVals, helm.RenderOptions{
 		Release: o.release, Namespace: o.kube.Namespace, KubeVersion: cluster.Version, IsUpgrade: mode == preflight.ForUpgrade,
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("the chart does not render with these values: %w", err)
 	}
 	objs, err := manifest.Parse(rendered)
@@ -277,7 +294,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	if err != nil {
 		return nil, err
 	}
-	return &prepared{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results}, nil
+	return &prepared{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results, planned: planned, objects: objs}, nil
 }
 
 // clients returns the typed and dynamic clients for the selected context.

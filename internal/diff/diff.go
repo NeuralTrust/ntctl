@@ -91,6 +91,10 @@ type SecretKeys struct {
 	Added   []string `json:"added,omitempty"`
 	Removed []string `json:"removed,omitempty"`
 	Changed []string `json:"changed,omitempty"`
+	// Unread are the removed keys no workload of the target release reads,
+	// and Empty those that held an empty value: dropping either is safe.
+	Unread []string `json:"unread,omitempty"`
+	Empty  []string `json:"empty,omitempty"`
 }
 
 // Result is every change between two manifests.
@@ -116,6 +120,7 @@ func (r Result) Empty() bool { return len(r.Changes) == 0 }
 // other.
 func Compare(from, to []manifest.Object) Result {
 	a, b := index(from), index(to)
+	reads := readers(to)
 	var res Result
 	for _, k := range sortedKeys(a, b) {
 		oldObj, inOld := a[k]
@@ -148,8 +153,21 @@ func Compare(from, to []manifest.Object) Result {
 			c.Op = Changed
 			c.SecretKeys = keys
 			c.Images = images(oldObj, newObj)
-			if keys != nil && len(keys.Removed) > 0 {
-				c.Blocking = append(c.Blocking, "removes Secret keys "+strings.Join(keys.Removed, ", ")+" that workloads may read")
+			// A key the target release no longer reads is safe to drop: the
+			// chart moved it elsewhere or stopped needing it. So is an empty
+			// one: an optional reference then leaves the variable unset
+			// instead of empty, which no service tells apart.
+			if keys != nil {
+				old := secretValues(oldObj)
+				for _, k := range keys.Removed {
+					if old[k] == emptyHash {
+						keys.Empty = append(keys.Empty, k)
+					} else if by := reads(name, k); by != "" {
+						c.Blocking = append(c.Blocking, fmt.Sprintf("removes Secret key %s, which %s still reads", k, by))
+					} else {
+						keys.Unread = append(keys.Unread, k)
+					}
+				}
 			}
 			for _, path := range immutable[kind] {
 				if !reflect.DeepEqual(dig(on, path), dig(nn, path)) {
@@ -246,7 +264,16 @@ func (k *SecretKeys) String() string {
 		parts = append(parts, "keys added: "+strings.Join(k.Added, ", "))
 	}
 	if len(k.Removed) > 0 {
-		parts = append(parts, "keys removed: "+strings.Join(k.Removed, ", "))
+		removed := "keys removed: " + strings.Join(k.Removed, ", ")
+		switch len(k.Removed) {
+		case len(k.Unread):
+			removed += ", read by nothing"
+		case len(k.Empty):
+			removed += ", all empty"
+		case len(k.Unread) + len(k.Empty):
+			removed += ", empty or read by nothing"
+		}
+		parts = append(parts, removed)
 	}
 	if len(k.Changed) > 0 {
 		parts = append(parts, "new values: "+strings.Join(k.Changed, ", "))
@@ -297,6 +324,83 @@ func splitImage(ref string) (repo, tag string) {
 	}
 	return ref, "latest"
 }
+
+// readers returns, for a Secret key, the first workload in objs that reads
+// it, or "" when none does: through secretKeyRef, through envFrom unless the
+// container sets that variable itself, or through a secret volume.
+func readers(objs []manifest.Object) func(secret, key string) string {
+	type source struct {
+		by     string
+		prefix string
+		own    map[string]bool
+		keys   map[string]bool // nil: every key
+	}
+	refs := map[string][]source{}
+	for _, o := range objs {
+		spec := o.PodSpec()
+		if spec == nil {
+			continue
+		}
+		by := o.Kind() + "/" + o.Name()
+		for _, v := range list(spec["volumes"]) {
+			if name, _ := dig(v, []string{"secret", "secretName"}).(string); name != "" {
+				refs[name] = append(refs[name], source{by: by, keys: itemKeys(dig(v, []string{"secret", "items"}))})
+			}
+			for _, p := range list(dig(v, []string{"projected", "sources"})) {
+				if name, _ := dig(p, []string{"secret", "name"}).(string); name != "" {
+					refs[name] = append(refs[name], source{by: by, keys: itemKeys(dig(p, []string{"secret", "items"}))})
+				}
+			}
+		}
+		for _, field := range []string{"initContainers", "containers"} {
+			for _, c := range list(spec[field]) {
+				own := map[string]bool{}
+				for _, e := range list(dig(c, []string{"env"})) {
+					n, _ := dig(e, []string{"name"}).(string)
+					own[n] = true
+					if name, _ := dig(e, []string{"valueFrom", "secretKeyRef", "name"}).(string); name != "" {
+						k, _ := dig(e, []string{"valueFrom", "secretKeyRef", "key"}).(string)
+						refs[name] = append(refs[name], source{by: by, keys: map[string]bool{k: true}})
+					}
+				}
+				for _, e := range list(dig(c, []string{"envFrom"})) {
+					if name, _ := dig(e, []string{"secretRef", "name"}).(string); name != "" {
+						prefix, _ := dig(e, []string{"prefix"}).(string)
+						refs[name] = append(refs[name], source{by: by, prefix: prefix, own: own})
+					}
+				}
+			}
+		}
+	}
+	return func(secret, key string) string {
+		for _, s := range refs[secret] {
+			switch {
+			case s.own != nil && s.own[s.prefix+key]:
+			case s.keys == nil || s.keys[key]:
+				return s.by
+			}
+		}
+		return ""
+	}
+}
+
+// itemKeys returns the keys a volume's items select, or nil when it has none
+// and so mounts every key.
+func itemKeys(items any) map[string]bool {
+	l := list(items)
+	if len(l) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, it := range l {
+		if k, _ := dig(it, []string{"key"}).(string); k != "" {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+func list(v any) []any { l, _ := v.([]any); return l }
 
 // kept reports whether Helm leaves the object in place when the release stops
 // rendering it. Helm's upgrade compares the annotation exactly, so this does
@@ -416,6 +520,8 @@ func secretValues(o manifest.Object) map[string]string {
 	}
 	return out
 }
+
+var emptyHash = hash(nil)
 
 func hash(b []byte) string {
 	s := sha256.Sum256(b)

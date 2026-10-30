@@ -80,12 +80,7 @@ func Render(ctx context.Context, ch *chart.Loaded, vals map[string]any, o Render
 	if err != nil {
 		return "", err
 	}
-	var b strings.Builder
-	fmt.Fprintln(&b, strings.TrimSpace(rel.Manifest))
-	for _, h := range rel.Hooks {
-		fmt.Fprintf(&b, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
-	}
-	return b.String(), nil
+	return withHooks(rel), nil
 }
 
 // ErrStopped means the wait for readiness was stopped early: the release was
@@ -197,6 +192,20 @@ func LastWorking(hist []*release.Release) *release.Release {
 // release's values over the new chart's defaults, as `ntctl upgrade` does;
 // without, vals replace them.
 func Plan(ctx context.Context, cfg *action.Configuration, ch chartapi.Charter, vals map[string]any, name, namespace string, reuse bool) (string, error) {
+	p, err := PlanWithHooks(ctx, cfg, ch, vals, name, namespace, reuse)
+	return p.Manifest, err
+}
+
+// Planned is what a dry-run upgrade would apply.
+type Planned struct {
+	// Manifest is the release manifest, without hooks.
+	Manifest string
+	// Rendered is the manifest followed by each hook, as Render prints them.
+	Rendered string
+}
+
+// PlanWithHooks is Plan that also returns the hooks the upgrade would run.
+func PlanWithHooks(ctx context.Context, cfg *action.Configuration, ch chartapi.Charter, vals map[string]any, name, namespace string, reuse bool) (Planned, error) {
 	up := action.NewUpgrade(cfg)
 	up.Namespace = namespace
 	up.DryRunStrategy = action.DryRunServer
@@ -205,13 +214,24 @@ func Plan(ctx context.Context, cfg *action.Configuration, ch chartapi.Charter, v
 	up.ServerSideApply = "auto"
 	r, err := up.RunWithContext(ctx, name, ch, vals)
 	if err != nil {
-		return "", err
+		return Planned{}, err
 	}
 	rel, err := v1(r)
 	if err != nil {
-		return "", err
+		return Planned{}, err
 	}
-	return rel.Manifest, nil
+	return Planned{Manifest: rel.Manifest, Rendered: withHooks(rel)}, nil
+}
+
+// withHooks prints a release's manifest, then each hook with its source
+// comment, as `helm template` does.
+func withHooks(rel *release.Release) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, strings.TrimSpace(rel.Manifest))
+	for _, h := range rel.Hooks {
+		fmt.Fprintf(&b, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
+	}
+	return b.String()
 }
 
 // Rollback restores revision to of a release and waits, up to timeout, for

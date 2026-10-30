@@ -179,6 +179,8 @@ func telemetryFiles(mode string) map[string]any {
 }
 
 func TestAskOperationalTelemetry(t *testing.T) {
+	// External and saas installs also ask about email; these tests are not about it.
+	t.Setenv("NT_EMAIL_PROVIDER", "none")
 	t.Setenv("ONPREM_SUPERADMIN_EMAIL", "admin@example.com")
 	t.Setenv("ONPREM_SUPERADMIN_PASSWORD", "correct-horse-battery")
 	cases := []struct {
@@ -237,6 +239,8 @@ func TestAskTelemetryNotAskedWhenSettled(t *testing.T) {
 }
 
 func TestAskMode(t *testing.T) {
+	// External and saas installs also ask about email; these tests are not about it.
+	t.Setenv("NT_EMAIL_PROVIDER", "none")
 	files := map[string]any{"global": map[string]any{
 		"domain": "m.example.com", "platform": "aws", "products": map[string]any{"trustguard": true},
 		"imageRegistry": "mirror.example.com", "observability": map[string]any{"operationalTelemetry": false},
@@ -285,6 +289,8 @@ func TestAskMode(t *testing.T) {
 }
 
 func TestAskAdmin(t *testing.T) {
+	// External and saas installs also ask about email; these tests are not about it.
+	t.Setenv("NT_EMAIL_PROVIDER", "none")
 	ctx := context.Background()
 	external := func() *opts { return &opts{mode: "external"} }
 	adminFiles := func() map[string]any {
@@ -402,6 +408,8 @@ func TestControlPlaneFlag(t *testing.T) {
 }
 
 func TestAskProductsOnlyForHybrid(t *testing.T) {
+	// External and saas installs also ask about email; these tests are not about it.
+	t.Setenv("NT_EMAIL_PROVIDER", "none")
 	t.Setenv("ONPREM_SUPERADMIN_EMAIL", "admin@example.com")
 	t.Setenv("ONPREM_SUPERADMIN_PASSWORD", "correct-horse-battery")
 	files := func(mode string) map[string]any {
@@ -460,5 +468,41 @@ func TestPrintSecretsFollowUpParses(t *testing.T) {
 	}
 	if o.kube.Namespace != "team-a" || len(o.valueFiles) != 1 || o.valueFiles[0] != file {
 		t.Errorf("parsed namespace %q and values %v from %q", o.kube.Namespace, o.valueFiles, cmd)
+	}
+}
+
+func TestAskEmail(t *testing.T) {
+	in := prompt.New(context.Background(), strings.NewReader(""), &bytes.Buffer{}, false)
+	if e, err := askEmail(in, false); err != nil || e != nil {
+		t.Errorf("without a terminal or NT_EMAIL_PROVIDER, email stays off: %+v, %v", e, err)
+	}
+	t.Setenv("NT_EMAIL_PROVIDER", "resend")
+	t.Setenv("NT_EMAIL_FROM", "alerts@example.com")
+	t.Setenv("NT_RESEND_API_KEY", "re_CANARY")
+	e, err := askEmail(in, false)
+	if err != nil || e.Provider != "resend" || e.From != "alerts@example.com" || e.APIKey != "re_CANARY" {
+		t.Errorf("resend from the environment: %+v, %v", e, err)
+	}
+	if e, err := askEmail(in, true); err != nil || e.APIKey != "<RESEND_API_KEY>" {
+		t.Errorf("printed, the key is a placeholder: %+v, %v", e, err)
+	}
+	t.Setenv("NT_EMAIL_PROVIDER", "ses")
+	t.Setenv("NT_SES_REGION", "eu-west-1")
+	if e, err := askEmail(in, false); err != nil || e.SESRegion != "eu-west-1" || e.AccessKeyID != "" {
+		t.Errorf("SES without keys uses the IAM role: %+v, %v", e, err)
+	}
+	t.Setenv("NT_EMAIL_PROVIDER", "smtp")
+	t.Setenv("NT_SMTP_HOST", "relay.example.com")
+	t.Setenv("NT_SMTP_SECURE", "false")
+	if e, err := askEmail(in, false); err != nil || e.SMTPHost != "relay.example.com" || e.SMTPPort != 587 || e.SMTPSecure || e.Password != "" {
+		t.Errorf("an SMTP relay without login: %+v, %v", e, err)
+	}
+	t.Setenv("NT_EMAIL_PROVIDER", "pigeon")
+	if _, err := askEmail(in, false); err == nil {
+		t.Error("an unknown provider should fail")
+	}
+	t.Setenv("NT_EMAIL_PROVIDER", "none")
+	if e, err := askEmail(in, false); err != nil || e != nil {
+		t.Errorf("none: %+v, %v", e, err)
 	}
 }

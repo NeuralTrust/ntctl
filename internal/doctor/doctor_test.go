@@ -305,3 +305,91 @@ func TestOnlyTheCurrentRevisionIsDiagnosed(t *testing.T) {
 		t.Error("a StatefulSet pod of an earlier revision is not diagnosed")
 	}
 }
+
+// generatorHook is a release hook of a chart whose generator writes
+// platform-secrets and a config-sync certificate.
+var generatorHook = []*release.Hook{{Manifest: `apiVersion: v1
+kind: ConfigMap
+metadata: {name: neuraltrust-generator-spec-trustguard}
+data:
+  spec.json: '[{"key":"AUTH_SECRET","type":"alnum"},{"key":"tls","type":"tls","secret":"trustguard-configsync-tls","cn":"x","sans":["x"]}]'
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: neuraltrust-platform-secrets-generator}
+spec:
+  template:
+    spec:
+      containers:
+      - name: generate
+        env:
+        - {name: GENERATED_SECRET, value: platform-secrets}
+`}}
+
+func TestMissingGeneratorSecretNamesTheGenerator(t *testing.T) {
+	r := rel(rcommon.StatusDeployed, "")
+	r.Hooks = generatorHook
+	for _, msg := range []string{`secret "platform-secrets" not found`, `couldn't find key AUTH_SECRET in Secret neuraltrust/platform-secrets`} {
+		got := run(t, r, pod("app-abc-1", "app-abc", waiting("CreateContainerConfigError", msg)))
+		if fix := got["NT-DR-011"].Fix; !strings.Contains(fix, "secrets generator") || !strings.Contains(fix, "--no-hooks") {
+			t.Errorf("%s: fix = %q, want the generator named", msg, fix)
+		}
+	}
+	got := run(t, r, pod("app-abc-1", "app-abc", waiting("CreateContainerConfigError", `secret "operator-owned" not found`)))
+	if fix := got["NT-DR-011"].Fix; strings.Contains(fix, "secrets generator") {
+		t.Errorf("an operator's Secret is not the generator's: %q", fix)
+	}
+}
+
+func TestLeftoverSecrets(t *testing.T) {
+	r := rel(rcommon.StatusDeployed, `apiVersion: apps/v1
+kind: Deployment
+metadata: {name: app}
+spec:
+  template:
+    spec:
+      imagePullSecrets: [{name: gcr-secret}]
+      containers:
+      - name: app
+        envFrom: [{secretRef: {name: platform-secrets}}]
+      volumes:
+      - name: tls
+        secret: {secretName: trustguard-configsync-tls}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: postgresql-secrets}
+`)
+	r.Hooks = generatorHook
+	secret := func(name string, labels, ann map[string]string) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels, Annotations: ann}}
+	}
+	helm := map[string]string{"meta.helm.sh/release-name": "neuraltrust-platform"}
+	gen := map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}
+	objs := []runtime.Object{
+		secret("platform-secrets", gen, nil),
+		secret("trustguard-configsync-tls", nil, map[string]string{"neuraltrust.ai/secrets-generator": "managed"}),
+		secret("postgresql-secrets", nil, helm),
+		secret("gcr-secret", nil, nil),
+		secret("neuraltrust-generated", gen, nil),
+		secret("neuraltrust-generated-trustguard-configsync-tls", gen, nil),
+		secret("control-plane-secrets", nil, helm),
+		secret("clickhouse-secrets", map[string]string{"app.kubernetes.io/instance": "neuraltrust-platform"}, nil),
+		secret("someone-elses", nil, nil),
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1.neuraltrust-platform.v3", Namespace: ns,
+			Labels: map[string]string{"app.kubernetes.io/instance": "neuraltrust-platform"}}, Type: "helm.sh/release.v1"},
+	}
+	got := run(t, r, objs...)["NT-DR-024"]
+	want := "4 Secrets from earlier chart versions are no longer read: clickhouse-secrets, control-plane-secrets, neuraltrust-generated, neuraltrust-generated-trustguard-configsync-tls"
+	if got.Message != want || got.Severity != preflight.OK {
+		t.Fatalf("NT-DR-024 = %+v\nwant %q, severity OK", got, want)
+	}
+	if !strings.Contains(got.Fix, "delete secret clickhouse-secrets control-plane-secrets") || !strings.Contains(got.Fix, "into platform-secrets") {
+		t.Errorf("fix = %q", got.Fix)
+	}
+	// Until the generator has written its Secret, the old ones may be where it
+	// copies credentials from.
+	if _, ok := run(t, r, objs[1:]...)["NT-DR-024"]; ok {
+		t.Error("leftovers reported while platform-secrets is missing")
+	}
+}
