@@ -2,6 +2,7 @@ package setup
 
 import (
 	"encoding/json"
+	"net/url"
 	"sort"
 	"strings"
 	"testing"
@@ -103,9 +104,6 @@ func TestExternalEverything(t *testing.T) {
 		"global.postgresql.host":                "db",
 		"global.postgresql.passwordSecret.name": PostgresSecret,
 		"global.redis.deploy":                   false,
-		"global.redis.host":                     "cache",
-		"global.redis.port":                     6379,
-		"global.redis.tls":                      "true",
 		"global.redis.existingSecret.name":      RedisSecret,
 	}
 	for path, want := range checks {
@@ -134,18 +132,15 @@ func TestExternalEverything(t *testing.T) {
 	if pg := byName[PostgresSecret]; pg == nil || string(pg.Data[PostgresKey]) != "pgpw" {
 		t.Error("PostgreSQL password Secret missing")
 	}
-	if r := byName[RedisSecret]; r == nil || len(r.Data) != 1 || string(r.Data[RedisPasswordKey]) != "rpw" {
-		t.Errorf("the Redis Secret should hold the password alone: %v", r)
+	if got := values.Get(v, "data-plane-api", "dataPlane", "components", "api", "redis", "existingSecret", "key"); got != RedisURLKey {
+		t.Errorf("data-plane-api should read its REDIS_URL from the Secret: %v", got)
 	}
-}
-
-func TestRedisWithoutPasswordNeedsNoSecret(t *testing.T) {
-	a := Answers{Redis: &Redis{Host: "cache", Port: 6379}}
-	if values.Get(a.Values(), "global", "redis", "existingSecret") != nil {
-		t.Error("a Redis without a password should reference no Secret")
+	if u := string(byName[RedisSecret].Data[RedisURLKey]); u != "rediss://:rpw@cache:6379/0" {
+		t.Errorf("REDIS_URL = %q", u)
 	}
-	if list, err := a.Secrets("nt"); err != nil || len(list) != 0 {
-		t.Errorf("secrets = %v, %v", list, err)
+	// The hybrid workloads load it whole and read the endpoint from it too.
+	if r := byName[RedisSecret]; r == nil || string(r.Data["REDIS_HOST"]) != "cache" || string(r.Data["REDIS_TLS"]) != "true" || string(r.Data["REDIS_PASSWORD"]) != "rpw" {
+		t.Error("Redis Secret missing or wrong")
 	}
 }
 
@@ -232,5 +227,20 @@ func TestEmailCredentialOnlyForTheChosenProvider(t *testing.T) {
 				t.Errorf("Secret keys = %v, want %v", keys, c.keys)
 			}
 		})
+	}
+}
+
+func TestRedisURLEscapesTheCredentials(t *testing.T) {
+	r := Redis{Host: "cache.example.com", Port: 6380, Username: "app", Password: "a/b+c=@:", TLS: true}
+	got := r.URL()
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pw, _ := u.User.Password(); pw != r.Password || u.User.Username() != "app" || u.Host != "cache.example.com:6380" || u.Path != "/0" || u.Scheme != "rediss" {
+		t.Errorf("%s does not parse back: %+v", got, u)
+	}
+	if got := (Redis{Host: "cache", Port: 6379}).URL(); got != "redis://cache:6379/0" {
+		t.Errorf("no password: %s", got)
 	}
 }

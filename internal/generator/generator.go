@@ -111,8 +111,11 @@ type Entry struct {
 	Key    string `json:"key"`
 	Type   string `json:"type"`
 	Length int    `json:"length,omitempty"`
-	// Source and Format make an alias (= source) or a derived value (Format
-	// with %s replaced by the source).
+	// Bits is an RSA key's size, 4096 when unset.
+	Bits int `json:"bits,omitempty"`
+	// Source and Format make an alias (= source), a derived value (Format
+	// with %s replaced by the source), or a public-key (the source private
+	// key's public half, base64 of its SPKI PEM).
 	Source string `json:"source,omitempty"`
 	Format string `json:"format,omitempty"`
 	// Adopt lists [secret, key] pairs an earlier chart rendered the value
@@ -127,6 +130,11 @@ type Entry struct {
 	Days       int      `json:"days,omitempty"`
 	SelfSigned bool     `json:"selfSigned,omitempty"`
 	CACN       string   `json:"caCn,omitempty"`
+	// Reissue marks a certificate other clusters dial under its public name:
+	// one issued for other SANs no longer counts. Annotations are written on
+	// the TLS Secret alongside the SANs digest.
+	Reissue     bool              `json:"reissue,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // specPrefix names the hook ConfigMaps each component contributes its

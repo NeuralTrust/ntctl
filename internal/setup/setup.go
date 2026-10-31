@@ -6,6 +6,7 @@ package setup
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -27,10 +28,8 @@ const (
 	PostgresSecret = "external-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
 	RedisSecret    = "external-redis"
-	// RedisPasswordKey is the only key of RedisSecret. Secrets earlier ntctl
-	// versions made also hold the host, port, user and TLS setting, which
-	// the chart takes from the values instead; they keep working.
-	RedisPasswordKey = "REDIS_PASSWORD" // #nosec G101 -- a key name, not a credential
+	// RedisURLKey holds the whole URL, password included, for data-plane-api.
+	RedisURLKey = "REDIS_URL"
 
 	// AdminSecret holds the console's first admin in external and saas
 	// installs, under the keys the chart reads by default.
@@ -92,6 +91,22 @@ type Redis struct {
 	Username string
 	Password string
 	TLS      bool
+}
+
+// URL is the Redis as one URL, database 0, the form data-plane-api reads:
+// rediss:// for TLS, the user and password escaped.
+func (r Redis) URL() string {
+	u := url.URL{Scheme: "redis", Host: net.JoinHostPort(r.Host, strconv.Itoa(r.Port)), Path: "/0"}
+	if r.TLS {
+		u.Scheme = "rediss"
+	}
+	switch {
+	case r.Username != "":
+		u.User = url.UserPassword(r.Username, r.Password)
+	case r.Password != "":
+		u.User = url.UserPassword("", r.Password)
+	}
+	return u.String()
 }
 
 // Admin is the console's first admin in an external or saas install.
@@ -170,17 +185,18 @@ func (a Answers) Values() map[string]any {
 			"passwordSecret": map[string]any{"name": PostgresSecret, "key": PostgresKey},
 		}
 	}
-	// Where Redis is and how to reach it is configuration, so it goes in
-	// the values; the Secret holds the password alone.
-	if r := a.Redis; r != nil {
-		redis := map[string]any{"deploy": false, "host": r.Host, "port": r.Port, "tls": strconv.FormatBool(r.TLS)}
-		if r.Username != "" {
-			redis["username"] = r.Username
+	// data-plane-api reads one REDIS_URL. Composed by the chart from the
+	// values, it would name the default host and no password, since both
+	// live in the Secret; so it takes the URL from the Secret too.
+	var dataPlaneAPI map[string]any
+	if a.Redis != nil {
+		global["redis"] = map[string]any{
+			"deploy":         false,
+			"existingSecret": map[string]any{"name": RedisSecret},
 		}
-		if r.Password != "" {
-			redis["existingSecret"] = map[string]any{"name": RedisSecret}
-		}
-		global["redis"] = redis
+		dataPlaneAPI = map[string]any{"dataPlane": map[string]any{"components": map[string]any{"api": map[string]any{
+			"redis": map[string]any{"existingSecret": map[string]any{"name": RedisSecret, "key": RedisURLKey}},
+		}}}}
 	}
 	if a.Admin != nil {
 		global["superadmin"] = map[string]any{"existingSecret": map[string]any{"name": AdminSecret}}
@@ -205,10 +221,14 @@ func (a Answers) Values() map[string]any {
 		}
 		global["email"] = email
 	}
-	if len(global) == 0 {
-		return map[string]any{}
+	out := map[string]any{}
+	if len(global) > 0 {
+		out["global"] = global
 	}
-	return map[string]any{"global": global}
+	if dataPlaneAPI != nil {
+		out["data-plane-api"] = dataPlaneAPI
+	}
+	return out
 }
 
 // Secrets returns the Secrets the answers need. A pull Secret is included
@@ -232,8 +252,17 @@ func (a Answers) Secrets(ns string) ([]*corev1.Secret, error) {
 	if pg := a.Postgres; pg != nil {
 		out = append(out, secrets.Opaque(ns, PostgresSecret, map[string]string{PostgresKey: pg.Password}))
 	}
-	if r := a.Redis; r != nil && r.Password != "" {
-		out = append(out, secrets.Opaque(ns, RedisSecret, map[string]string{RedisPasswordKey: r.Password}))
+	// The hybrid workloads load this Secret whole (envFrom) and take the
+	// endpoint from it as well as the password, so it holds both.
+	if r := a.Redis; r != nil {
+		out = append(out, secrets.Opaque(ns, RedisSecret, map[string]string{
+			"REDIS_HOST":     r.Host,
+			"REDIS_PORT":     strconv.Itoa(r.Port),
+			"REDIS_USERNAME": r.Username,
+			"REDIS_PASSWORD": r.Password,
+			"REDIS_TLS":      strconv.FormatBool(r.TLS),
+			RedisURLKey:      r.URL(),
+		}))
 	}
 	if ad := a.Admin; ad != nil && !ad.Existing {
 		out = append(out, secrets.Opaque(ns, AdminSecret, map[string]string{AdminEmailKey: ad.Email, AdminPassKey: ad.Password}))

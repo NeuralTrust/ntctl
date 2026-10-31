@@ -2,7 +2,10 @@ package generator
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"os"
 	"reflect"
@@ -75,11 +78,9 @@ func TestFreshInstall(t *testing.T) {
 	if store.Owner != Absent || len(store.Live) != 0 {
 		t.Errorf("owner = %s, live = %v", store.Owner, store.Live)
 	}
-	// Every key but the adopt-only ones, which nothing generates.
-	for _, k := range []string{"MCP_OAUTH_SIGNING_KEY", "AGENTGATEWAY_M2M_PRIVATE_KEY"} {
-		if _, ok := store.Data[k]; ok {
-			t.Errorf("%s is adopt-only and must not be generated", k)
-		}
+	// The keys the keygen hooks used to mint, generated as one pair.
+	if pub, err := publicHalf(store.Data["AGENTGATEWAY_M2M_PRIVATE_KEY"]); err != nil || pub != store.Data["ADMIN_M2M_PUBLIC_KEYS"] {
+		t.Errorf("the M2M halves are not one pair: %v", err)
 	}
 	entries, err := Spec(hooks(t))
 	if err != nil {
@@ -211,7 +212,10 @@ func TestOperatorSecretIsOnlyChecked(t *testing.T) {
 	if store.Owner != External || store.Data["POSTGRES_PASSWORD"] != "theirs" || len(store.Data) != 1 {
 		t.Errorf("an operator's Secret must not be filled in: %+v", store)
 	}
-	if !slices.Contains(store.Missing, "AUTH_SECRET") || slices.Contains(store.Missing, "POSTGRES_PASSWORD") || slices.Contains(store.Missing, "MCP_OAUTH_SIGNING_KEY") {
+	// The RSA keys the chart mints count like any other; a public half is
+	// needed only with its private key.
+	if !slices.Contains(store.Missing, "AUTH_SECRET") || slices.Contains(store.Missing, "POSTGRES_PASSWORD") ||
+		!slices.Contains(store.Missing, "MCP_OAUTH_SIGNING_KEY") || slices.Contains(store.Missing, "ADMIN_M2M_PUBLIC_KEYS") {
 		t.Errorf("missing = %v", store.Missing)
 	}
 	if tg := byName(t, p, "trustguard-configsync-tls"); tg.Owner != External || !reflect.DeepEqual(tg.Missing, []string{"tls.key", "ca.crt"}) {
@@ -252,4 +256,89 @@ func sameSet(a, b []string) bool {
 	sort.Strings(a)
 	sort.Strings(b)
 	return reflect.DeepEqual(a, b)
+}
+
+func TestReissueFollowsTheNames(t *testing.T) {
+	// A published listener: the certificate counts only while it covers the
+	// names the spec asks for.
+	e := Entry{Type: "tls", Secret: "databridge-southbound-tls", CN: "databridge.cp.example.com", CACN: "ca",
+		SANs: []string{"databridge.cp.example.com", "databridge-southbound"}, Reissue: true,
+		Annotations: map[string]string{"neuraltrust.ai/southbound-host": "databridge.cp.example.com"}}
+	job := manifest.Object{"kind": "Job", "spec": map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []any{
+		map[string]any{"env": []any{map[string]any{"name": "GENERATED_SECRET", "value": "platform-secrets"}}}}}}}}
+	raw, _ := json.Marshal([]Entry{e})
+	cm := manifest.Object{"kind": "ConfigMap", "metadata": map[string]any{"name": "neuraltrust-generator-spec-databridge"}, "data": map[string]any{"spec.json": string(raw)}}
+	issued := func(hash string) *corev1.Secret {
+		return secret("databridge-southbound-tls", map[string]string{Marker: "managed", sansAnnotation: hash}, "tls.crt", "C", "tls.key", "K", "ca.crt", "A")
+	}
+	for name, c := range map[string]struct {
+		hash string
+		kept bool
+	}{"same names": {sansHash(e.SANs), true}, "domain retargeted": {"0000000000000000", false}} {
+		t.Run(name, func(t *testing.T) {
+			p, err := Build(context.Background(), []manifest.Object{job, cm}, cluster(issued(c.hash)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := byName(t, p, "databridge-southbound-tls")
+			if kept := s.Data["tls.crt"] == "C"; kept != c.kept {
+				t.Fatalf("kept = %v, want %v (origin %v)", kept, c.kept, s.Origin)
+			}
+			if s.Annotations["neuraltrust.ai/southbound-host"] != "databridge.cp.example.com" || s.Annotations[sansAnnotation] != sansHash(e.SANs) {
+				t.Errorf("annotations = %v", s.Annotations)
+			}
+		})
+	}
+}
+
+func TestPublicKeyFollowsThePrivate(t *testing.T) {
+	// The keygen hook's format: base64 of the SPKI PEM. TrustGate verifies
+	// with it what the app signs with the private half, so the two must be one
+	// pair whether the private key was adopted or generated.
+	priv, err := generate(Entry{Key: "K", Type: "rsa-pkcs8", Bits: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := publicHalf(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(pub)
+	if err != nil {
+		t.Fatalf("not base64: %v", err)
+	}
+	b, _ := pem.Decode(raw)
+	if b == nil || b.Type != "PUBLIC KEY" {
+		t.Fatalf("not an SPKI PEM: %q", raw)
+	}
+	got, err := x509.ParsePKIXPublicKey(b.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pb, _ := pem.Decode([]byte(priv))
+	key, err := x509.ParsePKCS8PrivateKey(pb.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := key.(*rsa.PrivateKey)
+	if !rk.PublicKey.Equal(got) || rk.N.BitLen() != 2048 {
+		t.Errorf("the public half is not the private key's (%d bits)", rk.N.BitLen())
+	}
+
+	// Built from a spec: an adopted private key gets its own public half.
+	job := manifest.Object{"kind": "Job", "spec": map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []any{
+		map[string]any{"env": []any{map[string]any{"name": "GENERATED_SECRET", "value": "platform-secrets"}}}}}}}}
+	raw2, _ := json.Marshal([]Entry{
+		{Key: "AGENTGATEWAY_M2M_PRIVATE_KEY", Type: "rsa-pkcs8", Bits: 2048, Adopt: [][]string{{"agentgateway-m2m-keys", "AGENTGATEWAY_M2M_PRIVATE_KEY"}}},
+		{Key: "ADMIN_M2M_PUBLIC_KEYS", Type: "public-key", Source: "AGENTGATEWAY_M2M_PRIVATE_KEY"},
+	})
+	cm := manifest.Object{"kind": "ConfigMap", "metadata": map[string]any{"name": "neuraltrust-generator-spec-platform"}, "data": map[string]any{"spec.json": string(raw2)}}
+	p, err := Build(context.Background(), []manifest.Object{job, cm}, cluster(secret("agentgateway-m2m-keys", nil, "AGENTGATEWAY_M2M_PRIVATE_KEY", priv)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := byName(t, p, "platform-secrets")
+	if s.Data["AGENTGATEWAY_M2M_PRIVATE_KEY"] != priv || s.Data["ADMIN_M2M_PUBLIC_KEYS"] != pub {
+		t.Errorf("adopted pair: origin %v", s.Origin)
+	}
 }

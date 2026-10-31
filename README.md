@@ -161,15 +161,15 @@ database user and one Redis. In external mode every service has its own
 database user: configure that with `-f`, following
 `values-managed-datastores.yaml.example` in the chart repository.
 
-ntctl's Secrets hold credentials only; where a datastore is and how to reach
-it goes in the values. It names them the way the chart's examples do:
+ntctl names the Secrets it creates the way the chart's examples do:
 `external-postgresql` (key `POSTGRES_PASSWORD`), `external-redis`
-(`REDIS_PASSWORD`, none when your Redis has no password) and, for the email
+(`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_TLS`:
+the hybrid workloads load it whole, endpoint included; and `REDIS_URL`, which
+data-plane-api reads) and, for the email
 provider you choose, `email-credentials` (`RESEND_API_KEY`, `SMTP_PASSWORD`, or
 `SES_ACCESS_KEY_ID` and `SES_SECRET_ACCESS_KEY`). Installs made by earlier
-versions keep their Secrets as they are, `ntctl-postgresql` and `ntctl-redis`
-and an `external-redis` that also holds the host and port, since an upgrade
-reuses the values and renames nothing.
+versions keep their `ntctl-postgresql` and `ntctl-redis` Secrets, since an
+upgrade reuses the values and renames nothing.
 
 ### When only you may create Secrets
 

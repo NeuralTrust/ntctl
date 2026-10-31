@@ -2,6 +2,7 @@ package generator
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -178,8 +179,14 @@ func Build(ctx context.Context, objs []manifest.Object, live Lookup) (*Plan, err
 		}
 		plan.Secrets = append(plan.Secrets, s)
 	}
+	issuedFor := func(name string) string {
+		if s := sources[name]; s != nil {
+			return s.Annotations[sansAnnotation]
+		}
+		return ""
+	}
 	for _, e := range certs {
-		s, err := buildTLS(j, e, owner, source)
+		s, err := buildTLS(j, e, owner, source, issuedFor)
 		if err != nil {
 			return nil, err
 		}
@@ -252,7 +259,7 @@ func buildStore(j job, scalars []Entry, pins map[string]string, owner func(strin
 	if who == External {
 		out.Data = current
 		for _, e := range scalars {
-			if e.Type == "adopt" || (e.Type == "alias" && current[e.Source] == "") || current[e.Key] != "" {
+			if e.Type == "adopt" || ((e.Type == "alias" || e.Type == "public-key") && current[e.Source] == "") || current[e.Key] != "" {
 				continue
 			}
 			out.Missing = append(out.Missing, e.Key)
@@ -276,7 +283,7 @@ func buildStore(j job, scalars []Entry, pins map[string]string, owner func(strin
 			}
 		}
 	}
-	late := func(e Entry) bool { return e.Type == "alias" || e.Type == "derived" }
+	late := func(e Entry) bool { return e.Type == "alias" || e.Type == "derived" || e.Type == "public-key" }
 	ordered := append(slices.DeleteFunc(slices.Clone(scalars), late), slices.DeleteFunc(slices.Clone(scalars), func(e Entry) bool { return !late(e) })...)
 	for _, e := range ordered {
 		k := e.Key
@@ -284,8 +291,15 @@ func buildStore(j job, scalars []Entry, pins map[string]string, owner func(strin
 		case late(e):
 			if src := next[e.Source]; src != "" {
 				v := src
-				if e.Type == "derived" {
+				switch e.Type {
+				case "derived":
 					v = strings.Replace(e.Format, "%s", src, 1)
+				case "public-key":
+					pub, err := publicHalf(src)
+					if err != nil {
+						return Secret{}, fmt.Errorf("%s: %w", e.Key, err)
+					}
+					v = pub
 				}
 				if next[k] != v {
 					out.Origin[k] = "from " + e.Source
@@ -353,7 +367,12 @@ func complete(e Entry, d map[string]string) bool {
 	return d["tls.crt"] != "" && d["tls.key"] != "" && (e.SelfSigned || d["ca.crt"] != "")
 }
 
-func buildTLS(j job, e Entry, owner func(string) (Owner, error), source func(string) (map[string]string, bool, error)) (Secret, error) {
+// sansAnnotation holds the digest of the SANs a TLS Secret was issued for.
+const sansAnnotation = "neuraltrust.ai/tls-sans"
+
+// buildTLS settles one TLS Secret as the generator's tls() does. issuedFor
+// returns a Secret's SANs digest, which a reissue entry must match.
+func buildTLS(j job, e Entry, owner func(string) (Owner, error), source func(string) (map[string]string, bool, error), issuedFor func(string) string) (Secret, error) {
 	who, err := owner(e.Secret)
 	if err != nil {
 		return Secret{}, err
@@ -362,8 +381,14 @@ func buildTLS(j job, e Entry, owner func(string) (Owner, error), source func(str
 	if err != nil {
 		return Secret{}, err
 	}
-	out := Secret{Name: e.Secret, Type: corev1.SecretTypeTLS, Owner: who, Origin: map[string]string{},
-		Annotations: map[string]string{"neuraltrust.ai/tls-sans": sansHash(e.SANs)}}
+	hash := sansHash(e.SANs)
+	fits := func(name string) bool { return !e.Reissue || issuedFor(name) == hash }
+	ann := map[string]string{}
+	for k, v := range e.Annotations {
+		ann[k] = v
+	}
+	ann[sansAnnotation] = hash
+	out := Secret{Name: e.Secret, Type: corev1.SecretTypeTLS, Owner: who, Origin: map[string]string{}, Annotations: ann}
 	keep := func(d map[string]string) Secret {
 		out.Data, out.Live = d, sortedKeys(d)
 		return out
@@ -377,7 +402,7 @@ func buildTLS(j job, e Entry, owner func(string) (Owner, error), source func(str
 			}
 		}
 		return out, nil
-	case who == External, who == Managed && complete(e, own):
+	case who == External, who == Managed && complete(e, own) && fits(e.Secret):
 		return keep(own), nil
 	}
 	candidates := []string{}
@@ -395,7 +420,7 @@ func buildTLS(j job, e Entry, owner func(string) (Owner, error), source func(str
 		if err != nil {
 			return Secret{}, err
 		}
-		if !complete(e, d) {
+		if !complete(e, d) || !fits(name) {
 			continue
 		}
 		data := map[string]string{"tls.crt": d["tls.crt"], "tls.key": d["tls.key"], "ca.crt": d["ca.crt"]}
@@ -468,7 +493,11 @@ func generate(e Entry) (string, error) {
 		}
 		return base64.StdEncoding.EncodeToString(b), nil
 	case "rsa-pkcs1", "rsa-pkcs8":
-		k, err := rsa.GenerateKey(rand.Reader, 4096)
+		bits := e.Bits
+		if bits == 0 {
+			bits = 4096
+		}
+		k, err := rsa.GenerateKey(rand.Reader, bits)
 		if err != nil {
 			return "", fmt.Errorf("generating %s: %w", e.Key, err)
 		}
@@ -482,6 +511,34 @@ func generate(e Entry) (string, error) {
 		return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})), nil
 	}
 	return "", fmt.Errorf("unknown type %s for %s: this ntctl predates the chart's generator; update ntctl", e.Type, e.Key)
+}
+
+// publicHalf returns a PEM private key's public half the way the generator
+// writes it: base64 of the SPKI PEM, on one line.
+func publicHalf(private string) (string, error) {
+	b, _ := pem.Decode([]byte(private))
+	if b == nil {
+		return "", errors.New("the private key is not PEM")
+	}
+	var key any
+	var err error
+	if b.Type == "RSA PRIVATE KEY" {
+		key, err = x509.ParsePKCS1PrivateKey(b.Bytes)
+	} else {
+		key, err = x509.ParsePKCS8PrivateKey(b.Bytes)
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading the private key: %w", err)
+	}
+	signer, ok := key.(interface{ Public() crypto.PublicKey })
+	if !ok {
+		return "", errors.New("the private key has no public half")
+	}
+	der, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return "", fmt.Errorf("encoding the public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})), nil
 }
 
 // sansHash is the digest the chart's TLS templates annotate: sha256 of the
