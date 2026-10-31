@@ -28,6 +28,9 @@ spec:
       containers:
       - name: proxy
         image: registry.example.com/proxy:1.0.0
+        envFrom:
+        - secretRef:
+            name: tokens
 ---
 apiVersion: v1
 kind: Secret
@@ -106,7 +109,7 @@ func TestBlockingChanges(t *testing.T) {
 		"statefulset service": {"serviceName: db", "serviceName: db-headless", "spec.serviceName is immutable"},
 		"pvc class":           {"storageClassName: standard", "storageClassName: fast", "spec.storageClassName is immutable"},
 		"pvc access":          {"accessModes: [ReadWriteOnce]", "accessModes: [ReadWriteMany]", "spec.accessModes is immutable"},
-		"secret key removed":  {"  OTHER: same\n", "", "removes Secret keys OTHER"},
+		"secret key removed":  {"  OTHER: same\n", "", "removes Secret key OTHER"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -136,6 +139,107 @@ func TestRemovingDataKindsBlocks(t *testing.T) {
 	}
 	if b := compare(t, without("ConfigMap")).Blocking(); len(b) != 0 {
 		t.Errorf("removing a ConfigMap is safe: %+v", b)
+	}
+}
+
+func TestRemovingKeptResourcesDoesNotBlock(t *testing.T) {
+	keep := "\n  annotations:\n    helm.sh/resource-policy: keep"
+	cases := map[string]string{
+		"Secret":                "  name: tokens",
+		"StatefulSet":           "  name: db",
+		"PersistentVolumeClaim": "  name: data",
+	}
+	for kind, name := range cases {
+		t.Run(kind, func(t *testing.T) {
+			from := strings.Replace(base, "kind: "+kind+"\nmetadata:\n"+name, "kind: "+kind+"\nmetadata:\n"+name+keep, 1)
+			var to []string
+			for _, doc := range strings.Split(from, "---\n") {
+				if !strings.Contains(doc, "kind: "+kind+"\n") {
+					to = append(to, doc)
+				}
+			}
+			r := Compare(parse(t, from), parse(t, strings.Join(to, "---\n")))
+			if b := r.Blocking(); len(b) != 0 {
+				t.Fatalf("a kept %s should not block: %+v", kind, b)
+			}
+			if len(r.Changes) != 1 || r.Changes[0].Op != Removed || !r.Changes[0].Kept {
+				t.Fatalf("want one removed, kept %s: %+v", kind, r.Changes)
+			}
+			var out bytes.Buffer
+			r.Print(&out, false)
+			if !strings.Contains(out.String(), "kept in the cluster") {
+				t.Fatalf("output should say it is kept:\n%s", out.String())
+			}
+		})
+	}
+}
+
+func TestRemovingAnUnreadSecretKeyDoesNotBlock(t *testing.T) {
+	// The key leaves the Secret and nothing in the target reads it: the
+	// chart moved it to a ConfigMap, or stopped needing it.
+	reader := "        envFrom:\n        - secretRef:\n            name: tokens\n"
+	cases := map[string]string{
+		"no reader left":       "",
+		"explicit env wins":    "        env:\n        - name: OTHER\n          value: from-config\n" + reader,
+		"volume of other keys": "        volumeMounts: []\n      volumes:\n      - name: t\n        secret:\n          secretName: tokens\n          items:\n          - key: TOKEN\n            path: token\n",
+	}
+	for name, with := range cases {
+		t.Run(name, func(t *testing.T) {
+			to := strings.Replace(strings.Replace(base, reader, with, 1), "  OTHER: same\n", "", 1)
+			r := compare(t, to)
+			if b := r.Blocking(); len(b) != 0 {
+				t.Fatalf("an unread key should not block: %+v", b)
+			}
+			var out bytes.Buffer
+			r.Print(&out, false)
+			if !strings.Contains(out.String(), "keys removed: OTHER, read by nothing") {
+				t.Fatalf("output should say nothing reads it:\n%s", out.String())
+			}
+		})
+	}
+}
+
+func TestRemovingAnEmptySecretKeyDoesNotBlock(t *testing.T) {
+	// The workload still reads OTHER through an optional reference; it was
+	// empty, so it becomes unset instead.
+	from := strings.Replace(base, "OTHER: same", `OTHER: ""`, 1)
+	to := strings.Replace(from, "  OTHER: \"\"\n", "", 1)
+	r := Compare(parse(t, from), parse(t, to))
+	if b := r.Blocking(); len(b) != 0 {
+		t.Fatalf("an empty key should not block: %+v", b)
+	}
+	var out bytes.Buffer
+	r.Print(&out, false)
+	if !strings.Contains(out.String(), "keys removed: OTHER, all empty") {
+		t.Fatalf("output should say it was empty:\n%s", out.String())
+	}
+}
+
+func TestRemovingASecretKeyStillReadBlocks(t *testing.T) {
+	reader := "        envFrom:\n        - secretRef:\n            name: tokens\n"
+	cases := map[string]string{
+		"envFrom":      reader,
+		"secretKeyRef": "        env:\n        - name: X\n          valueFrom:\n            secretKeyRef:\n              name: tokens\n              key: OTHER\n",
+		"whole volume": "      volumes:\n      - name: t\n        secret:\n          secretName: tokens\n",
+	}
+	for name, with := range cases {
+		t.Run(name, func(t *testing.T) {
+			to := strings.Replace(strings.Replace(base, reader, with, 1), "  OTHER: same\n", "", 1)
+			b := compare(t, to).Blocking()
+			if len(b) != 1 || !strings.Contains(strings.Join(b[0].Blocking, ";"), "removes Secret key OTHER, which Deployment/proxy still reads") {
+				t.Fatalf("blocking = %+v", b)
+			}
+		})
+	}
+}
+
+func TestRemovingKeysFromAKeptSecretStillBlocks(t *testing.T) {
+	// keep only stops Helm deleting the object; a key that leaves a Secret
+	// still rendered is removed by the upgrade's patch.
+	from := strings.Replace(base, "metadata:\n  name: tokens", "metadata:\n  name: tokens\n  annotations:\n    helm.sh/resource-policy: keep", 1)
+	to := strings.Replace(from, "  OTHER: same\n", "", 1)
+	if b := Compare(parse(t, from), parse(t, to)).Blocking(); len(b) != 1 {
+		t.Fatalf("removing a key from a kept Secret should block: %+v", b)
 	}
 }
 

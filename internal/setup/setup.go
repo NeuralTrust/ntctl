@@ -6,6 +6,7 @@ package setup
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/NeuralTrust/ntctl/internal/secrets"
+	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
 // Secret names and keys for a PostgreSQL and Redis the chart does not run.
@@ -26,18 +28,35 @@ const (
 	PostgresSecret = "external-postgresql" // #nosec G101 -- a Secret name, not a credential
 	PostgresKey    = "POSTGRES_PASSWORD"
 	RedisSecret    = "external-redis"
+	// RedisURLKey holds the whole URL, password included, for data-plane-api.
+	RedisURLKey = "REDIS_URL"
 
 	// AdminSecret holds the console's first admin in external and saas
 	// installs, under the keys the chart reads by default.
 	AdminSecret   = "onprem-superadmin"
 	AdminEmailKey = "ONPREM_SUPERADMIN_EMAIL"
 	AdminPassKey  = "ONPREM_SUPERADMIN_PASSWORD" // #nosec G101 -- a key name, not a credential
+
+	// EmailSecret holds the credential of the email provider the console
+	// sends with, under the keys the chart reads by default
+	// (global.email.existingSecret).
+	EmailSecret = "email-credentials"
+)
+
+// The keys of EmailSecret, one set per provider.
+//
+// #nosec G101 -- key names, not credentials
+const (
+	ResendKey       = "RESEND_API_KEY"
+	SMTPPasswordKey = "SMTP_PASSWORD"
+	SESKeyIDKey     = "SES_ACCESS_KEY_ID"
+	SESSecretKey    = "SES_SECRET_ACCESS_KEY"
 )
 
 // OwnSecrets are the names of every Secret ntctl may create in an install
 // namespace, including the ones earlier versions used.
 func OwnSecrets() []string {
-	return []string{secrets.PullSecret, PostgresSecret, RedisSecret, "ntctl-postgresql", "ntctl-redis", AdminSecret,
+	return []string{secrets.PullSecret, PostgresSecret, RedisSecret, "ntctl-postgresql", "ntctl-redis", AdminSecret, EmailSecret,
 		"agentgateway-config-sync", "trustguard-config-sync", "dataagent-enrolment-trustgate", "dataagent-enrolment-trustguard"}
 }
 
@@ -74,6 +93,22 @@ type Redis struct {
 	TLS      bool
 }
 
+// URL is the Redis as one URL, database 0, the form data-plane-api reads:
+// rediss:// for TLS, the user and password escaped.
+func (r Redis) URL() string {
+	u := url.URL{Scheme: "redis", Host: net.JoinHostPort(r.Host, strconv.Itoa(r.Port)), Path: "/0"}
+	if r.TLS {
+		u.Scheme = "rediss"
+	}
+	switch {
+	case r.Username != "":
+		u.User = url.UserPassword(r.Username, r.Password)
+	case r.Password != "":
+		u.User = url.UserPassword("", r.Password)
+	}
+	return u.String()
+}
+
 // Admin is the console's first admin in an external or saas install.
 type Admin struct {
 	Email    string
@@ -82,13 +117,51 @@ type Admin struct {
 	Existing bool
 }
 
+// Email is how the console sends mail (invitations, alerts) in an external
+// or saas install. The provider, addresses and server go in the values; the
+// credential alone goes in EmailSecret, and only the chosen provider's.
+type Email struct {
+	// Provider is resend, smtp or ses.
+	Provider string
+	From     string
+	ReplyTo  string
+	// APIKey is Resend's.
+	APIKey string
+	// SMTP server and login; an empty Password is an unauthenticated relay.
+	SMTPHost   string
+	SMTPPort   int
+	SMTPSecure bool
+	SMTPUser   string
+	Password   string
+	// SES region and keys; empty keys use the pod's IAM role.
+	SESRegion       string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// credential returns the keys of EmailSecret, or nil when the provider
+// needs no Secret.
+func (e *Email) credential() map[string]string {
+	switch {
+	case e.Provider == "resend" && e.APIKey != "":
+		return map[string]string{ResendKey: e.APIKey}
+	case e.Provider == "smtp" && e.Password != "":
+		return map[string]string{SMTPPasswordKey: e.Password}
+	case e.Provider == "ses" && e.AccessKeyID != "":
+		return map[string]string{SESKeyIDKey: e.AccessKeyID, SESSecretKey: e.SecretAccessKey}
+	}
+	return nil
+}
+
 // Answers are the install choices. Nil datastores stay in the cluster; a nil
-// Admin leaves the bootstrap admin to the values.
+// Admin leaves the bootstrap admin to the values, and a nil Email leaves the
+// console without email, which can be set up later.
 type Answers struct {
 	Images   Images
 	Postgres *Postgres
 	Redis    *Redis
 	Admin    *Admin
+	Email    *Email
 }
 
 // Values returns the chart values the answers stand for.
@@ -112,19 +185,50 @@ func (a Answers) Values() map[string]any {
 			"passwordSecret": map[string]any{"name": PostgresSecret, "key": PostgresKey},
 		}
 	}
+	// data-plane-api reads one REDIS_URL. Composed by the chart from the
+	// values, it would name the default host and no password, since both
+	// live in the Secret; so it takes the URL from the Secret too.
+	var dataPlaneAPI map[string]any
 	if a.Redis != nil {
 		global["redis"] = map[string]any{
 			"deploy":         false,
 			"existingSecret": map[string]any{"name": RedisSecret},
 		}
+		dataPlaneAPI = map[string]any{"dataPlane": map[string]any{"components": map[string]any{"api": map[string]any{
+			"redis": map[string]any{"existingSecret": map[string]any{"name": RedisSecret, "key": RedisURLKey}},
+		}}}}
 	}
 	if a.Admin != nil {
 		global["superadmin"] = map[string]any{"existingSecret": map[string]any{"name": AdminSecret}}
 	}
-	if len(global) == 0 {
-		return map[string]any{}
+	if e := a.Email; e != nil {
+		email := map[string]any{"provider": e.Provider, "from": e.From}
+		if e.ReplyTo != "" {
+			email["replyTo"] = e.ReplyTo
+		}
+		switch e.Provider {
+		case "smtp":
+			smtp := map[string]any{"host": e.SMTPHost, "port": e.SMTPPort, "secure": e.SMTPSecure}
+			if e.SMTPUser != "" {
+				smtp["user"] = e.SMTPUser
+			}
+			email["smtp"] = smtp
+		case "ses":
+			email["ses"] = map[string]any{"region": e.SESRegion}
+		}
+		if e.credential() != nil {
+			email["existingSecret"] = map[string]any{"name": EmailSecret}
+		}
+		global["email"] = email
 	}
-	return map[string]any{"global": global}
+	out := map[string]any{}
+	if len(global) > 0 {
+		out["global"] = global
+	}
+	if dataPlaneAPI != nil {
+		out["data-plane-api"] = dataPlaneAPI
+	}
+	return out
 }
 
 // Secrets returns the Secrets the answers need. A pull Secret is included
@@ -148,6 +252,8 @@ func (a Answers) Secrets(ns string) ([]*corev1.Secret, error) {
 	if pg := a.Postgres; pg != nil {
 		out = append(out, secrets.Opaque(ns, PostgresSecret, map[string]string{PostgresKey: pg.Password}))
 	}
+	// The hybrid workloads load this Secret whole (envFrom) and take the
+	// endpoint from it as well as the password, so it holds both.
 	if r := a.Redis; r != nil {
 		out = append(out, secrets.Opaque(ns, RedisSecret, map[string]string{
 			"REDIS_HOST":     r.Host,
@@ -155,16 +261,23 @@ func (a Answers) Secrets(ns string) ([]*corev1.Secret, error) {
 			"REDIS_USERNAME": r.Username,
 			"REDIS_PASSWORD": r.Password,
 			"REDIS_TLS":      strconv.FormatBool(r.TLS),
+			RedisURLKey:      r.URL(),
 		}))
 	}
 	if ad := a.Admin; ad != nil && !ad.Existing {
 		out = append(out, secrets.Opaque(ns, AdminSecret, map[string]string{AdminEmailKey: ad.Email, AdminPassKey: ad.Password}))
 	}
+	if e := a.Email; e != nil {
+		if c := e.credential(); c != nil {
+			out = append(out, secrets.Opaque(ns, EmailSecret, c))
+		}
+	}
 	return out, nil
 }
 
-// Summary describes the answers without any credential.
-func (a Answers) Summary() []string {
+// Summary describes the answers without any credential. vals are the
+// effective values, which describe a datastore the answers leave alone.
+func (a Answers) Summary(vals map[string]any) []string {
 	var out []string
 	switch {
 	case a.Images.Registry == "":
@@ -179,7 +292,7 @@ func (a Answers) Summary() []string {
 	if pg := a.Postgres; pg != nil {
 		out = append(out, fmt.Sprintf("PostgreSQL: %s@%s:%d/%s (sslmode=%s)", pg.User, pg.Host, pg.Port, pg.Database, pg.SSLMode))
 	} else {
-		out = append(out, "PostgreSQL: in the cluster")
+		out = append(out, "PostgreSQL: "+fromValues(vals, "postgresql"))
 	}
 	if r := a.Redis; r != nil {
 		tls := ""
@@ -188,7 +301,7 @@ func (a Answers) Summary() []string {
 		}
 		out = append(out, fmt.Sprintf("Redis:      %s:%d%s", r.Host, r.Port, tls))
 	} else {
-		out = append(out, "Redis:      in the cluster")
+		out = append(out, "Redis:      "+fromValues(vals, "redis"))
 	}
 	switch ad := a.Admin; {
 	case ad == nil:
@@ -196,6 +309,17 @@ func (a Answers) Summary() []string {
 		out = append(out, "Admin:      from the existing Secret "+AdminSecret)
 	default:
 		out = append(out, "Admin:      "+ad.Email+" (first sign-in to the console)")
+	}
+	switch e := a.Email; {
+	case e == nil:
+	case e.Provider == "resend":
+		out = append(out, "Email:      Resend, from "+e.From)
+	case e.Provider == "smtp":
+		out = append(out, fmt.Sprintf("Email:      SMTP %s:%d, from %s", e.SMTPHost, e.SMTPPort, e.From))
+	case e.AccessKeyID == "":
+		out = append(out, "Email:      Amazon SES "+e.SESRegion+" (the pods' IAM role), from "+e.From)
+	default:
+		out = append(out, "Email:      Amazon SES "+e.SESRegion+", from "+e.From)
 	}
 	return out
 }
@@ -278,4 +402,27 @@ func RegistryServer(addr string) string {
 	addr = strings.TrimPrefix(strings.TrimPrefix(addr, "https://"), "http://")
 	host, _, _ := strings.Cut(addr, "/")
 	return host
+}
+
+// fromValues describes global.<name> (postgresql or redis): in the cluster,
+// unless the values point it at one of their own.
+func fromValues(vals map[string]any, name string) string {
+	host, _ := values.Get(vals, "global", name, "host").(string)
+	if host == "" && fmt.Sprint(values.Get(vals, "global", name, "deploy")) != "false" {
+		return "in the cluster"
+	}
+	if host == "" {
+		host = "your own"
+	}
+	var how []string
+	if strings.EqualFold(fmt.Sprint(values.Get(vals, "global", name, "authMode")), "iam") {
+		how = append(how, "IAM")
+	}
+	if values.Get(vals, "global", name, "cluster") == true {
+		how = append(how, "cluster")
+	}
+	if len(how) > 0 {
+		host += " (" + strings.Join(how, ", ") + ")"
+	}
+	return host + ", from your values"
 }

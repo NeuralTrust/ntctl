@@ -201,7 +201,9 @@ func Commands(list []*corev1.Secret, keyFile string) string {
 		sort.Strings(keys)
 		for _, k := range keys {
 			v := string(s.Data[k])
-			if redact.SensitiveKey(k) {
+			// A credential inside a value under a plain name (a URL with its
+			// password) is a placeholder too.
+			if redact.SensitiveKey(k) || redact.Text(v) != v {
 				v = "<" + k + ">"
 			}
 			fmt.Fprintf(&b, " \\\n  --from-literal=%s=%s", k, quote(v))

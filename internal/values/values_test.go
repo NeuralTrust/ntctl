@@ -209,3 +209,24 @@ func TestInlineAdminPassword(t *testing.T) {
 		}
 	}
 }
+
+func TestConsoleHost(t *testing.T) {
+	app := func(c map[string]any) map[string]any {
+		return map[string]any{"global": map[string]any{"domain": "p.example.com"},
+			"control-plane-app": map[string]any{"controlPlane": map[string]any{"components": map[string]any{"app": c}}}}
+	}
+	cases := []struct {
+		name string
+		vals map[string]any
+		want string
+	}{
+		{"default", app(map[string]any{}), "app.p.example.com"},
+		{"prefix", app(map[string]any{"hostPrefix": "test-app"}), "test-app.p.example.com"},
+		{"host wins", app(map[string]any{"hostPrefix": "test-app", "host": "console.example.org"}), "console.example.org"},
+	}
+	for _, c := range cases {
+		if got := ConsoleHost(c.vals); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}

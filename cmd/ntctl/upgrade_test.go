@@ -12,7 +12,14 @@ import (
 
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	release "helm.sh/helm/v4/pkg/release/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/NeuralTrust/ntctl/internal/chart"
+	"github.com/NeuralTrust/ntctl/internal/helm"
+	"github.com/NeuralTrust/ntctl/internal/manifest"
 	"github.com/NeuralTrust/ntctl/internal/prompt"
 	"github.com/NeuralTrust/ntctl/internal/redact"
 	"github.com/NeuralTrust/ntctl/internal/values"
@@ -37,6 +44,71 @@ func TestRollbackTarget(t *testing.T) {
 	}
 	if got := rollbackTarget(hist[:1], 0); got != nil {
 		t.Fatalf("a single revision has nothing to return to, got %v", got)
+	}
+}
+
+func TestUnresolvedAfterRollback(t *testing.T) {
+	// Revision 3 ran chart 3.9: its generator wrote neuraltrust-generated,
+	// which its workloads read optionally, and it rendered settings itself.
+	rel := &release.Release{Version: 3, Manifest: `apiVersion: apps/v1
+kind: Deployment
+metadata: {name: app}
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: AUTH_SECRET
+          valueFrom: {secretKeyRef: {name: neuraltrust-generated, key: AUTH_SECRET, optional: true}}
+        - name: PULL
+          valueFrom: {secretKeyRef: {name: operator, key: TOKEN}}
+        - name: EXTRA
+          valueFrom: {secretKeyRef: {name: someone-else, key: X, optional: true}}
+        envFrom:
+        - secretRef: {name: settings}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: settings}
+`, Hooks: []*release.Hook{{Path: "templates/secrets-generator.yaml", Manifest: `apiVersion: batch/v1
+kind: Job
+metadata: {name: neuraltrust-platform-secrets-generator}
+spec:
+  template:
+    spec:
+      containers:
+      - name: generate
+        env:
+        - {name: GENERATED_SECRET, value: neuraltrust-generated}
+`}}}
+	secret := func(name string, keys ...string) *corev1.Secret {
+		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "nt"}, Data: map[string][]byte{}}
+		for _, k := range keys {
+			s.Data[k] = []byte("v")
+		}
+		return s
+	}
+	cases := map[string]struct {
+		live []runtime.Object
+		want []string
+	}{
+		"all there": {[]runtime.Object{secret("neuraltrust-generated", "AUTH_SECRET"), secret("operator", "TOKEN")}, nil},
+		"generator Secret deleted as a leftover": {[]runtime.Object{secret("operator", "TOKEN")},
+			[]string{"Secret neuraltrust-generated (read by Deployment/app)"}},
+		"operator key gone": {[]runtime.Object{secret("neuraltrust-generated"), secret("operator")},
+			[]string{"key TOKEN of Secret operator (read by Deployment/app)"}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := unresolved(context.Background(), fake.NewClientset(c.live...), "nt", rel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("unresolved = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -163,5 +235,43 @@ func TestConnects(t *testing.T) {
 				t.Errorf("connects = %q, want %q and not %q", got, tc.want, tc.not)
 			}
 		})
+	}
+}
+
+func TestGeneratorChange(t *testing.T) {
+	job := `apiVersion: batch/v1
+kind: Job
+metadata: {name: neuraltrust-platform-secrets-generator}
+spec:
+  template:
+    spec:
+      containers:
+      - name: generate
+        env:
+        - {name: GENERATED_SECRET, value: platform-secrets}
+`
+	withGenerator, err := manifest.Parse(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prep := func(deployed bool, planned []manifest.Object) *prepared {
+		cur := &release.Release{Manifest: "", Config: map[string]any{}}
+		if deployed {
+			cur.Hooks = []*release.Hook{{Manifest: job}}
+		}
+		return &prepared{current: cur, planned: &helm.Planned{}, objects: planned, chart: &chart.Loaded{Version: "3.10.0"}}
+	}
+	var o opts
+	var out bytes.Buffer
+	if _, err := o.generatorChange(context.Background(), &out, prep(false, nil), true); err == nil || !strings.Contains(err.Error(), "does not run the secrets generator") {
+		t.Errorf("--secrets-generator on a chart without it should fail, got %v", err)
+	}
+	out.Reset()
+	if _, err := o.generatorChange(context.Background(), &out, prep(false, withGenerator), true); err != nil || !strings.Contains(out.String(), "creates platform-secrets before the upgrade") {
+		t.Errorf("err = %v, out = %q", err, out.String())
+	}
+	out.Reset()
+	if _, err := o.generatorChange(context.Background(), &out, prep(true, withGenerator), true); err != nil || out.Len() != 0 {
+		t.Errorf("an install already on the generator needs no word: err = %v, out = %q", err, out.String())
 	}
 }

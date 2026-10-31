@@ -2,6 +2,8 @@ package setup
 
 import (
 	"encoding/json"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 
@@ -130,7 +132,14 @@ func TestExternalEverything(t *testing.T) {
 	if pg := byName[PostgresSecret]; pg == nil || string(pg.Data[PostgresKey]) != "pgpw" {
 		t.Error("PostgreSQL password Secret missing")
 	}
-	if r := byName[RedisSecret]; r == nil || string(r.Data["REDIS_HOST"]) != "cache" || string(r.Data["REDIS_TLS"]) != "true" {
+	if got := values.Get(v, "data-plane-api", "dataPlane", "components", "api", "redis", "existingSecret", "key"); got != RedisURLKey {
+		t.Errorf("data-plane-api should read its REDIS_URL from the Secret: %v", got)
+	}
+	if u := string(byName[RedisSecret].Data[RedisURLKey]); u != "rediss://:rpw@cache:6379/0" {
+		t.Errorf("REDIS_URL = %q", u)
+	}
+	// The hybrid workloads load it whole and read the endpoint from it too.
+	if r := byName[RedisSecret]; r == nil || string(r.Data["REDIS_HOST"]) != "cache" || string(r.Data["REDIS_TLS"]) != "true" || string(r.Data["REDIS_PASSWORD"]) != "rpw" {
 		t.Error("Redis Secret missing or wrong")
 	}
 }
@@ -142,5 +151,96 @@ func TestNodeIdentityHasNoPullSecret(t *testing.T) {
 	}
 	if s, _ := a.Secrets("nt"); len(s) != 0 {
 		t.Errorf("node identity created Secrets: %v", s)
+	}
+}
+
+func TestSummaryDescribesDatastoresFromValues(t *testing.T) {
+	global := func(g map[string]any) map[string]any { return map[string]any{"global": g} }
+	cases := []struct {
+		name      string
+		vals      map[string]any
+		pg, redis string
+	}{
+		{"chart runs both", map[string]any{}, "PostgreSQL: in the cluster", "Redis:      in the cluster"},
+		{"own, with passwords", global(map[string]any{
+			"postgresql": map[string]any{"deploy": false, "host": "db.example.com"},
+			"redis":      map[string]any{"deploy": false, "host": "cache.example.com"},
+		}), "PostgreSQL: db.example.com, from your values", "Redis:      cache.example.com, from your values"},
+		{"own, with IAM", global(map[string]any{
+			"postgresql": map[string]any{"deploy": false, "host": "10.0.0.2", "authMode": "iam"},
+			"redis":      map[string]any{"deploy": false, "host": "10.0.0.3", "authMode": "iam", "cluster": true},
+		}), "PostgreSQL: 10.0.0.2 (IAM), from your values", "Redis:      10.0.0.3 (IAM, cluster), from your values"},
+	}
+	for _, c := range cases {
+		got := strings.Join(Answers{}.Summary(c.vals), "\n")
+		if !strings.Contains(got, c.pg) || !strings.Contains(got, c.redis) {
+			t.Errorf("%s:\n%s", c.name, got)
+		}
+	}
+}
+
+func TestEmailCredentialOnlyForTheChosenProvider(t *testing.T) {
+	cases := map[string]struct {
+		email  Email
+		keys   []string
+		values map[string]any
+	}{
+		"resend": {Email{Provider: "resend", From: "a@example.com", APIKey: "re_x"}, []string{ResendKey},
+			map[string]any{"global.email.provider": "resend", "global.email.from": "a@example.com", "global.email.existingSecret.name": EmailSecret}},
+		"smtp with login": {Email{Provider: "smtp", From: "a@example.com", SMTPHost: "mail.example.com", SMTPPort: 587, SMTPSecure: true, SMTPUser: "u", Password: "p"},
+			[]string{SMTPPasswordKey},
+			map[string]any{"global.email.smtp.host": "mail.example.com", "global.email.smtp.port": 587, "global.email.smtp.secure": true, "global.email.smtp.user": "u"}},
+		"smtp relay": {Email{Provider: "smtp", From: "a@example.com", SMTPHost: "relay", SMTPPort: 25}, nil,
+			map[string]any{"global.email.existingSecret": nil, "global.email.smtp.user": nil}},
+		"ses with keys": {Email{Provider: "ses", From: "a@example.com", SESRegion: "eu-west-1", AccessKeyID: "AKIA", SecretAccessKey: "s"},
+			[]string{SESKeyIDKey, SESSecretKey}, map[string]any{"global.email.ses.region": "eu-west-1"}},
+		"ses with the IAM role": {Email{Provider: "ses", From: "a@example.com", SESRegion: "eu-west-1"}, nil,
+			map[string]any{"global.email.existingSecret": nil}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := Answers{Email: &c.email}
+			v := a.Values()
+			for path, want := range c.values {
+				if got := values.Get(v, strings.Split(path, ".")...); got != want {
+					t.Errorf("%s = %v, want %v", path, got, want)
+				}
+			}
+			b, _ := json.Marshal(v)
+			for _, secret := range []string{"re_x", `"p"`, "AKIA", `"s"`} {
+				if strings.Contains(string(b), secret) {
+					t.Errorf("credential %s leaked into values: %s", secret, b)
+				}
+			}
+			list, err := a.Secrets("nt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var keys []string
+			for _, s := range list {
+				for k := range s.Data {
+					keys = append(keys, k)
+				}
+			}
+			sort.Strings(keys)
+			if strings.Join(keys, ",") != strings.Join(c.keys, ",") {
+				t.Errorf("Secret keys = %v, want %v", keys, c.keys)
+			}
+		})
+	}
+}
+
+func TestRedisURLEscapesTheCredentials(t *testing.T) {
+	r := Redis{Host: "cache.example.com", Port: 6380, Username: "app", Password: "a/b+c=@:", TLS: true}
+	got := r.URL()
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pw, _ := u.User.Password(); pw != r.Password || u.User.Username() != "app" || u.Host != "cache.example.com:6380" || u.Path != "/0" || u.Scheme != "rediss" {
+		t.Errorf("%s does not parse back: %+v", got, u)
+	}
+	if got := (Redis{Host: "cache", Port: 6379}).URL(); got != "redis://cache:6379/0" {
+		t.Errorf("no password: %s", got)
 	}
 }

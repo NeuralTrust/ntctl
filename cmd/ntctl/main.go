@@ -36,6 +36,8 @@ Commands:
   support-bundle  Write a redacted .tar.gz for NeuralTrust support
   preflight   Check a cluster against what an install needs, without changing anything
   render      Print the manifests an install would apply (same output as helm template)
+  secrets     Create or print the Secrets the chart's secrets generator would make, for
+              installs whose GitOps tool skips Helm hooks, or that keep credentials in a vault
   version     Print the ntctl version and the latest chart version
 
 Console:
@@ -85,6 +87,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runVersion(ctx, args[1:], stdout)
 	case "render":
 		err = runRender(ctx, args[1:], stdout)
+	case "secrets":
+		err = runSecrets(ctx, args[1:], stdout)
 	case "preflight":
 		err = runPreflight(ctx, args[1:], stdout)
 	case "status":

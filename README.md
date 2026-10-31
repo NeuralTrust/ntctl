@@ -137,6 +137,7 @@ export NT_REDIS_URL='rediss://:password@cache.example.com:6380'
 export NT_REGISTRY_USERNAME=robot NT_REGISTRY_PASSWORD=...
 # external and saas installs only:
 export ONPREM_SUPERADMIN_EMAIL=admin@example.com ONPREM_SUPERADMIN_PASSWORD=...
+export NT_EMAIL_PROVIDER=resend NT_EMAIL_FROM=alerts@example.com NT_RESEND_API_KEY=...
 
 ntctl install --yes --domain platform.example.com \
   --image-registry registry.example.com/neuraltrust
@@ -150,6 +151,7 @@ ntctl install --yes --domain platform.example.com \
 | Your own Redis | | `NT_REDIS_URL` |
 | Where the control plane runs | `--mode` | |
 | The console's first admin (external and saas) | | `ONPREM_SUPERADMIN_EMAIL`, `ONPREM_SUPERADMIN_PASSWORD` |
+| How the console sends email (external and saas): `none` (the default), `resend`, `smtp` or `ses` | | `NT_EMAIL_PROVIDER`, `NT_EMAIL_FROM`, `NT_EMAIL_REPLY_TO`; `NT_RESEND_API_KEY`; `NT_SMTP_HOST`, `NT_SMTP_PORT` (587), `NT_SMTP_SECURE` (true), `NT_SMTP_USER`, `NT_SMTP_PASSWORD`; `NT_SES_REGION`, `NT_SES_ACCESS_KEY_ID`, `NT_SES_SECRET_ACCESS_KEY` (unset: the pods' IAM role) |
 
 Connection strings and passwords are environment-only, so they stay out of
 shell history.
@@ -159,12 +161,15 @@ database user and one Redis. In external mode every service has its own
 database user: configure that with `-f`, following
 `values-managed-datastores.yaml.example` in the chart repository.
 
-ntctl names the Secrets it creates for your datastores the way the chart's
-examples do: `external-postgresql` (key `POSTGRES_PASSWORD`) and
-`external-redis` (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`,
-`REDIS_PASSWORD`, `REDIS_TLS`). Installs made by earlier versions keep their
-`ntctl-postgresql` and `ntctl-redis` Secrets, since an upgrade reuses the values
-and renames nothing.
+ntctl names the Secrets it creates the way the chart's examples do:
+`external-postgresql` (key `POSTGRES_PASSWORD`), `external-redis`
+(`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_TLS`:
+the hybrid workloads load it whole, endpoint included; and `REDIS_URL`, which
+data-plane-api reads) and, for the email
+provider you choose, `email-credentials` (`RESEND_API_KEY`, `SMTP_PASSWORD`, or
+`SES_ACCESS_KEY_ID` and `SES_SECRET_ACCESS_KEY`). Installs made by earlier
+versions keep their `ntctl-postgresql` and `ntctl-redis` Secrets, since an
+upgrade reuses the values and renames nothing.
 
 ### When only you may create Secrets
 
@@ -182,6 +187,32 @@ ntctl install -f neuraltrust-values.yaml
 ```
 
 The second run finds the Secrets in place, keeps them, and installs.
+
+### Generated credentials
+
+The chart generates every credential the platform makes for itself, database
+passwords, signing keys and certificates among them, in a Job it runs before
+each install and upgrade, the secrets generator. It writes them once into
+`platform-secrets` and its TLS Secrets, outside the release, so no later
+render or GitOps sync changes them. Helm, ntctl, Argo CD and Flux run it with
+nothing to configure.
+
+Two cases need the Secrets made beforehand:
+
+```sh
+# A GitOps tool that skips Helm hooks: create them before the first sync.
+ntctl secrets create -f neuraltrust-values.yaml
+# Credentials kept in a vault: print them, with their values, to store there.
+ntctl secrets print -f neuraltrust-values.yaml --output json > generated.json
+```
+
+Both render the chart with your values, so the keys follow the products and
+install shape you run, and both read the namespace first: values in use are
+kept, values earlier chart versions rendered are adopted, and only what is
+missing is generated. `create` never changes a value that is already there.
+A Secret the External Secrets Operator creates is only checked by the
+generator, never written: it stops, naming the keys missing.
+`print --offline` generates everything without reading the cluster.
 
 ### Signed in to the console
 
@@ -249,12 +280,13 @@ one. The mode of an install cannot change in place.
 | `ntctl rollback` | Returns an install to an earlier revision (`--to N`), showing what changes first |
 | `ntctl history` | The revisions of an install |
 | `ntctl adopt` | Checks that an install made with plain `helm` can be managed with ntctl, changing nothing (`--chart` for air-gapped clusters) |
-| `ntctl uninstall` | Removes an install; its volumes and the Secrets ntctl created are kept unless you pass `--delete-data` / `--delete-secrets` |
+| `ntctl uninstall` | Removes an install; its volumes and generated credentials, and the Secrets ntctl created, are kept unless you pass `--delete-data` / `--delete-secrets` |
 | `ntctl status` | Workload readiness, pods that need attention, and DNS records |
 | `ntctl doctor` | Says what is wrong with an install and how to fix it (`--output json`) |
 | `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
 | `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`) |
-| `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values |
+| `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values. Apply them with a tool that runs Helm hooks, or the secrets generator does not run |
+| `ntctl secrets create` / `print` | Creates, or prints with their values, the Secrets the chart's secrets generator would make: for GitOps tools that skip hooks, and vaults (see [Generated credentials](#generated-credentials)) |
 | `ntctl version` | The `ntctl` version, the latest chart version, and whether a newer `ntctl` is out |
 | `ntctl login` / `logout` | Sign in to the console in the browser, or sign out and end the session |
 | `ntctl auth status` | Who is signed in, to which console, and the selected organization |
@@ -333,12 +365,29 @@ cannot do in place:
 - a new selector on a Deployment, DaemonSet or StatefulSet;
 - a new StatefulSet service name or volume template;
 - a new storage class or access mode on a volume;
-- removing a Secret, a volume or a StatefulSet;
-- removing a key from a Secret.
+- removing a Secret, a volume or a StatefulSet, unless it carries
+  `helm.sh/resource-policy: keep`: Helm leaves those in the cluster, and the
+  diff lists them as kept, no longer managed;
+- removing a key from a Secret, even a kept one, that a workload of the new
+  release still reads. A key nothing reads any more, or one that held an empty
+  value, is listed as removed and does not stop it.
 
 Pass `--allow-breaking` only when you accept that those resources are deleted
 and recreated. If the upgrade does not become ready, the last working revision
 is restored.
+
+An install whose chart still renders its generated credentials on every
+upgrade, as charts before 3.7 did, is told when the target chart can move them
+onto the secrets generator, unless it turned the generator off
+(`global.secrets.generator.enabled: false`). `--secrets-generator` makes that move: the generator copies
+every value in use into `platform-secrets` before the upgrade, and the Secrets
+the chart rendered them in stay in the cluster, no longer read. ntctl never
+makes the move unasked.
+
+A rollback runs none of the chart's install or upgrade hooks, the secrets
+generator among them. `ntctl rollback` therefore stops when the revision it
+returns to reads a Secret that is no longer in the cluster, such as one of the
+leftovers below deleted since.
 
 When an install or upgrade did not become ready, `ntctl doctor` says why. Once
 the cause is fixed, `ntctl upgrade` applies the failed revision again, even
@@ -438,7 +487,7 @@ and a fix for each finding:
 |---|---|
 | `NT-DR-001` | The release failed, or an install or upgrade was interrupted |
 | `NT-DR-010` | Images do not pull, grouped by cause: credentials refused, image or tag missing, registry unreachable |
-| `NT-DR-011` | A container cannot start because a Secret or ConfigMap is missing |
+| `NT-DR-011` | A container cannot start because a Secret or ConfigMap is missing; for one the secrets generator writes, it says why the generator did not run |
 | `NT-DR-012` | A container keeps crashing; its last log lines are shown |
 | `NT-DR-013` | Pods cannot be scheduled, with the scheduler's reason |
 | `NT-DR-014` | A container was killed for exceeding its memory limit |
@@ -447,6 +496,7 @@ and a fix for each finding:
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
 | `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
+| `NT-DR-024` | Information: Secrets earlier chart versions left that nothing reads any more, with the command that deletes them. Upgrades keep them on purpose; deleting them is optional |
 | `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP, and `NT-PF-011` about a console admin password set in the values, which Helm keeps in the release history |
 
 If you need help, send NeuralTrust support a bundle:
@@ -481,8 +531,12 @@ ntctl uninstall                                  # asks you to type the namespac
 ntctl uninstall --yes --delete-data --delete-secrets
 ```
 
-`uninstall` removes the release and every resource it created. Your volumes
-and the Secrets ntctl created stay unless you ask, and so does the namespace.
+`uninstall` removes the release and every resource it manages. Your volumes,
+the Secrets holding the install's generated credentials (`platform-secrets`, its
+TLS Secrets, and those the chart keeps on purpose), and the Secrets ntctl
+created stay unless you ask, and so does the namespace. `--delete-data` deletes
+the volumes and the generated credentials together, since those keys decrypt
+what the volumes hold.
 Private TrustGate and TrustGuard instances stay in the console; delete them
 there if you no longer need them.
 
