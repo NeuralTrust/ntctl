@@ -393,3 +393,37 @@ metadata: {name: postgresql-secrets}
 		t.Error("leftovers reported while platform-secrets is missing")
 	}
 }
+
+func TestRerenderedCredentials(t *testing.T) {
+	helmLabels := map[string]string{"app.kubernetes.io/managed-by": "Helm"}
+	argo := map[string]string{"argocd.argoproj.io/tracking-id": "nt:/Secret:neuraltrust/platform-secrets"}
+	shared := func(labels, ann map[string]string) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "platform-secrets", Namespace: ns, Labels: labels, Annotations: ann}}
+	}
+	app := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "control-plane-app", Namespace: ns}}
+	cases := map[string]struct {
+		rel     *release.Release
+		objs    []runtime.Object
+		want    bool
+		fixHint string
+	}{
+		"hybrid under Argo":           {nil, []runtime.Object{shared(helmLabels, argo)}, true, "generator.enabled: true"},
+		"external under Argo":         {nil, []runtime.Object{shared(helmLabels, argo), app}, true, "3.10 or later"},
+		"applied without a release":   {nil, []runtime.Object{shared(helmLabels, nil)}, true, ""},
+		"a Helm release, no Argo":     {rel(rcommon.StatusDeployed, ""), []runtime.Object{shared(helmLabels, nil)}, false, ""},
+		"the generator's own":         {nil, []runtime.Object{shared(map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}, argo)}, false, ""},
+		"taken over by the generator": {nil, []runtime.Object{shared(helmLabels, map[string]string{"neuraltrust.ai/secrets-generator": "managed"})}, false, ""},
+		"no platform-secrets":         {nil, nil, false, ""},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, ok := run(t, c.rel, c.objs...)["NT-DR-025"]
+			if ok != c.want {
+				t.Fatalf("NT-DR-025 reported = %v, want %v: %+v", ok, c.want, r)
+			}
+			if ok && (r.Severity != preflight.Fail || !strings.Contains(r.Fix, c.fixHint)) {
+				t.Errorf("finding = %+v", r)
+			}
+		})
+	}
+}

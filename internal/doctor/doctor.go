@@ -19,6 +19,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -196,6 +197,53 @@ func leftovers(ctx context.Context, in Input) (*preflight.Result, error) {
 		Message: fmt.Sprintf("%d Secrets from earlier chart versions are no longer read: %s", len(names), strings.Join(names, ", ")),
 		Fix: why + " To remove them: kubectl -n " + in.Namespace + " delete secret " + strings.Join(names, " ") + ". " +
 			"A rollback to a revision that still read one stops until it is restored.",
+	}, nil
+}
+
+// argoTracking is the annotation Argo CD sets on every object an Application
+// manages (annotation-based tracking, the default since Argo CD 3).
+const argoTracking = "argocd.argoproj.io/tracking-id"
+
+// rerendered reports an install whose chart still renders its generated
+// credentials into platform-secrets while something other than Helm applies
+// it. Argo CD and similar tools render with helm template, which cannot read
+// the live Secret, so every hard refresh or manifest-cache expiry mints new
+// signing keys and encryption keys: issued tokens stop verifying, and data
+// encrypted at rest can no longer be read. A platform-secrets the secrets
+// generator manages is never re-rendered, so it raises nothing.
+func rerendered(ctx context.Context, in Input) (*preflight.Result, error) {
+	s, err := in.Clientset.CoreV1().Secrets(in.Namespace).Get(ctx, generator.Store, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading Secret %s: %w", generator.Store, err)
+	}
+	if generator.Owns(s) || s.Labels["app.kubernetes.io/managed-by"] != "Helm" {
+		return nil, nil
+	}
+	tool := ""
+	switch {
+	case s.Annotations[argoTracking] != "":
+		tool = "Argo CD"
+	case in.Current == nil:
+		tool = "a tool other than Helm, with no Helm release in the namespace"
+	default:
+		return nil, nil
+	}
+	fix := "Upgrade to a chart that runs the secrets generator (3.10 or later), which takes the live values over once and never renders them again. " +
+		"`ntctl upgrade --secrets-generator` does the same for a release Helm applies."
+	if _, err := in.Clientset.AppsV1().Deployments(in.Namespace).Get(ctx, "control-plane-app", metav1.GetOptions{}); apierrors.IsNotFound(err) {
+		fix = "Set global.secrets.generator.enabled: true, and keep it: the generator then takes the live values over once and never renders them again. " +
+			"It runs in the control-plane app image, so a registry mirror must carry that image too."
+	}
+	return &preflight.Result{
+		Code: "NT-DR-025", Check: "rotation", Severity: preflight.Fail,
+		Message: fmt.Sprintf("%s is rendered by the chart and applied by %s, which renders without reading the cluster: each hard refresh generates new signing and encryption keys", generator.Store, tool),
+		Detail: []string{
+			"Tokens already issued with those keys stop verifying, and data encrypted at rest with them can no longer be read.",
+		},
+		Fix: fix + " Credentials issued before the last rotation have to be issued again; see the chart's SECRETS.md, \"Recovering an install whose credentials rotated\".",
 	}, nil
 }
 
@@ -443,6 +491,11 @@ func podFindings(ctx context.Context, in Input, pods []corev1.Pod, stale map[str
 func resourceFindings(ctx context.Context, in Input) ([]preflight.Result, error) {
 	var out []preflight.Result
 	if r, err := leftovers(ctx, in); err != nil {
+		return nil, err
+	} else if r != nil {
+		out = append(out, *r)
+	}
+	if r, err := rerendered(ctx, in); err != nil {
 		return nil, err
 	} else if r != nil {
 		out = append(out, *r)

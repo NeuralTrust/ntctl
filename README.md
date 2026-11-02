@@ -497,6 +497,7 @@ and a fix for each finding:
 | `NT-DR-022` | Ingresses have no address yet |
 | `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
 | `NT-DR-024` | Information: Secrets earlier chart versions left that nothing reads any more, with the command that deletes them. Upgrades keep them on purpose; deleting them is optional |
+| `NT-DR-025` | `platform-secrets` is rendered by the chart and applied by Argo CD (or another tool that renders without reading the cluster), so every hard refresh generates new signing and encryption keys. It gives the fix for the install's shape and points at the recovery steps |
 | `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP, and `NT-PF-011` about a console admin password set in the values, which Helm keeps in the release history |
 
 If you need help, send NeuralTrust support a bundle:
