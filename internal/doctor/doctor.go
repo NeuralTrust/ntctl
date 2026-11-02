@@ -222,6 +222,13 @@ func rerendered(ctx context.Context, in Input) (*preflight.Result, error) {
 	if generator.Owns(s) || s.Labels["app.kubernetes.io/managed-by"] != "Helm" {
 		return nil, nil
 	}
+	// Charts 3.7 to 3.9 ran the generator into neuraltrust-generated and left
+	// a platform-secrets rendered before them in place, unread: no render
+	// writes it once a generator Secret exists that is newer than its last
+	// write.
+	if leftover, err := predatesGenerator(ctx, in, s); err != nil || leftover {
+		return nil, err
+	}
 	tool := ""
 	switch {
 	case s.Annotations[argoTracking] != "":
@@ -245,6 +252,35 @@ func rerendered(ctx context.Context, in Input) (*preflight.Result, error) {
 		},
 		Fix: fix + " Credentials issued before the last rotation have to be issued again; see the chart's SECRETS.md, \"Recovering an install whose credentials rotated\".",
 	}, nil
+}
+
+// predatesGenerator reports whether a Secret the generator manages was created
+// after s was last written: s is then a leftover no render touches any more.
+func predatesGenerator(ctx context.Context, in Input, s *corev1.Secret) (bool, error) {
+	list, err := in.Clientset.CoreV1().Secrets(in.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("listing Secrets: %w", err)
+	}
+	written := lastWrite(s)
+	for i := range list.Items {
+		g := &list.Items[i]
+		if g.Name != s.Name && generator.Owns(g) && g.CreationTimestamp.After(written) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// lastWrite is when an object was last changed, from its managed fields, or
+// its creation when it carries none.
+func lastWrite(s *corev1.Secret) time.Time {
+	t := s.CreationTimestamp.Time
+	for _, f := range s.ManagedFields {
+		if f.Time != nil && f.Time.After(t) {
+			t = f.Time.Time
+		}
+	}
+	return t
 }
 
 // releaseCheck reports the Helm release's own state.
