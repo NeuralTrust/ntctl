@@ -414,6 +414,15 @@ func TestRerenderedCredentials(t *testing.T) {
 		"the generator's own":         {nil, []runtime.Object{shared(map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}, argo)}, false, ""},
 		"taken over by the generator": {nil, []runtime.Object{shared(helmLabels, map[string]string{"neuraltrust.ai/secrets-generator": "managed"})}, false, ""},
 		"no platform-secrets":         {nil, nil, false, ""},
+		// 3.7 to 3.9: the generator wrote neuraltrust-generated after the
+		// rendered platform-secrets was last written, so nothing renders it.
+		"a leftover beside the earlier generator": {nil, []runtime.Object{aged(shared(helmLabels, argo), -48*time.Hour),
+			aged(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "neuraltrust-generated", Namespace: ns,
+				Labels: map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}}}, -24*time.Hour)}, false, ""},
+		// Rendered again after the generator Secret appeared (turned off again).
+		"rendered after the generator Secret": {nil, []runtime.Object{aged(shared(helmLabels, argo), -1*time.Hour),
+			aged(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "neuraltrust-generated", Namespace: ns,
+				Labels: map[string]string{"app.kubernetes.io/managed-by": "neuraltrust-secrets-generator"}}}, -24*time.Hour)}, true, ""},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -426,4 +435,10 @@ func TestRerenderedCredentials(t *testing.T) {
 			}
 		})
 	}
+}
+
+// aged sets a Secret's creation time relative to now.
+func aged(s *corev1.Secret, d time.Duration) *corev1.Secret {
+	s.CreationTimestamp = metav1.NewTime(time.Now().Add(d))
+	return s
 }
