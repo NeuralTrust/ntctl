@@ -18,7 +18,7 @@ const Ref = "oci://europe-west1-docker.pkg.dev/neuraltrust-app-prod/helm-charts/
 
 // Supported is the chart range this ntctl release installs when no version is
 // pinned.
-const Supported = ">=3.0.0 <4.0.0"
+const Supported = ">=3.0.0 <5.0.0"
 
 // Source says where to load the chart from.
 type Source struct {

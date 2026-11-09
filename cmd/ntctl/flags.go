@@ -70,6 +70,8 @@ type opts struct {
 	// addingOnly marks install's add-products flow, which keeps every
 	// setting of the release and asks about nothing but the products.
 	addingOnly bool
+	// loaded is the chart --chart / --version name, loaded once per command.
+	loaded *chart.Loaded
 }
 
 func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *flag.FlagSet {

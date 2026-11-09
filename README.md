@@ -150,11 +150,22 @@ ntctl install --yes --domain platform.example.com \
 | Your own PostgreSQL | | `NT_POSTGRES_URL` |
 | Your own Redis | | `NT_REDIS_URL` |
 | Where the control plane runs | `--mode` | |
+| Where TrustGuard's firewall runs (chart 4.x): `in-cluster` or `hosted` | `--firewall` | `NT_FIREWALL_JWT` for the hosted one |
 | The console's first admin (external and saas) | | `ONPREM_SUPERADMIN_EMAIL`, `ONPREM_SUPERADMIN_PASSWORD` |
 | How the console sends email (external and saas): `none` (the default), `resend`, `smtp` or `ses` | | `NT_EMAIL_PROVIDER`, `NT_EMAIL_FROM`, `NT_EMAIL_REPLY_TO`; `NT_RESEND_API_KEY`; `NT_SMTP_HOST`, `NT_SMTP_PORT` (587), `NT_SMTP_SECURE` (true), `NT_SMTP_USER`, `NT_SMTP_PASSWORD`; `NT_SES_REGION`, `NT_SES_ACCESS_KEY_ID`, `NT_SES_SECRET_ACCESS_KEY` (unset: the pods' IAM role) |
 
 Connection strings and passwords are environment-only, so they stay out of
 shell history.
+
+From chart 4.0.0, TrustGuard uses the NeuralTrust-hosted firewall unless the
+values say otherwise, and the hosted firewall needs this install's
+`FIREWALL_JWT`. When TrustGuard is installed and the values leave the firewall
+open, install asks whether to run it in this cluster (the default) or use the
+hosted one. Hosted takes the JWT from `NT_FIREWALL_JWT` or asks for it with
+input hidden, and stores it in the Secret `trustguard-firewall`
+(`FIREWALL_JWT`). With `--yes`, `NT_FIREWALL_JWT` picks the hosted firewall;
+without it the firewall runs in the cluster. Charts before 4.0.0 always run it
+in the cluster.
 
 The PostgreSQL and Redis questions apply to hybrid installs, which share one
 database user and one Redis. In external mode every service has its own
@@ -375,6 +386,16 @@ cannot do in place:
 Pass `--allow-breaking` only when you accept that those resources are deleted
 and recreated. If the upgrade does not become ready, the last working revision
 is restored.
+
+An upgrade from a 3.x chart to 4.x keeps TrustGuard's firewall in the cluster.
+Chart 4.0.0 moved the default to the NeuralTrust-hosted firewall, which needs a
+`FIREWALL_JWT` the install never had, so ntctl writes
+`global.firewall.deploy: true` into the release's values and says so before
+you confirm. To move to the hosted firewall, pass in `-f`
+`global.firewall.deploy: false` and `trustguard.firewall.jwtExistingSecret.name`
+naming a Secret with its `FIREWALL_JWT`. `ntctl adopt` writes the same
+`deploy: true` into the values file of a 3.x release, which renders exactly as
+before on that chart.
 
 An install whose chart still renders its generated credentials on every
 upgrade, as charts before 3.7 did, is told when the target chart can move them

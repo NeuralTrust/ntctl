@@ -58,6 +58,8 @@ Credentials are read from the environment, or asked for with input hidden:
   NT_POSTGRES_URL   postgres://user:password@host:5432/database?sslmode=require
   NT_REDIS_URL      redis://:password@host:6379 (rediss:// for TLS)
   NT_REGISTRY_USERNAME / NT_REGISTRY_PASSWORD   for --image-registry
+  NT_FIREWALL_JWT   chart 4.x: TrustGuard's FIREWALL_JWT for the NeuralTrust-hosted
+                    firewall (--firewall hosted); without it the firewall runs here
 External and saas installs also ask how the console sends email: none (the
 default, set up later with global.email), Resend, SMTP or Amazon SES. The
 provider's settings go in the values and its credential in the Secret
@@ -93,6 +95,9 @@ type installFlags struct {
 	instances     map[api.Product]string
 	// stopEarly ends the wait on a lasting failure waiting does not fix.
 	stopEarly bool
+	// firewall is --firewall: in-cluster or hosted; "" asks, or takes
+	// in-cluster without a terminal unless NT_FIREWALL_JWT is set.
+	firewall string
 }
 
 func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writer) error {
@@ -109,6 +114,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
 	fs.BoolVar(&f.stopEarly, "stop-early", true, "stop waiting once a failure that waiting does not fix (an image that cannot be pulled, a missing Secret, a crash loop, a refused config-sync token) has lasted "+watchGiveUp.String()+"; false waits the full --timeout")
+	fs.StringVar(&f.firewall, "firewall", "", "chart 4.x with TrustGuard: in-cluster runs the firewall here (global.firewall.deploy: true); hosted uses the NeuralTrust-hosted firewall with the FIREWALL_JWT in NT_FIREWALL_JWT (default: ask; without a terminal, hosted when NT_FIREWALL_JWT is set, else in-cluster)")
 	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to install (default: create one)")
 	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to install (default: create one)")
@@ -123,6 +129,8 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 		return errors.New("--secrets-mode print needs --save-values: the second run installs from that file")
 	case f.print() && f.replace:
 		return errors.New("--secrets-mode print changes no Secret; replace one yourself instead of passing --replace-secrets")
+	case f.firewall != "" && f.firewall != firewallInCluster && f.firewall != firewallHosted:
+		return fmt.Errorf("--firewall must be %s or %s, not %q", firewallInCluster, firewallHosted, f.firewall)
 	}
 	in := prompt.New(ctx, stdin, out, !f.yes)
 	sess, err := openSession()
@@ -179,6 +187,22 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
+	// Chart 4.x sends TrustGuard to the hosted firewall unless told
+	// otherwise; settle where it runs before anything is checked.
+	ch, err := o.loadChart()
+	if err != nil {
+		return err
+	}
+	fwVals, fwSecret, err := firewallChoice(ctx, in, cs, ns, f, ch.Version, vals)
+	if err != nil {
+		return err
+	}
+	if fwVals != nil {
+		o.extra = values.Merge(orEmpty(o.extra), fwVals)
+	}
+	if fwSecret != nil {
+		create = append(create, fwSecret)
+	}
 	// Tokens come from the environment, else from the console when signed
 	// in, else from the operator. Printed, they are placeholders.
 	tokens, need, err := tokenSecrets(ctx, in, out, cs, ns, sess, vals, enabledProducts(vals), f.replace, f.print())
@@ -225,6 +249,9 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fmt.Fprintf(out, "  Telemetry:  operational traces and metrics %s\n", values.TelemetryState(p.values))
 	if cp, _ := values.DialedControlPlane(p.values); cp != "" && values.DeploymentMode(p.values) == "hybrid" {
 		fmt.Fprintf(out, "  Connects:   control plane at %s\n", cp)
+	}
+	if line := describeFirewall(p.chart.Version, p.values); line != "" {
+		fmt.Fprintf(out, "  Firewall:   %s\n", line)
 	}
 	for _, line := range answers.Summary(p.values) {
 		fmt.Fprintf(out, "  %s\n", line)

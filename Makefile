@@ -21,6 +21,9 @@ test:
 # Installs on the cluster in NTCTL_E2E_KUBECONFIG, e.g. a local kind cluster:
 #   kind get kubeconfig --name kind > /tmp/kind.kubeconfig
 #   NTCTL_E2E_KUBECONFIG=/tmp/kind.kubeconfig make test-e2e
+# The real-chart tests install the newest supported chart. Pin the one under
+# test with NTCTL_E2E_CHART_VERSION=3.15.1 (a version or constraint), or test
+# a local checkout with NTCTL_E2E_CHART=../neuraltrust-platform.
 .PHONY: test-e2e
 test-e2e:
 	go test -tags e2e -run E2E -count=1 -timeout 15m -v ./cmd/ntctl/

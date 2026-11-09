@@ -260,6 +260,9 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 	if line := connects(reuse(p.current.Config, p.values), signedInConsole()); line != "" {
 		fmt.Fprintln(out, line)
 	}
+	for _, n := range p.notes {
+		fmt.Fprintln(out, n)
+	}
 	if o.chartPath == "" && from != to {
 		releaseNotes(ctx, out, from, to, f.fullNotes)
 	}
@@ -715,10 +718,20 @@ func runAdopt(ctx context.Context, args []string, out io.Writer) error {
 	}
 	clean, _ := redact.Value(deepCopy(rel.Config)).(map[string]any)
 	removed := redactedPaths(rel.Config, clean, "")
+	// Chart 4.0.0 moves an unset global.firewall.deploy to the hosted
+	// firewall. The file records where the firewall runs today, so a later
+	// upgrade to 4.x keeps it; on this chart it renders the same.
+	pin := values.PinFirewall(want, clean)
+	if pin != nil {
+		clean = values.Merge(orEmpty(clean), pin)
+	}
 	if err := values.Save(file, clean); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Wrote the release's values to %s.\n", file)
+	if pin != nil {
+		fmt.Fprintln(out, "It sets global.firewall.deploy: true, which this chart already defaults to: chart 4.x defaults TrustGuard to the NeuralTrust-hosted firewall, and this keeps the firewall in the cluster when you upgrade.")
+	}
 	if len(removed) > 0 {
 		fmt.Fprintf(out, "%d values looked like secrets and were left out: %s\n"+
 			"Keep them in your own values file, or better in a Secret the chart reads (existingSecret).\n",

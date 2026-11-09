@@ -5,10 +5,15 @@
 //
 //	kind get kubeconfig --name kind > /tmp/kind.kubeconfig
 //	NTCTL_E2E_KUBECONFIG=/tmp/kind.kubeconfig make test-e2e
+//
+// The tests that install the real chart take the newest supported release
+// unless NTCTL_E2E_CHART_VERSION pins one (a version or constraint), or
+// NTCTL_E2E_CHART names a local chart directory or .tgz to test instead.
 package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -69,6 +74,42 @@ func secretValue(t *testing.T, cs kubernetes.Interface, ns, name, key string) st
 	return string(s.Data[key])
 }
 
+// chartArgs pins the chart the real-chart tests install: NTCTL_E2E_CHART is a
+// local chart directory or .tgz, NTCTL_E2E_CHART_VERSION a version or
+// constraint. Unset, ntctl takes the newest supported release.
+func chartArgs() []string {
+	var args []string
+	if c := os.Getenv("NTCTL_E2E_CHART"); c != "" {
+		args = append(args, "--chart", c)
+	}
+	if v := os.Getenv("NTCTL_E2E_CHART_VERSION"); v != "" {
+		args = append(args, "--version", v)
+	}
+	return args
+}
+
+// unpullable makes every image of the install come from a repository on the
+// NeuralTrust registry host that has never served an image, with a key the
+// registry refuses. No node can have those images cached, so the pull fails
+// on the credentials even on a node that ran a full install before, and
+// IfNotPresent cannot start the pods from its cache. The key is the pull
+// Secret's password, so key must not leak anywhere else.
+func unpullable(t *testing.T, key string) []string {
+	t.Helper()
+	t.Setenv("NT_REGISTRY_USERNAME", "_json_key")
+	t.Setenv("NT_REGISTRY_PASSWORD", key)
+	return []string{"--image-registry", "europe-west1-docker.pkg.dev/ntctl-e2e-unpullable/neuraltrust"}
+}
+
+// args joins command-line pieces.
+func args(parts ...[]string) []string {
+	var out []string
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
 // noCanary fails when a file holds a token.
 func noCanary(t *testing.T, path string) {
 	t.Helper()
@@ -83,7 +124,7 @@ func noCanary(t *testing.T, path string) {
 
 // TestE2EInstallWithTheChart installs the published chart signed in: ntctl
 // creates both private instances and fills the Secrets the chart reads with
-// their tokens. Images cannot be pulled without a real key, so the install is
+// their tokens. The images cannot be pulled (see unpullable), so the install is
 // expected not to become ready, and nothing is recorded in the console.
 func TestE2EInstallWithTheChart(t *testing.T) {
 	const ns = "ntctl-e2e-chart"
@@ -95,13 +136,10 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	ntctl(t, 0, "login", "--app-url", srv.URL)
 
 	dir := t.TempDir()
-	key := filepath.Join(dir, "registry-key.json")
-	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"not-a-real-key"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	images := unpullable(t, `{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"not-a-real-key"}`)
 	saved := filepath.Join(dir, "values.yaml")
-	out := ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
-		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", saved, "--timeout", "45s")
+	out := ntctl(t, 1, args([]string{"install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
+		"--products", "trustgate,trustguard", "--save-values", saved, "--timeout", "45s"}, images, chartArgs())...)
 	for _, want := range []string{"tokens from the console", `Created private TrustGate "e2e.example.com"`, `Created private TrustGuard "e2e.example.com"`,
 		"tokens for the control plane at cp.example.com", "install did not complete",
 		// The failure comes with its cause: the images cannot be pulled.
@@ -154,8 +192,8 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 
 	// The same install again finds the release failed: it says how to get
 	// out, changes nothing and asks the console for nothing.
-	out = ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
-		"--products", "trustgate,trustguard", "--registry-key", key, "--save-values", "")
+	out = ntctl(t, 1, args([]string{"install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "e2e.example.com",
+		"--products", "trustgate,trustguard", "--save-values", ""}, images, chartArgs())...)
 	if !strings.Contains(out, "revision 1 failed") || !strings.Contains(out, "ntctl doctor") {
 		t.Errorf("a second install on a failed release did not say how to recover:\n%s", out)
 	}
@@ -166,7 +204,11 @@ func TestE2EInstallWithTheChart(t *testing.T) {
 	// Upgrade on the failed release applies it again instead of reporting
 	// that it is up to date. The images still cannot be pulled, so it fails
 	// again, and with no working revision it stays in place.
-	out = ntctl(t, 1, "upgrade", "--yes", "--ignore-capacity", "--namespace", ns, "--version", rel.Chart.Metadata.Version, "--timeout", "30s")
+	same := []string{"--version", rel.Chart.Metadata.Version}
+	if c := os.Getenv("NTCTL_E2E_CHART"); c != "" {
+		same = []string{"--chart", c}
+	}
+	out = ntctl(t, 1, args([]string{"upgrade", "--yes", "--ignore-capacity", "--namespace", ns, "--timeout", "30s"}, same)...)
 	for _, want := range []string{"Revision 1 failed; this applies it again", "No revision has worked yet", "left in place"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("upgrade of a failed release: output lacks %q:\n%s", want, out)
@@ -325,12 +367,9 @@ func TestE2EDoctorAndSupportBundle(t *testing.T) {
 		t.Setenv(env, "CANARY-"+strings.ToLower(env)+"-x9f3k2m8q7w1z5r4t6")
 	}
 	dir := t.TempDir()
-	key := filepath.Join(dir, "registry-key.json")
-	if err := os.WriteFile(key, []byte(`{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"CANARY-registry-key"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ntctl(t, 1, "install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "doctor.example.com",
-		"--products", "trustgate", "--registry-key", key, "--save-values", "", "--timeout", "30s")
+	images := unpullable(t, `{"type":"service_account","project_id":"e2e","client_email":"e2e@e2e.iam.gserviceaccount.com","private_key":"CANARY-registry-key"}`)
+	ntctl(t, 1, args([]string{"install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "doctor.example.com",
+		"--products", "trustgate", "--save-values", "", "--timeout", "30s"}, images, chartArgs())...)
 
 	out := ntctl(t, 3, "doctor", "--namespace", ns)
 	for _, want := range []string{"NT-DR-001", "release neuraltrust-platform revision 1", "workloads cannot pull their images: the registry refused the credentials", "gcr-secret", "fix (NT-DR-010)"} {
@@ -379,6 +418,50 @@ func TestE2EDoctorAndSupportBundle(t *testing.T) {
 		if !names[want] {
 			t.Errorf("the bundle lacks %s", want)
 		}
+	}
+}
+
+// TestE2EUpgradeTo4KeepsTheFirewall installs TrustGuard on chart 3.15.1,
+// whose firewall runs in the cluster, and checks that the upgrade to 4.x,
+// whose default is the NeuralTrust-hosted firewall, keeps it there: ntctl
+// says so, and the plan removes no firewall workload. It is a dry run, so the
+// images need not be pullable.
+func TestE2EUpgradeTo4KeepsTheFirewall(t *testing.T) {
+	const ns = "ntctl-e2e-firewall"
+	cluster(t, ns)
+	t.Setenv("NTCTL_CONFIG_DIR", t.TempDir())
+	t.Setenv("NT_FIREWALL_JWT", "")
+	for _, env := range []string{"NT_TRUSTGUARD_CONFIG_SYNC_TOKEN", "NT_TRUSTGUARD_ENROLMENT_TOKEN"} {
+		t.Setenv(env, "CANARY-"+strings.ToLower(env))
+	}
+	images := unpullable(t, `{"type":"service_account","project_id":"e2e","private_key":"CANARY-registry-key"}`)
+	ntctl(t, 1, args([]string{"install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "firewall.example.com",
+		"--products", "trustguard", "--save-values", "", "--timeout", "30s", "--version", "3.15.1"}, images)...)
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"upgrade", "--yes", "--ignore-capacity", "--dry-run", "--namespace", ns, "--version", ">=4.0.0 <5.0.0"},
+		strings.NewReader(""), &stdout, &stderr)
+	out := stdout.String() + stderr.String()
+	// Other changes between the two charts may be blocking; this test is
+	// about the firewall, so a stopped dry run is fine too.
+	if code != 0 && code != 3 {
+		t.Fatalf("upgrade --dry-run to 4.x: exit %d\n%s", code, out)
+	}
+	if strings.Contains(out, "CANARY") {
+		t.Fatalf("the upgrade printed a token:\n%s", out)
+	}
+	for _, want := range []string{"keeps running the firewall in the cluster (global.firewall.deploy: true)", "What changes:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- Deployment/firewall") {
+			t.Errorf("the upgrade removes a firewall workload: %s\n%s", line, out)
+		}
+	}
+	if strings.Contains(out, "FIREWALL_JWT") && !strings.Contains(out, "jwtExistingSecret") {
+		t.Errorf("the render asked for a FIREWALL_JWT instead of keeping the firewall:\n%s", out)
 	}
 }
 
