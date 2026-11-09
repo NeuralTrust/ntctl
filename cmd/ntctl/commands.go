@@ -208,6 +208,9 @@ type prepared struct {
 	// one; objects are what the checks ran against, hooks included.
 	planned *helm.Planned
 	objects []manifest.Object
+	// notes are changes ntctl made to the values on its own, said before the
+	// operator confirms.
+	notes []string
 }
 
 // prepare reads the cluster, builds the values, renders the chart and runs the
@@ -241,13 +244,25 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	if err != nil {
 		return nil, err
 	}
-	ch, err := chart.Load(o.kube.Settings(), chart.Source{Path: o.chartPath, Version: o.version})
+	ch, err := o.loadChart()
 	if err != nil {
 		return nil, err
 	}
 	renderVals := vals
+	var notes []string
 	if mode == preflight.ForUpgrade && current != nil {
 		renderVals = reuse(current.Config, vals)
+		// From chart 4.0.0 TrustGuard defaults to the hosted firewall, which
+		// needs a FIREWALL_JWT this release never had: it keeps the firewall
+		// it runs in the cluster instead of failing to render.
+		if keep := values.KeepFirewall(ch.Version, renderVals); keep != nil {
+			vals = values.Merge(orEmpty(vals), keep)
+			renderVals = reuse(current.Config, vals)
+			notes = append(notes, fmt.Sprintf("Chart %s defaults TrustGuard to the NeuralTrust-hosted firewall; this release keeps running the firewall in the cluster (global.firewall.deploy: true). To move to the hosted one, set trustguard.firewall.jwtExistingSecret.name to a Secret holding its FIREWALL_JWT, with global.firewall.deploy: false, in -f.", ch.Version))
+		}
+	}
+	if mode == preflight.ForInstall && values.NeedsFirewallChoice(ch.Version, renderVals) {
+		return nil, fmt.Errorf("chart %s sends TrustGuard to the NeuralTrust-hosted firewall, which needs this install's FIREWALL_JWT: set NT_FIREWALL_JWT (ntctl stores it in the Secret %s), or run the firewall in this cluster with --firewall in-cluster (global.firewall.deploy: true)", ch.Version, values.FirewallJWTSecret)
 	}
 	if willCreate == nil && mode == preflight.ForInstall {
 		willCreate = managedSecrets(renderVals)
@@ -294,7 +309,19 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 	if err != nil {
 		return nil, err
 	}
-	return &prepared{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results, planned: planned, objects: objs}, nil
+	return &prepared{cs: cs, dyn: dyn, cfg: cfg, cluster: cluster, current: current, chart: ch, values: vals, results: results, planned: planned, objects: objs, notes: notes}, nil
+}
+
+// loadChart loads the chart --chart / --version name, once per command.
+func (o *opts) loadChart() (*chart.Loaded, error) {
+	if o.loaded == nil {
+		ch, err := chart.Load(o.kube.Settings(), chart.Source{Path: o.chartPath, Version: o.version})
+		if err != nil {
+			return nil, err
+		}
+		o.loaded = ch
+	}
+	return o.loaded, nil
 }
 
 // clients returns the typed and dynamic clients for the selected context.

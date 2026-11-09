@@ -13,6 +13,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -417,6 +418,50 @@ func TestE2EDoctorAndSupportBundle(t *testing.T) {
 		if !names[want] {
 			t.Errorf("the bundle lacks %s", want)
 		}
+	}
+}
+
+// TestE2EUpgradeTo4KeepsTheFirewall installs TrustGuard on chart 3.15.1,
+// whose firewall runs in the cluster, and checks that the upgrade to 4.x,
+// whose default is the NeuralTrust-hosted firewall, keeps it there: ntctl
+// says so, and the plan removes no firewall workload. It is a dry run, so the
+// images need not be pullable.
+func TestE2EUpgradeTo4KeepsTheFirewall(t *testing.T) {
+	const ns = "ntctl-e2e-firewall"
+	cluster(t, ns)
+	t.Setenv("NTCTL_CONFIG_DIR", t.TempDir())
+	t.Setenv("NT_FIREWALL_JWT", "")
+	for _, env := range []string{"NT_TRUSTGUARD_CONFIG_SYNC_TOKEN", "NT_TRUSTGUARD_ENROLMENT_TOKEN"} {
+		t.Setenv(env, "CANARY-"+strings.ToLower(env))
+	}
+	images := unpullable(t, `{"type":"service_account","project_id":"e2e","private_key":"CANARY-registry-key"}`)
+	ntctl(t, 1, args([]string{"install", "--yes", "--ignore-capacity", "--namespace", ns, "--domain", "firewall.example.com",
+		"--products", "trustguard", "--save-values", "", "--timeout", "30s", "--version", "3.15.1"}, images)...)
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"upgrade", "--yes", "--ignore-capacity", "--dry-run", "--namespace", ns, "--version", ">=4.0.0 <5.0.0"},
+		strings.NewReader(""), &stdout, &stderr)
+	out := stdout.String() + stderr.String()
+	// Other changes between the two charts may be blocking; this test is
+	// about the firewall, so a stopped dry run is fine too.
+	if code != 0 && code != 3 {
+		t.Fatalf("upgrade --dry-run to 4.x: exit %d\n%s", code, out)
+	}
+	if strings.Contains(out, "CANARY") {
+		t.Fatalf("the upgrade printed a token:\n%s", out)
+	}
+	for _, want := range []string{"keeps running the firewall in the cluster (global.firewall.deploy: true)", "What changes:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- Deployment/firewall") {
+			t.Errorf("the upgrade removes a firewall workload: %s\n%s", line, out)
+		}
+	}
+	if strings.Contains(out, "FIREWALL_JWT") && !strings.Contains(out, "jwtExistingSecret") {
+		t.Errorf("the render asked for a FIREWALL_JWT instead of keeping the firewall:\n%s", out)
 	}
 }
 
