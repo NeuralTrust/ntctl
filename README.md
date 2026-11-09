@@ -378,7 +378,12 @@ cannot do in place:
 - a new storage class or access mode on a volume;
 - removing a Secret, a volume or a StatefulSet, unless it carries
   `helm.sh/resource-policy: keep`: Helm leaves those in the cluster, and the
-  diff lists them as kept, no longer managed;
+  diff lists them as kept, no longer managed. A removed Secret that nothing
+  names does not stop it either: no other object of the installed or the new
+  release mentions it, and no Gateway listener (`tls.certificateRefs`) or
+  Ingress (`tls.secretName`) in the cluster serves it. The diff lists it as
+  read by nothing. If the cluster's Gateways or Ingresses cannot be read, it
+  still stops;
 - removing a key from a Secret, even a kept one, that a workload of the new
   release still reads. A key nothing reads any more, or one that held an empty
   value, is listed as removed and does not stop it.

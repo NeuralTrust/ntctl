@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/api"
@@ -367,7 +368,7 @@ func (o *opts) applyChange(ctx context.Context, in *prompt.Prompter, out io.Writ
 // target chart that does not run the generator for this install is an error,
 // not a silent no-op.
 func (o *opts) generatorChange(ctx context.Context, out io.Writer, p *prepared, enable bool) (diff.Result, error) {
-	res, err := compare(p.current.Manifest, p.planned.Manifest)
+	res, err := compareUsing(p.current.Manifest, p.planned.Manifest, o.clusterUsers(ctx, p.cs, p.dyn))
 	if err != nil {
 		return res, err
 	}
@@ -431,6 +432,13 @@ func releaseNotes(ctx context.Context, out io.Writer, from, to string, full bool
 }
 
 func compare(current, target string) (diff.Result, error) {
+	return compareUsing(current, target, nil)
+}
+
+// compareUsing is compare, with users naming what outside the release still
+// uses a Secret the release stops rendering (see secretUsers). nil keeps
+// every removed Secret blocking.
+func compareUsing(current, target string, users func([]manifest.Object) diff.Referrer) (diff.Result, error) {
 	a, err := manifest.Parse(current)
 	if err != nil {
 		return diff.Result{}, fmt.Errorf("reading the deployed manifest: %w", err)
@@ -439,7 +447,23 @@ func compare(current, target string) (diff.Result, error) {
 	if err != nil {
 		return diff.Result{}, fmt.Errorf("reading the target manifest: %w", err)
 	}
-	return diff.Compare(a, b), nil
+	var outside diff.Referrer
+	if users != nil {
+		outside = users(append(append([]manifest.Object{}, a...), b...))
+	}
+	return diff.CompareUsing(a, b, outside), nil
+}
+
+// clusterUsers looks up, in the selected cluster, what outside a release uses
+// its Secrets.
+// Without clients, nothing outside the manifests is checked.
+func (o *opts) clusterUsers(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface) func([]manifest.Object) diff.Referrer {
+	if cs == nil || dyn == nil {
+		return nil
+	}
+	return func(release []manifest.Object) diff.Referrer {
+		return secretUsers(ctx, cs, dyn, o.kube.Namespace, release)
+	}
 }
 
 func runHistory(_ context.Context, args []string, out io.Writer) error {
@@ -525,11 +549,11 @@ func runRollback(ctx context.Context, args []string, stdin io.Reader, out io.Wri
 	}
 	fmt.Fprintf(out, "Roll back %q in namespace %q from revision %d (chart %s, %s) to revision %d (chart %s)\non %s.\n",
 		o.release, o.kube.Namespace, cur.Version, cur.Chart.Metadata.Version, cur.Info.Status, target.Version, target.Chart.Metadata.Version, o.kube.Target())
-	res, err := compare(cur.Manifest, target.Manifest)
+	cs, dyn, err := o.clients()
 	if err != nil {
 		return err
 	}
-	cs, err := o.kube.Clientset()
+	res, err := compareUsing(cur.Manifest, target.Manifest, o.clusterUsers(ctx, cs, dyn))
 	if err != nil {
 		return err
 	}

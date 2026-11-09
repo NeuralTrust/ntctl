@@ -108,3 +108,20 @@ func TestListRoutes(t *testing.T) {
 		t.Errorf("unreported route problems = %v", got)
 	}
 }
+
+func TestListGatewaysReadsCertificateRefs(t *testing.T) {
+	https := gatewayapitest.Listener("https", 443, map[string]any{"from": "All"})
+	https["tls"] = map[string]any{"certificateRefs": []any{
+		map[string]any{"name": "edge-tls"},
+		map[string]any{"name": "nt-tls", "namespace": "neuraltrust"},
+		map[string]any{"name": "not-a-secret", "kind": "ConfigMap"},
+	}}
+	gws, err := gatewayapi.ListGateways(context.Background(), gatewayapitest.Client(gatewayapitest.Gateway("gw", "shared", "192.0.2.10", https)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, _ := gws[0].Listener("https")
+	if got := strings.Join(l.Certificates, ","); got != "gw/edge-tls,neuraltrust/nt-tls" {
+		t.Fatalf("certificates = %q, want the Gateway's namespace filled in and only Secrets", got)
+	}
+}
