@@ -60,6 +60,9 @@ type Change struct {
 	// Kept says a removed resource carries helm.sh/resource-policy: keep, so
 	// Helm leaves it in the cluster, no longer managed by the release.
 	Kept bool `json:"kept,omitempty"`
+	// Unread says a removed Secret is named by nothing: no other object of
+	// either release, nor any object outside it the check could see.
+	Unread bool `json:"unread,omitempty"`
 	// Secret keys added, removed or with a new value. Values are never kept.
 	SecretKeys *SecretKeys `json:"secretKeys,omitempty"`
 	// Images are the containers whose image changes.
@@ -116,9 +119,21 @@ func (r Result) Blocking() []Change {
 // Empty reports whether nothing changes.
 func (r Result) Empty() bool { return len(r.Changes) == 0 }
 
+// Referrer names an object outside the release that still uses the Secret
+// called name, such as an operator's own Gateway serving the release's
+// certificate, or returns "" when none does.
+type Referrer func(name string) string
+
 // Compare returns what changes when a release goes from one manifest to the
 // other.
-func Compare(from, to []manifest.Object) Result {
+func Compare(from, to []manifest.Object) Result { return CompareUsing(from, to, nil) }
+
+// CompareUsing is Compare, with outside naming what in the cluster still uses
+// a Secret the release stops rendering. A removed Secret named by nothing in
+// either release, nor by outside, is safe to drop: it holds nothing anything
+// reads. Without outside, every removed Secret the releases do not name still
+// blocks, since nothing beyond the manifests was checked.
+func CompareUsing(from, to []manifest.Object, outside Referrer) Result {
 	a, b := index(from), index(to)
 	reads := readers(to)
 	var res Result
@@ -138,6 +153,19 @@ func Compare(from, to []manifest.Object) Result {
 			switch {
 			case kept(oldObj):
 				c.Kept = true
+			case kind == "Secret":
+				switch by := namedBy(name, k, from, to); {
+				case by != "":
+					c.Blocking = append(c.Blocking, fmt.Sprintf("removing a Secret deletes what it holds, and %s names it", by))
+				case outside == nil:
+					c.Blocking = append(c.Blocking, "removing a Secret deletes what it holds")
+				default:
+					if by := outside(name); by != "" {
+						c.Blocking = append(c.Blocking, fmt.Sprintf("removing a Secret deletes what it holds, and %s still references it", by))
+					} else {
+						c.Unread = true
+					}
+				}
 			case dataKinds[kind]:
 				c.Blocking = append(c.Blocking, fmt.Sprintf("removing a %s deletes what it holds", kind))
 			}
@@ -234,6 +262,9 @@ func (r Result) Print(w io.Writer, full bool) {
 		}
 		if c.Kept {
 			line += "  (kept in the cluster, no longer managed)"
+		}
+		if c.Unread {
+			line += "  (read by nothing)"
 		}
 		if len(c.Blocking) > 0 {
 			line += "  BLOCKING"
@@ -382,6 +413,52 @@ func readers(objs []manifest.Object) func(secret, key string) string {
 		}
 		return ""
 	}
+}
+
+// namedBy returns the first object, other than the one keyed self, whose spec,
+// data or annotations hold the exact string name, or "". It is deliberately
+// wider than readers: a Secret is used through env and volumes, but also
+// through imagePullSecrets, an Ingress's tls.secretName, a Gateway's
+// certificateRefs, a cert-manager Certificate's secretName, or a name a
+// program looks up itself. Any mention keeps the Secret's removal blocking.
+func namedBy(name, self string, sets ...[]manifest.Object) string {
+	for _, objs := range sets {
+		for _, o := range objs {
+			if key(o) == self {
+				continue
+			}
+			for k, v := range o {
+				if k == "metadata" {
+					v = dig(v, []string{"annotations"})
+				}
+				if mentions(v, name) {
+					return o.Kind() + "/" + o.Name()
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// mentions reports whether any string in v, a key or a value, is s.
+func mentions(v any, s string) bool {
+	switch t := v.(type) {
+	case string:
+		return t == s
+	case map[string]any:
+		for k, x := range t {
+			if k == s || mentions(x, s) {
+				return true
+			}
+		}
+	case []any:
+		for _, x := range t {
+			if mentions(x, s) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // itemKeys returns the keys a volume's items select, or nil when it has none

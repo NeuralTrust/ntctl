@@ -354,3 +354,114 @@ func TestComponentsCountsAnImageOnce(t *testing.T) {
 		t.Fatalf("components = %+v", c)
 	}
 }
+
+// AUT-1196: a Secret the old release rendered, that nothing reads or names,
+// such as a self-signed TLS Secret left by an older chart's Ingress path.
+const orphan = `---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: neuraltrust-ingress-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: Y2VydA==
+  tls.key: a2V5
+`
+
+func TestRemovingASecretNamedByNothing(t *testing.T) {
+	from, to := parse(t, base+orphan), parse(t, base)
+	outsideNone := func(string) string { return "" }
+
+	r := CompareUsing(from, to, outsideNone)
+	if b := r.Blocking(); len(b) != 0 {
+		t.Fatalf("a Secret named by nothing, inside or outside the release, should not block: %+v", b)
+	}
+	if len(r.Changes) != 1 || !r.Changes[0].Unread || r.Changes[0].Op != Removed {
+		t.Fatalf("want one removed, unread Secret: %+v", r.Changes)
+	}
+	var out bytes.Buffer
+	r.Print(&out, false)
+	if !strings.Contains(out.String(), "- Secret/neuraltrust-ingress-tls  (read by nothing)") {
+		t.Fatalf("output should say it is read by nothing:\n%s", out.String())
+	}
+
+	// Without a look outside the manifests, nothing is assumed.
+	if b := Compare(from, to).Blocking(); len(b) != 1 {
+		t.Fatalf("with nothing checked outside the release it should still block: %+v", b)
+	}
+
+	// Something outside the release still serves it.
+	r = CompareUsing(from, to, func(name string) string {
+		if name == "neuraltrust-ingress-tls" {
+			return "Gateway kgateway-system/internal listener https"
+		}
+		return ""
+	})
+	b := r.Blocking()
+	if len(b) != 1 || !strings.Contains(b[0].Blocking[0], "Gateway kgateway-system/internal listener https still references it") {
+		t.Fatalf("a Secret a Gateway serves should block, naming the Gateway: %+v", b)
+	}
+}
+
+func TestRemovingASecretSomethingNamesBlocks(t *testing.T) {
+	outsideNone := func(string) string { return "" }
+	for name, user := range map[string]string{
+		"Ingress tls": `---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+spec:
+  tls:
+  - secretName: neuraltrust-ingress-tls
+`,
+		"imagePullSecrets": `---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: puller
+imagePullSecrets:
+- name: neuraltrust-ingress-tls
+`,
+		"an annotation": `---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: note
+  annotations:
+    example.com/cert: neuraltrust-ingress-tls
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The user is in the old release only; it still blocks, since
+			// the old release reads the Secret until the upgrade ends.
+			r := CompareUsing(parse(t, base+orphan+user), parse(t, base), outsideNone)
+			var blocked bool
+			for _, c := range r.Blocking() {
+				if c.Name == "neuraltrust-ingress-tls" && strings.Contains(strings.Join(c.Blocking, ";"), "names it") {
+					blocked = true
+				}
+			}
+			if !blocked {
+				t.Fatalf("a Secret named by %s should block: %+v", name, r.Changes)
+			}
+		})
+	}
+}
+
+func TestAnObjectSharingTheSecretsNameInItsMetadataIsNotAUse(t *testing.T) {
+	// A ConfigMap that happens to be called the same, or carries it as a
+	// label, does not read the Secret.
+	same := `---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: neuraltrust-ingress-tls
+  labels:
+    app: neuraltrust-ingress-tls
+`
+	r := CompareUsing(parse(t, base+orphan+same), parse(t, base+same), func(string) string { return "" })
+	if b := r.Blocking(); len(b) != 0 {
+		t.Fatalf("a name in another object's metadata is not a use: %+v", b)
+	}
+}

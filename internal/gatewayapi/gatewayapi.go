@@ -36,6 +36,9 @@ type Listener struct {
 	// From is allowedRoutes.namespaces.from: All, Same or Selector.
 	From     string
 	selector labels.Selector
+	// Certificates are the Secrets tls.certificateRefs names, as
+	// namespace/name with the Gateway's namespace filled in.
+	Certificates []string
 }
 
 // Admits reports whether a route in namespace ns, labelled nsLabels, may
@@ -172,6 +175,14 @@ type gatewayObject struct {
 					Selector *metav1.LabelSelector `json:"selector"`
 				} `json:"namespaces"`
 			} `json:"allowedRoutes"`
+			TLS *struct {
+				CertificateRefs []struct {
+					Group     string `json:"group"`
+					Kind      string `json:"kind"`
+					Name      string `json:"name"`
+					Namespace string `json:"namespace"`
+				} `json:"certificateRefs"`
+			} `json:"tls"`
 		} `json:"listeners"`
 	} `json:"spec"`
 	Status struct {
@@ -215,6 +226,19 @@ func toGateway(u *unstructured.Unstructured) (Gateway, error) {
 				return Gateway{}, fmt.Errorf("Gateway %s listener %s: %w", g.Ref(), l.Name, err)
 			}
 			ln.selector = sel
+		}
+		if l.TLS != nil {
+			for _, r := range l.TLS.CertificateRefs {
+				// A core Secret, the API's default kind and group.
+				if (r.Kind != "" && r.Kind != "Secret") || r.Group != "" {
+					continue
+				}
+				ns := r.Namespace
+				if ns == "" {
+					ns = g.Namespace
+				}
+				ln.Certificates = append(ln.Certificates, ns+"/"+r.Name)
+			}
 		}
 		g.Listeners = append(g.Listeners, ln)
 	}
