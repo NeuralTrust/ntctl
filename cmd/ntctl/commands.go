@@ -309,7 +309,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 			renderVals = reuse(current.Config, vals)
 			notes = append(notes, fmt.Sprintf("Chart %s defaults TrustGuard to the NeuralTrust-hosted firewall; this release keeps running the firewall in the cluster (global.firewall.deploy: true). To move to the hosted one, set trustguard.firewall.jwtExistingSecret.name to a Secret holding its FIREWALL_JWT, with global.firewall.deploy: false, in -f.", ch.Version))
 		}
-		// From chart 4.6.0 data-plane-api is opt-in in every mode. An external
+		// From chart 4.5.1 data-plane-api is opt-in in every mode. An external
 		// or saas release that never set global.products.dataPlane runs it
 		// today, and keeps it.
 		if keep := values.KeepDataPlane(current.Chart.Metadata.Version, ch.Version, renderVals); keep != nil {

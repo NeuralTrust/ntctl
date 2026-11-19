@@ -749,7 +749,7 @@ func runAdopt(ctx context.Context, args []string, out io.Writer) error {
 	if pin != nil {
 		clean = values.Merge(orEmpty(clean), pin)
 	}
-	// Chart 4.6.0 makes data-plane-api opt-in in external and saas too; the
+	// Chart 4.5.1 makes data-plane-api opt-in in external and saas too; the
 	// file records that this release runs it.
 	dpPin := values.PinDataPlane(want, clean)
 	if dpPin != nil {
@@ -763,7 +763,7 @@ func runAdopt(ctx context.Context, args []string, out io.Writer) error {
 		fmt.Fprintln(out, "It sets global.firewall.deploy: true, which this chart already defaults to: chart 4.x defaults TrustGuard to the NeuralTrust-hosted firewall, and this keeps the firewall in the cluster when you upgrade.")
 	}
 	if dpPin != nil {
-		fmt.Fprintln(out, "It sets global.products.dataPlane: true, which this chart already defaults to here: from chart 4.6.0 data-plane-api is opt-in, and this keeps it when you upgrade.")
+		fmt.Fprintln(out, "It sets global.products.dataPlane: true, which this chart already defaults to here: from chart 4.5.1 data-plane-api is opt-in, and this keeps it when you upgrade.")
 	}
 	if len(removed) > 0 {
 		fmt.Fprintf(out, "%d values looked like secrets and were left out: %s\n"+

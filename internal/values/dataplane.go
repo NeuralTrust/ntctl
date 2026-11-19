@@ -10,7 +10,7 @@ var DefaultProducts = []string{"trustgate", "trustguard"}
 // dataPlaneOptInSince is the first chart where data-plane-api is opt-in in
 // external and saas too: before it, an unset global.products.dataPlane
 // deployed it there.
-var dataPlaneOptInSince = semver.MustParse("4.6.0")
+var dataPlaneOptInSince = semver.MustParse("4.5.1")
 
 // DataPlaneOptIn reports whether chart version v deploys data-plane-api only
 // when global.products.dataPlane is true, in every mode. A version that does

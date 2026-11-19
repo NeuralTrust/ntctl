@@ -285,9 +285,9 @@ mode: a new install leaves it off unless you choose it. In hybrid, add
 `global.products.dataPlane` in your values does the same. TrustTest may change
 or be removed in a future release.
 
-Charts before 4.6.0 deployed data-plane-api in external and saas installs
+Charts before 4.5.1 deployed data-plane-api in external and saas installs
 unless `global.products.dataPlane` was `false`. When `ntctl upgrade` moves such
-a release to 4.6.0 or later and its values never set the flag, it keeps
+a release to 4.5.1 or later and its values never set the flag, it keeps
 data-plane-api running by setting `global.products.dataPlane: true`, and says
 so before you confirm. Installs made by ntctl already record the flag. Remove it
 with `ntctl upgrade --remove-products dataPlane`.

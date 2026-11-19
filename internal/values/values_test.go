@@ -243,11 +243,11 @@ func TestDataPlaneOptIn(t *testing.T) {
 		vals     map[string]any
 		keep     bool
 	}{
-		{"external unset crossing to opt-in keeps it", "4.5.0", "4.6.0", external(map[string]any{}), true},
+		{"external unset crossing to opt-in keeps it", "4.5.0", "4.5.1", external(map[string]any{}), true},
 		{"saas unset crossing to opt-in keeps it", "4.5.0", "5.0.0", map[string]any{"global": map[string]any{"deploymentMode": "saas"}}, true},
 		{"an explicit flag is the release's choice", "4.5.0", "4.6.0", external(map[string]any{"dataPlane": false}), false},
 		{"hybrid was already opt-in", "4.5.0", "4.6.0", hybrid, false},
-		{"both charts opt-in", "4.6.0", "4.7.0", external(map[string]any{}), false},
+		{"both charts opt-in", "4.5.1", "4.6.0", external(map[string]any{}), false},
 		{"both charts opt-out", "4.4.0", "4.5.0", external(map[string]any{}), false},
 	}
 	for _, c := range cases {
@@ -262,7 +262,7 @@ func TestDataPlaneOptIn(t *testing.T) {
 	if PinDataPlane("4.5.0", external(map[string]any{})) == nil {
 		t.Error("PinDataPlane: an external release on an opt-out chart is not pinned")
 	}
-	if PinDataPlane("4.6.0", external(map[string]any{})) != nil {
+	if PinDataPlane("4.5.1", external(map[string]any{})) != nil {
 		t.Error("PinDataPlane: a release already on an opt-in chart is pinned")
 	}
 	if contains(DefaultProducts, "dataPlane") {
