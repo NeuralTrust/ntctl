@@ -50,7 +50,8 @@ default, so pressing Enter takes a working choice:
 | Base domain for the endpoints | (required) | |
 | Platform | detected from the cluster | aws, gcp, azure, openshift, kubernetes |
 | How the endpoints are exposed (asked only when the cluster has a Gateway API Gateway) | Ingresses; a Gateway when the cluster has no IngressClass and is not GKE | HTTPRoutes on one of the cluster's Gateways |
-| Products | all | any of `trustgate`, `trustguard`, `dataPlane` |
+| Products (hybrid) | `trustgate`, `trustguard` | any of `trustgate`, `trustguard`, `dataPlane` |
+| data-plane-api (external and saas) | No | Yes: deploys data-plane-api, the TrustTest red-teaming and evaluation API. See [data-plane-api](#data-plane-api) |
 | [Operational telemetry](#operational-telemetry) | No | Yes: TrustGate and TrustGuard send their own traces and metrics to NeuralTrust in hybrid installs, or to your in-cluster collector otherwise |
 | Where images come from | the NeuralTrust registry, with your key file | your own registry: its address, and either a username and password or the nodes' own identity (ECR, Artifact Registry, ACR) |
 | PostgreSQL | run it in the cluster | your own, as a connection string `postgres://user:password@host:5432/database?sslmode=require` |
@@ -156,6 +157,7 @@ ntctl install --yes --domain platform.example.com \
 | Your own Redis | | `NT_REDIS_URL` |
 | Where the control plane runs | `--mode` | |
 | Where TrustGuard's firewall runs (chart 4.x): `in-cluster` or `hosted` | `--firewall` | `NT_FIREWALL_JWT` for the hosted one |
+| Whether data-plane-api (TrustTest red teaming) runs, in any mode | `--data-plane-api` | |
 | The console's first admin (external and saas) | | `ONPREM_SUPERADMIN_EMAIL`, `ONPREM_SUPERADMIN_PASSWORD` |
 | How the console sends email (external and saas): `none` (the default), `resend`, `smtp` or `ses` | | `NT_EMAIL_PROVIDER`, `NT_EMAIL_FROM`, `NT_EMAIL_REPLY_TO`; `NT_RESEND_API_KEY`; `NT_SMTP_HOST`, `NT_SMTP_PORT` (587), `NT_SMTP_SECURE` (true), `NT_SMTP_USER`, `NT_SMTP_PASSWORD`; `NT_SES_REGION`, `NT_SES_ACCESS_KEY_ID`, `NT_SES_SECRET_ACCESS_KEY` (unset: the pods' IAM role) |
 
@@ -274,6 +276,22 @@ in the environment still take precedence.
 This needs a console that offers CLI sign-in. Without one, `ntctl login` says so
 and everything else works as described above.
 
+### data-plane-api
+
+data-plane-api, the TrustTest red-teaming and evaluation API, is opt-in in every
+mode: a new install leaves it off unless you choose it. In hybrid, add
+`dataPlane` to the products; in external and saas, answer yes to its question.
+`--data-plane-api` (or `--data-plane-api=false`) answers it in any mode, and
+`global.products.dataPlane` in your values does the same. TrustTest may change
+or be removed in a future release.
+
+Charts before 4.6.0 deployed data-plane-api in external and saas installs
+unless `global.products.dataPlane` was `false`. When `ntctl upgrade` moves such
+a release to 4.6.0 or later and its values never set the flag, it keeps
+data-plane-api running by setting `global.products.dataPlane: true`, and says
+so before you confirm. Installs made by ntctl already record the flag. Remove it
+with `ntctl upgrade --remove-products dataPlane`.
+
 ## Deployment modes
 
 `--mode` (or `global.deploymentMode` in your values, or the first question)
@@ -323,8 +341,10 @@ Flags for `install`, `upgrade`, `preflight` and `render`:
 
 - `-f values.yaml`: any chart value, as with `helm -f`. Repeat it to layer files.
 - `--domain`, `--platform`, `--products`. `--products` is for hybrid installs:
-  external and saas installs run every product, so it is neither asked nor
-  accepted there. On `upgrade`, `--products` only
+  external and saas installs run TrustGate and TrustGuard, so it is neither
+  asked nor accepted there.
+- `--data-plane-api`: deploy data-plane-api (TrustTest red teaming), opt-in in
+  every mode. See [data-plane-api](#data-plane-api). On `upgrade`, `--products` only
   turns products on and the others keep their state; `--remove-products`
   turns products off. See [Adding or removing a product](#adding-or-removing-a-product).
 - `--gateway <namespace>/<name>[:<listener>]`: expose the endpoints as Gateway

@@ -231,14 +231,16 @@ func InlineAdminPassword(vals map[string]any) bool {
 }
 
 // Installed lists the products the chart deploys for these values, by the
-// chart's own rule: in hybrid a product is on only when its flag is true; in
-// external and saas it is on unless its flag is false.
+// chart's own rule: dataPlane, and any product in hybrid, is on only when its
+// flag is true; trustgate and trustguard in external and saas are on unless
+// their flag is false. Charts before 4.6.0 also deployed an unset dataPlane in
+// external and saas; KeepDataPlane pins it on when such a release upgrades.
 func Installed(vals map[string]any) []string {
-	hybrid := DeploymentMode(vals) == "hybrid"
+	optIn := DeploymentMode(vals) == "hybrid"
 	var out []string
 	for _, p := range Products {
 		on, set := Get(vals, "global", "products", p).(bool)
-		if (hybrid && on) || (!hybrid && (on || !set)) {
+		if ((optIn || p == "dataPlane") && on) || (!optIn && p != "dataPlane" && (on || !set)) {
 			out = append(out, p)
 		}
 	}

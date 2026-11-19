@@ -121,3 +121,29 @@ func TestInstallRecordsOperationalTelemetry(t *testing.T) {
 		})
 	}
 }
+
+// data-plane-api is opt-in: an install records it off unless --data-plane-api
+// turns it on, in any mode, and the flag beats the files as --set would.
+func TestDataPlaneAPIFlag(t *testing.T) {
+	for _, mode := range []string{"hybrid", "external", "saas"} {
+		vals, err := (&opts{mode: mode}).effectiveValues(installDefaults("aws"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := values.Get(vals, "global", "products", "dataPlane"); got != false {
+			t.Errorf("%s: install default dataPlane = %v, want false", mode, got)
+		}
+		on := true
+		o := opts{mode: mode}
+		o.dataPlane.v = &on
+		if vals, err = o.effectiveValues(installDefaults("aws")); err != nil {
+			t.Fatal(err)
+		}
+		if got := values.Get(vals, "global", "products", "dataPlane"); got != true {
+			t.Errorf("%s: --data-plane-api did not turn dataPlane on: %v", mode, got)
+		}
+		if got := values.Get(vals, "global", "products", "trustguard"); got != true {
+			t.Errorf("%s: --data-plane-api changed the other products: %v", mode, values.Get(vals, "global", "products"))
+		}
+	}
+}

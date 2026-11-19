@@ -151,7 +151,8 @@ func TestInstalledFollowsTheChartRule(t *testing.T) {
 	}{
 		{"hybrid needs true", products("", map[string]any{"trustgate": true, "trustguard": false}), []string{"trustgate"}},
 		{"hybrid unset is off", products("hybrid", map[string]any{}), nil},
-		{"external unset is on", products("external", map[string]any{"trustguard": false}), []string{"trustgate", "dataPlane"}},
+		{"external unset is on, but dataPlane is opt-in", products("external", map[string]any{"trustguard": false}), []string{"trustgate"}},
+		{"external dataPlane needs true", products("external", map[string]any{"dataPlane": true}), []string{"trustgate", "trustguard", "dataPlane"}},
 		{"saas is external", products("saas", map[string]any{"dataPlane": false}), []string{"trustgate", "trustguard"}},
 	}
 	for _, c := range cases {
@@ -228,5 +229,43 @@ func TestConsoleHost(t *testing.T) {
 		if got := ConsoleHost(c.vals); got != c.want {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestDataPlaneOptIn(t *testing.T) {
+	external := func(flags map[string]any) map[string]any {
+		return map[string]any{"global": map[string]any{"deploymentMode": "external", "products": flags}}
+	}
+	hybrid := map[string]any{"global": map[string]any{"products": map[string]any{"trustgate": true}}}
+	cases := []struct {
+		name     string
+		from, to string
+		vals     map[string]any
+		keep     bool
+	}{
+		{"external unset crossing to opt-in keeps it", "4.5.0", "4.6.0", external(map[string]any{}), true},
+		{"saas unset crossing to opt-in keeps it", "4.5.0", "5.0.0", map[string]any{"global": map[string]any{"deploymentMode": "saas"}}, true},
+		{"an explicit flag is the release's choice", "4.5.0", "4.6.0", external(map[string]any{"dataPlane": false}), false},
+		{"hybrid was already opt-in", "4.5.0", "4.6.0", hybrid, false},
+		{"both charts opt-in", "4.6.0", "4.7.0", external(map[string]any{}), false},
+		{"both charts opt-out", "4.4.0", "4.5.0", external(map[string]any{}), false},
+	}
+	for _, c := range cases {
+		got := KeepDataPlane(c.from, c.to, c.vals)
+		if (got != nil) != c.keep {
+			t.Errorf("%s: KeepDataPlane = %v, want keep %v", c.name, got, c.keep)
+		}
+		if got != nil && Get(got, "global", "products", "dataPlane") != true {
+			t.Errorf("%s: KeepDataPlane does not turn dataPlane on: %v", c.name, got)
+		}
+	}
+	if PinDataPlane("4.5.0", external(map[string]any{})) == nil {
+		t.Error("PinDataPlane: an external release on an opt-out chart is not pinned")
+	}
+	if PinDataPlane("4.6.0", external(map[string]any{})) != nil {
+		t.Error("PinDataPlane: a release already on an opt-in chart is pinned")
+	}
+	if contains(DefaultProducts, "dataPlane") {
+		t.Errorf("DefaultProducts = %v; dataPlane is opt-in", DefaultProducts)
 	}
 }

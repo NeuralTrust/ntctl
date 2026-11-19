@@ -48,7 +48,7 @@ func TestAskInteractive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
-	if o.domain != "platform.example.com" || o.platform != "aws" || o.products != "trustgate,trustguard,dataPlane" || o.mode != "" {
+	if o.domain != "platform.example.com" || o.platform != "aws" || o.products != "trustgate,trustguard" || o.mode != "" {
 		t.Errorf("domain=%q platform=%q products=%q", o.domain, o.platform, o.products)
 	}
 	if a.Images.Registry != "registry.example.com/neuraltrust" || a.Images.Username != "robot" || a.Images.Password != "token" {
@@ -190,7 +190,7 @@ func TestAskOperationalTelemetry(t *testing.T) {
 	}{
 		{"hybrid by default, yes", "", "\ny\n", true, "to NeuralTrust, to help support diagnose your gateway"},
 		{"hybrid, Enter keeps no", "hybrid", "\n", false, "to NeuralTrust, to help support diagnose your gateway"},
-		{"external, yes", "external", "yes\n", true, "to your own in-cluster collector"},
+		{"external, yes", "external", "\nyes\n", true, "to your own in-cluster collector"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -242,7 +242,7 @@ func TestAskMode(t *testing.T) {
 	// External and saas installs also ask about email; these tests are not about it.
 	t.Setenv("NT_EMAIL_PROVIDER", "none")
 	files := map[string]any{"global": map[string]any{
-		"domain": "m.example.com", "platform": "aws", "products": map[string]any{"trustguard": true},
+		"domain": "m.example.com", "platform": "aws", "products": map[string]any{"trustguard": true, "dataPlane": false},
 		"imageRegistry": "mirror.example.com", "observability": map[string]any{"operationalTelemetry": false},
 	}}
 	run := func(o *opts, in *prompt.Prompter, out *bytes.Buffer) error {
@@ -295,7 +295,7 @@ func TestAskAdmin(t *testing.T) {
 	external := func() *opts { return &opts{mode: "external"} }
 	adminFiles := func() map[string]any {
 		return map[string]any{"global": map[string]any{
-			"domain": "a.example.com", "platform": "aws", "products": map[string]any{"trustguard": true},
+			"domain": "a.example.com", "platform": "aws", "products": map[string]any{"trustguard": true, "dataPlane": false},
 			"imageRegistry": "mirror.example.com", "observability": map[string]any{"operationalTelemetry": false},
 		}}
 	}
@@ -429,12 +429,16 @@ func TestAskProductsOnlyForHybrid(t *testing.T) {
 	for _, mode := range []string{"external", "saas"} {
 		var out bytes.Buffer
 		o := opts{}
-		if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader(""), &out), &out,
+		if _, err := ask(context.Background(), prompt.Scripted(strings.NewReader("\n"), &out), &out,
 			fake.NewSimpleClientset(), &detect.Cluster{Platform: "aws"}, &o, installFlags{}, files(mode)); err != nil {
 			t.Fatalf("%s: %v\n%s", mode, err, out.String())
 		}
 		if strings.Contains(out.String(), "Products") || o.products != "" {
-			t.Errorf("%s: every product runs, so none is asked:\n%s", mode, out.String())
+			t.Errorf("%s: TrustGate and TrustGuard run, so no product list is asked:\n%s", mode, out.String())
+		}
+		// data-plane-api is the one choice, opt-in: Enter leaves it off.
+		if !strings.Contains(out.String(), "Deploy data-plane-api") || o.dataPlane.v == nil || *o.dataPlane.v {
+			t.Errorf("%s: data-plane-api should be asked and default to off (got %v):\n%s", mode, o.dataPlane.v, out.String())
 		}
 		o = opts{products: "trustgate"}
 		_, err := ask(context.Background(), prompt.Scripted(strings.NewReader(""), &out), &out,
@@ -451,6 +455,12 @@ func TestAskProductsOnlyForHybrid(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Products, comma-separated") {
 		t.Errorf("hybrid still asks for its products:\n%s", out.String())
+	}
+	if o.products != "trustgate,trustguard" {
+		t.Errorf("hybrid products default to TrustGate and TrustGuard, data-plane-api opt-in: got %q", o.products)
+	}
+	if strings.Contains(out.String(), "Deploy data-plane-api") {
+		t.Errorf("hybrid chooses data-plane-api in its product list, not a separate question:\n%s", out.String())
 	}
 }
 

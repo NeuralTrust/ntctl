@@ -445,14 +445,16 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			return a, err
 		}
 	}
-	// External and saas installs run every product: there is nothing to
-	// choose, and naming some would turn the others off.
+	// External and saas installs run TrustGate and TrustGuard: naming some
+	// products would turn the others off. data-plane-api is the one choice,
+	// asked below.
 	if mode != "hybrid" && o.products != "" {
-		return a, fmt.Errorf("--products applies to hybrid installs; %s installs run every product", mode)
+		return a, fmt.Errorf("--products applies to hybrid installs; %s installs run TrustGate and TrustGuard, and --data-plane-api adds data-plane-api", mode)
 	}
 	if mode == "hybrid" && o.products == "" && !set("global", "products") && in.Interactive {
+		fmt.Fprintf(out, "Products: %s. dataPlane (data-plane-api, TrustTest red teaming) is opt-in; TrustTest may change or be removed in a future release.\n", strings.Join(values.Products, ", "))
 		for {
-			if o.products, err = in.Text("Products, comma-separated", strings.Join(values.Products, ",")); err != nil {
+			if o.products, err = in.Text("Products, comma-separated", strings.Join(values.DefaultProducts, ",")); err != nil {
 				return a, err
 			}
 			if _, err = o.productList(); err == nil {
@@ -460,6 +462,13 @@ func ask(ctx context.Context, in *prompt.Prompter, out io.Writer, cs kubernetes.
 			}
 			fmt.Fprintf(out, "  %v\n", err)
 		}
+	}
+	if mode != "hybrid" && o.dataPlane.v == nil && !set("global", "products", "dataPlane") && in.Interactive {
+		on, err := in.YesNo("Deploy data-plane-api (TrustTest red teaming; opt-in, may change or be removed in a future release)?", false)
+		if err != nil {
+			return a, err
+		}
+		o.dataPlane.v = &on
 	}
 	if o.telemetry.v == nil && !set("global", "observability", "operationalTelemetry") && in.Interactive {
 		on, err := askTelemetry(in, out, mode)

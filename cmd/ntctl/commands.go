@@ -227,11 +227,12 @@ func releaseSummary(rel *release.Release) map[string]any {
 }
 
 // installDefaults are what an install sets when the flags, files and answers
-// leave it open: the detected platform, every product, and operational
-// telemetry off, recorded so that a later upgrade knows it was decided.
+// leave it open: the detected platform, TrustGate and TrustGuard (dataPlane
+// is opt-in), and operational telemetry off, recorded so that a later upgrade
+// knows it was decided.
 func installDefaults(platform string) values.Inputs {
 	off := false
-	return values.Inputs{Platform: platform, Products: values.Products, OperationalTelemetry: &off}
+	return values.Inputs{Platform: platform, Products: values.DefaultProducts, OperationalTelemetry: &off}
 }
 
 // reuse layers an upgrade's values over the release's own, as Helm does with
@@ -307,6 +308,14 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 			vals = values.Merge(orEmpty(vals), keep)
 			renderVals = reuse(current.Config, vals)
 			notes = append(notes, fmt.Sprintf("Chart %s defaults TrustGuard to the NeuralTrust-hosted firewall; this release keeps running the firewall in the cluster (global.firewall.deploy: true). To move to the hosted one, set trustguard.firewall.jwtExistingSecret.name to a Secret holding its FIREWALL_JWT, with global.firewall.deploy: false, in -f.", ch.Version))
+		}
+		// From chart 4.6.0 data-plane-api is opt-in in every mode. An external
+		// or saas release that never set global.products.dataPlane runs it
+		// today, and keeps it.
+		if keep := values.KeepDataPlane(current.Chart.Metadata.Version, ch.Version, renderVals); keep != nil {
+			vals = values.Merge(orEmpty(vals), keep)
+			renderVals = reuse(current.Config, vals)
+			notes = append(notes, fmt.Sprintf("Chart %s deploys data-plane-api (TrustTest red teaming) only with global.products.dataPlane: true; this release keeps running it (global.products.dataPlane: true). To remove it, run `ntctl upgrade --remove-products dataPlane`.", ch.Version))
 		}
 	}
 	if mode == preflight.ForInstall && values.NeedsFirewallChoice(ch.Version, renderVals) {
