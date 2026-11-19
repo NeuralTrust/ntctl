@@ -31,6 +31,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
 	"github.com/NeuralTrust/ntctl/internal/generator"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
+	"github.com/NeuralTrust/ntctl/internal/openshift"
 	"github.com/NeuralTrust/ntctl/internal/preflight"
 	"github.com/NeuralTrust/ntctl/internal/redact"
 	"github.com/NeuralTrust/ntctl/internal/secrets"
@@ -79,6 +80,7 @@ func Run(ctx context.Context, in Input) ([]preflight.Result, error) {
 	}
 	current, stale := currentRevision(ctx, in, pods.Items)
 	out = append(out, podFindings(ctx, in, current, stale)...)
+	out = append(out, admissionFindings(ctx, in)...)
 	more, err := resourceFindings(ctx, in)
 	if err != nil {
 		return nil, err
@@ -303,7 +305,8 @@ func releaseCheck(in Input) preflight.Result {
 	case rcommon.StatusPendingInstall:
 		r.Severity = preflight.Fail
 		r.Message += " (an install was interrupted, or is still running)"
-		r.Fix = "If no install is running, remove the release with `ntctl uninstall --namespace " + in.Namespace + "`, then install again."
+		r.Fix = "An install still running continues on its own once the cause in the findings below is fixed (a pre-install hook refused by admission, an image that does not pull). " +
+			"If no install is running, fix that cause, then remove the release with `ntctl uninstall --namespace " + in.Namespace + "` and install again."
 	case rcommon.StatusPendingUpgrade, rcommon.StatusPendingRollback:
 		r.Severity = preflight.Fail
 		r.Message += " (a change was interrupted, or is still running)"
@@ -315,8 +318,9 @@ func releaseCheck(in Input) preflight.Result {
 	return r
 }
 
-// deployedChecks runs the preflight checks against the deployed manifest, so
-// a Secret or storage class that went missing after the install shows up.
+// deployedChecks runs the preflight checks against the deployed manifest and
+// its hooks, so a Secret or storage class that went missing after the install
+// shows up.
 func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 	objs, err := manifest.Parse(in.Current.Manifest)
 	if err != nil {
@@ -330,6 +334,9 @@ func deployedChecks(ctx context.Context, in Input) ([]preflight.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Hooks count: the Secrets the secrets generator writes are known from
+	// its hook's Role, so they are not taken for ones the operator creates.
+	objs = append(objs, hooks(in.Current)...)
 	rs, err := preflight.Run(ctx, preflight.Input{
 		Mode: preflight.ForUpgrade, Release: in.Release, Namespace: in.Namespace, ReleaseExists: true,
 		Cluster: in.Cluster, Needs: manifest.Analyse(objs), Platform: platform, NamespaceLabels: nsLabels,
@@ -607,6 +614,25 @@ func resourceFindings(ctx context.Context, in Input) ([]preflight.Result, error)
 				Message: fmt.Sprintf("%d of %d HTTPRoutes are not accepted by their Gateway: %s", len(names), len(routes), strings.Join(names, ", ")),
 				Detail:  detail,
 				Fix:     "The Gateway controller's reason is shown above. Check the parent Gateway exists, its listener admits this namespace, and the backend Services exist.",
+			})
+		}
+		ocp, err := openshift.ListRoutes(ctx, in.Dynamic, in.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		detail, names = nil, nil
+		for _, r := range ocp {
+			if !r.Admitted {
+				names = append(names, r.Name)
+				detail = append(detail, r.Name+" ("+r.Host+"): "+r.Reason)
+			}
+		}
+		if len(names) > 0 {
+			out = append(out, preflight.Result{
+				Code: "NT-DR-026", Check: "ingress", Severity: preflight.Warn,
+				Message: fmt.Sprintf("%d of %d OpenShift Routes are not admitted by a router: %s", len(names), len(ocp), strings.Join(names, ", ")),
+				Detail:  detail,
+				Fix:     "The router's reason is shown above. HostAlreadyClaimed means another Route, often in another namespace, owns the host: pick another --domain or remove that Route. A Route no router reported on needs a router whose namespace and route selectors admit this namespace.",
 			})
 		}
 	}

@@ -15,10 +15,15 @@ import (
 func TestUninstallFindsWhatItKeeps(t *testing.T) {
 	ctx := context.Background()
 	obj := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Name: name, Namespace: "nt"} }
+	ntctls := func(name string) metav1.ObjectMeta {
+		m := obj(name)
+		m.Labels = map[string]string{"app.kubernetes.io/managed-by": "ntctl"}
+		return m
+	}
 	cs := fake.NewClientset(
-		&corev1.Secret{ObjectMeta: obj("gcr-secret")},
-		&corev1.Secret{ObjectMeta: obj("agentgateway-config-sync")},
-		&corev1.Secret{ObjectMeta: obj("onprem-superadmin")},
+		&corev1.Secret{ObjectMeta: ntctls("gcr-secret")},
+		&corev1.Secret{ObjectMeta: ntctls("agentgateway-config-sync")},
+		&corev1.Secret{ObjectMeta: ntctls("onprem-superadmin")},
 		&corev1.Secret{ObjectMeta: obj("someone-elses")},
 		&corev1.PersistentVolumeClaim{ObjectMeta: obj("data-clickhouse-0")},
 	)
@@ -41,6 +46,24 @@ func TestUninstallFindsWhatItKeeps(t *testing.T) {
 	}
 	if left, _ := cs.CoreV1().Secrets("nt").List(ctx, metav1.ListOptions{}); len(left.Items) != 1 || left.Items[0].Name != "someone-elses" {
 		t.Errorf("left = %v; only the operator's own Secret should stay", left.Items)
+	}
+}
+
+// An operator who created the external PostgreSQL credentials (or the pull
+// Secret) themselves under ntctl's name keeps them on --delete-secrets.
+func TestUninstallKeepsTheOperatorsSameNamedSecrets(t *testing.T) {
+	ctx := context.Background()
+	cs := fake.NewClientset(
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "external-postgresql", Namespace: "nt"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "gcr-secret", Namespace: "nt",
+			Labels: map[string]string{"app.kubernetes.io/managed-by": "ntctl"}}},
+	)
+	own, err := ownSecrets(ctx, cs, "nt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(own, ","); got != "gcr-secret" {
+		t.Errorf("own Secrets = %q; an unlabelled external-postgresql is the operator's", got)
 	}
 }
 

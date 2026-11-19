@@ -130,3 +130,71 @@ func TestCollectControlPlaneServices(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenShiftWildcardAndRoutes(t *testing.T) {
+	const apps = "apps.cluster.example.com"
+	router := networkingv1.IngressStatus{LoadBalancer: networkingv1.IngressLoadBalancerStatus{
+		Ingress: []networkingv1.IngressLoadBalancerIngress{{Hostname: "router-default." + apps}}}}
+	cs := fake.NewSimpleClientset(
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "nt"},
+			Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{Host: "app." + apps}}}, Status: router},
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "custom", Namespace: "nt"},
+			Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{Host: "guard.example.com"}}}, Status: router},
+	)
+	dyn := gatewayapitest.Client(
+		gatewayapitest.OpenShiftRoute("nt", "app-x1", "app."+apps, "True", ""),
+		gatewayapitest.OpenShiftRoute("nt", "trustguard", "trustguard."+apps, "True", ""),
+		gatewayapitest.OpenShiftRoute("nt", "api", "api."+apps, "False", "HostAlreadyClaimed"),
+	)
+	st, err := Collect(context.Background(), cs, dyn, "nt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildcard := map[string]string{}
+	for _, r := range st.Records {
+		wildcard[r.Host] = r.Wildcard
+	}
+	if wildcard["app."+apps] != "*."+apps || wildcard["trustguard."+apps] != "*."+apps {
+		t.Errorf("hosts under the router's domain should be covered by its wildcard: %+v", st.Records)
+	}
+	if wildcard["guard.example.com"] != "" {
+		t.Errorf("a host outside the router's domain needs its own record: %+v", st.Records)
+	}
+	if len(st.Routes) != 3 {
+		t.Fatalf("routes = %+v", st.Routes)
+	}
+	var buf bytes.Buffer
+	st.Print(&buf)
+	out := buf.String()
+	for _, want := range []string{
+		"Covered by the cluster's *." + apps + " wildcard DNS; no records needed:", "trustguard." + apps,
+		"DNS records to create:", "guard.example.com", "NOT ADMITTED: HostAlreadyClaimed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "app."+apps+"                         CNAME") {
+		t.Errorf("a covered host is listed as a record to create:\n%s", out)
+	}
+}
+
+func TestNoDNSHeaderWhenEverythingIsCovered(t *testing.T) {
+	const apps = "apps.cluster.example.com"
+	cs := fake.NewSimpleClientset(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "nt"},
+		Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{Host: "app." + apps}}},
+		Status: networkingv1.IngressStatus{LoadBalancer: networkingv1.IngressLoadBalancerStatus{
+			Ingress: []networkingv1.IngressLoadBalancerIngress{{Hostname: "router-default." + apps}}}}})
+	st, err := Collect(context.Background(), cs, nil, "nt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.NeedsDNS() {
+		t.Error("a host under the router's wildcard needs no DNS")
+	}
+	var buf bytes.Buffer
+	st.PrintDNS(&buf)
+	if strings.Contains(buf.String(), "DNS records to create") {
+		t.Errorf("no record to create, yet the header is printed:\n%s", buf.String())
+	}
+}

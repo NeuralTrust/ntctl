@@ -19,6 +19,7 @@ import (
 	"github.com/NeuralTrust/ntctl/internal/helm"
 	"github.com/NeuralTrust/ntctl/internal/manifest"
 	"github.com/NeuralTrust/ntctl/internal/prompt"
+	"github.com/NeuralTrust/ntctl/internal/secrets"
 	"github.com/NeuralTrust/ntctl/internal/setup"
 )
 
@@ -149,16 +150,19 @@ func volumeClaims(ctx context.Context, cs kubernetes.Interface, ns string) ([]st
 	return out, nil
 }
 
-// ownSecrets lists the Secrets ntctl creates that exist in the namespace.
+// ownSecrets lists the Secrets ntctl created that exist in the namespace. A
+// Secret only counts when it carries ntctl's managed-by label: the operator
+// may have created one under the same name (the external PostgreSQL
+// credentials, the registry pull Secret), and that one is theirs to keep.
 func ownSecrets(ctx context.Context, cs kubernetes.Interface, ns string) ([]string, error) {
 	var out []string
 	for _, name := range setup.OwnSecrets() {
-		_, err := cs.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+		s, err := cs.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
 		case err != nil:
 			return nil, fmt.Errorf("reading Secret %s: %w", name, err)
-		default:
+		case secrets.CreatedByNtctl(s):
 			out = append(out, name)
 		}
 	}

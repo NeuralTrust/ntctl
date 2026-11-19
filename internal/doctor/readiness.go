@@ -16,15 +16,16 @@ const readinessFix = "The readiness probe's failures and the container's last er
 
 // Hopeless reports whether a finding is one that waiting does not fix: an
 // image that cannot be pulled, a Secret or ConfigMap that is missing, a
-// container that keeps crashing, or one that never becomes ready for a cause
-// doctor recognises (such as a token another control plane issued). Pods
+// container that keeps crashing, pods that admission refuses, or a container
+// that never becomes ready for a cause doctor recognises (such as a token
+// another control plane issued). Pods
 // that cannot be scheduled are not hopeless: an autoscaler may add nodes.
 func Hopeless(r preflight.Result) bool {
 	if r.Severity != preflight.Fail {
 		return false
 	}
 	switch r.Code {
-	case "NT-DR-010", "NT-DR-011", "NT-DR-012":
+	case "NT-DR-010", "NT-DR-011", "NT-DR-012", "NT-DR-016":
 		return true
 	case "NT-DR-015":
 		return r.Fix != readinessFix

@@ -95,8 +95,9 @@ type installFlags struct {
 	instances     map[api.Product]string
 	// stopEarly ends the wait on a lasting failure waiting does not fix.
 	stopEarly bool
-	// firewall is --firewall: in-cluster or hosted; "" asks, or takes
-	// in-cluster without a terminal unless NT_FIREWALL_JWT is set.
+	// firewall is --firewall: in-cluster or hosted; "" takes hosted when
+	// NT_FIREWALL_JWT or the trustguard-firewall Secret is there, else asks,
+	// or takes in-cluster with a warning without a terminal.
 	firewall string
 }
 
@@ -114,7 +115,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	fs.BoolVar(&f.yes, "yes", false, "ask nothing: take defaults and do not ask for confirmation")
 	fs.DurationVar(&f.timeout, "timeout", helm.DefaultTimeout, "how long to wait for the install to become ready")
 	fs.BoolVar(&f.stopEarly, "stop-early", true, "stop waiting once a failure that waiting does not fix (an image that cannot be pulled, a missing Secret, a crash loop, a refused config-sync token) has lasted "+watchGiveUp.String()+"; false waits the full --timeout")
-	fs.StringVar(&f.firewall, "firewall", "", "chart 4.x with TrustGuard: in-cluster runs the firewall here (global.firewall.deploy: true); hosted uses the NeuralTrust-hosted firewall with the FIREWALL_JWT in NT_FIREWALL_JWT (default: ask; without a terminal, hosted when NT_FIREWALL_JWT is set, else in-cluster)")
+	fs.StringVar(&f.firewall, "firewall", "", "chart 4.x with TrustGuard: in-cluster runs the firewall here (global.firewall.deploy: true); hosted uses the NeuralTrust-hosted firewall with the FIREWALL_JWT in NT_FIREWALL_JWT (default: hosted when NT_FIREWALL_JWT is set or the Secret trustguard-firewall exists, else ask; without a terminal, in-cluster with a warning)")
 	fs.StringVar(&f.org, "org", "", "signed in: organization ID (default: the selected one)")
 	fs.StringVar(&gate, "trustgate-instance", "", "signed in: ID or name of the private TrustGate to install (default: create one)")
 	fs.StringVar(&guard, "trustguard-instance", "", "signed in: ID or name of the private TrustGuard to install (default: create one)")
@@ -193,7 +194,7 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
-	fwVals, fwSecret, err := firewallChoice(ctx, in, cs, ns, f, ch.Version, vals)
+	fwVals, fwSecret, err := firewallChoice(ctx, in, out, cs, ns, f, ch.Version, vals)
 	if err != nil {
 		return err
 	}
@@ -304,9 +305,11 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	w := waitWatch{cs: p.cs, cluster: p.cluster, ns: ns, release: o.release, out: out, every: watchEvery, giveUp: watchGiveUp, stopEarly: f.stopEarly}.start(ctx)
 	_, installErr := helm.Install(ctx, p.cfg, p.chart, p.values, o.release, ns, f.timeout, w.stop)
 	w.finish()
+	needDNS := true
 	if st, err := report.Collect(ctx, p.cs, p.dyn, ns); err == nil {
 		fmt.Fprintln(out)
 		st.Print(out)
+		needDNS = st.NeedsDNS()
 	}
 	if installErr != nil {
 		o.printFailures(ctx, out)
@@ -317,18 +320,23 @@ func runInstall(ctx context.Context, args []string, stdin io.Reader, out io.Writ
 	}
 	fmt.Fprintln(out)
 	consoles.finalize(ctx, out, sess, p.values)
-	fmt.Fprintln(out, installedMessage(p.values))
+	fmt.Fprintln(out, installedMessage(p.values, needDNS))
 	return nil
 }
 
 // installedMessage is the last line of a successful install: where the setup
-// continues, which depends on where the control plane runs.
-func installedMessage(vals map[string]any) string {
+// continues, which depends on where the control plane runs, after the DNS
+// records when some are needed.
+func installedMessage(vals map[string]any, needDNS bool) string {
+	first := "Installed. Create the DNS records above, then "
+	if !needDNS {
+		first = "Installed. "
+	}
 	if values.DeploymentMode(vals) == "hybrid" {
-		return "Installed. Create the DNS records above, then finish the setup in the NeuralTrust console."
+		return first + capitalizeIf(!needDNS, "finish the setup in the NeuralTrust console.")
 	}
 	domain, _ := values.Get(vals, "global", "domain").(string)
-	msg := fmt.Sprintf("Installed. Create the DNS records above, then sign in to this install's console at https://%s.", values.ConsoleHost(vals))
+	msg := first + capitalizeIf(!needDNS, fmt.Sprintf("sign in to this install's console at https://%s.", values.ConsoleHost(vals)))
 	if values.DeploymentMode(vals) == "saas" {
 		cp, _ := values.Get(vals, "global", "controlPlane", "domain").(string)
 		if cp == "" {
@@ -367,6 +375,15 @@ func (o *opts) sameMode(current map[string]any) error {
 		return fmt.Errorf("--mode %s differs from the release's mode, %s; a release cannot change where its control plane runs in place. Install the other mode as a separate release (--namespace)", o.mode, have)
 	}
 	return nil
+}
+
+// capitalizeIf upper-cases the first letter of s when cond holds, for a
+// sentence that may start a line.
+func capitalizeIf(cond bool, s string) string {
+	if !cond || s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // orEmpty returns m, or an empty map when m is nil, so it can be merged into.

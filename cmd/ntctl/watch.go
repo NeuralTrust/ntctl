@@ -57,6 +57,7 @@ func (w waitWatch) start(ctx context.Context) *watching {
 		t := time.NewTicker(w.every)
 		defer t.Stop()
 		since := map[string]time.Time{}
+		announced := map[string]bool{}
 		last := ""
 		for {
 			select {
@@ -76,6 +77,9 @@ func (w waitWatch) start(ctx context.Context) *watching {
 			found, err := doctor.Run(watchCtx, doctor.Input{Clientset: w.cs, Namespace: w.ns, Release: w.release, Cluster: w.cluster})
 			if err != nil {
 				continue
+			}
+			for _, r := range announce(found, announced) {
+				fmt.Fprintf(w.out, "  Problem: %s\n    Fix: %s\n", r.Message, r.Fix)
 			}
 			if lasting := hopelessFor(found, since, time.Now(), w.giveUp); len(lasting) > 0 {
 				wt.findings = lasting
@@ -124,6 +128,22 @@ func hopelessFor(found []preflight.Result, since map[string]time.Time, now time.
 		}
 	}
 	return lasting
+}
+
+// announce returns the admission refusals (NT-DR-016) not reported yet, and
+// records them in announced. A refused pod never exists, so the progress line
+// alone shows nothing but a wait; the cause is said as soon as it is seen,
+// while the operator can still fix it before the wait gives up.
+func announce(found []preflight.Result, announced map[string]bool) []preflight.Result {
+	var out []preflight.Result
+	for _, r := range found {
+		if r.Code != "NT-DR-016" || r.Severity != preflight.Fail || announced[r.Message] {
+			continue
+		}
+		announced[r.Message] = true
+		out = append(out, r)
+	}
+	return out
 }
 
 // progress is one line on what is ready and what is still awaited.

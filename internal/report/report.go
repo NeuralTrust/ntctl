@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
+	"github.com/NeuralTrust/ntctl/internal/openshift"
 	"github.com/NeuralTrust/ntctl/internal/values"
 )
 
@@ -38,6 +39,9 @@ type Record struct {
 	Host   string `json:"host"`
 	Type   string `json:"type"` // A or CNAME; empty while the address is pending
 	Target string `json:"target"`
+	// Wildcard is the *.<domain> DNS an OpenShift router already answers
+	// on for Host, when it does: no record needs creating.
+	Wildcard string `json:"coveredByWildcard,omitempty"`
 }
 
 // Status is the state of a namespace.
@@ -45,10 +49,13 @@ type Status struct {
 	Workloads []Workload `json:"workloads"`
 	Problems  []Problem  `json:"problems"`
 	Records   []Record   `json:"dns"`
+	// Routes are the namespace's OpenShift Routes, the router's own from
+	// Ingresses included.
+	Routes []openshift.Route `json:"routes,omitempty"`
 }
 
 // Collect reads workloads, pods, ingresses and, when dyn is not nil, the
-// HTTPRoutes in the namespace.
+// HTTPRoutes and OpenShift Routes in the namespace.
 func Collect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface, ns string) (*Status, error) {
 	s := &Status{}
 	deps, err := cs.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
@@ -113,12 +120,55 @@ func Collect(ctx context.Context, cs kubernetes.Interface, dyn dynamic.Interface
 		if err := s.routeRecords(ctx, dyn, ns, seen); err != nil {
 			return nil, err
 		}
+		if err := s.openshiftRoutes(ctx, dyn, ns, seen); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.serviceRecords(ctx, cs, ns, seen); err != nil {
 		return nil, err
 	}
+	for i := range s.Records {
+		if s.Records[i].Type == "CNAME" {
+			s.Records[i].Wildcard = openshift.Wildcard(s.Records[i].Host, s.Records[i].Target)
+		}
+	}
 	sort.Slice(s.Records, func(i, j int) bool { return s.Records[i].Host < s.Records[j].Host })
 	return s, nil
+}
+
+// openshiftRoutes keeps the namespace's OpenShift Routes and adds a record
+// for each host no Ingress already named, pointing at the router that
+// admitted it.
+func (s *Status) openshiftRoutes(ctx context.Context, dyn dynamic.Interface, ns string, seen map[string]bool) error {
+	routes, err := openshift.ListRoutes(ctx, dyn, ns)
+	if err != nil {
+		return err
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].Host < routes[j].Host })
+	s.Routes = routes
+	for _, r := range routes {
+		if r.Host == "" || seen[r.Host] {
+			continue
+		}
+		seen[r.Host] = true
+		rec := Record{Host: r.Host}
+		if r.Router != "" {
+			rec.Type, rec.Target = "CNAME", r.Router
+		}
+		s.Records = append(s.Records, rec)
+	}
+	return nil
+}
+
+// NeedsDNS reports whether any endpoint needs a DNS record created, or may
+// once its address is known.
+func (s *Status) NeedsDNS() bool {
+	for _, r := range s.Records {
+		if r.Wildcard == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // configSyncHost is the annotation the chart puts on a central control
@@ -235,17 +285,48 @@ func (s *Status) Print(w io.Writer) {
 			fmt.Fprintf(w, "  %-55s %s (restarts: %d)\n", p.Pod, p.Reason, p.Restarts)
 		}
 	}
+	if len(s.Routes) > 0 {
+		fmt.Fprintln(w, "\nOpenShift Routes:")
+		for _, r := range s.Routes {
+			state := "admitted"
+			if !r.Admitted {
+				state = "NOT ADMITTED: " + r.Reason
+			}
+			fmt.Fprintf(w, "  %-45s %s\n", r.Host, state)
+		}
+	}
 	s.PrintDNS(w)
 }
 
-// PrintDNS writes the DNS records to create.
+// PrintDNS writes the DNS records to create, and the hosts an OpenShift
+// router's wildcard DNS already covers.
 func (s *Status) PrintDNS(w io.Writer) {
-	if len(s.Records) == 0 {
+	covered := map[string][]string{}
+	var wildcards []string
+	for _, r := range s.Records {
+		if r.Wildcard == "" {
+			continue
+		}
+		if covered[r.Wildcard] == nil {
+			wildcards = append(wildcards, r.Wildcard)
+		}
+		covered[r.Wildcard] = append(covered[r.Wildcard], r.Host)
+	}
+	for _, wc := range wildcards {
+		fmt.Fprintf(w, "\nCovered by the cluster's %s wildcard DNS; no records needed:\n", wc)
+		for _, h := range covered[wc] {
+			fmt.Fprintf(w, "  %s\n", h)
+		}
+	}
+	if !s.NeedsDNS() {
 		return
 	}
 	fmt.Fprintln(w, "\nDNS records to create:")
 	pending := false
 	for _, r := range s.Records {
+		if r.Wildcard != "" {
+			continue
+		}
 		if r.Type == "" {
 			pending = true
 			fmt.Fprintf(w, "  %-45s (address pending)\n", r.Host)

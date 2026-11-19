@@ -378,12 +378,19 @@ func TestInstalledMessage(t *testing.T) {
 		"saas":     {"https://app.p.example.com", "export-controlplane-ca.sh", "global.controlPlane.domain: p.example.com"},
 	}
 	for m, wants := range cases {
-		got := installedMessage(mode(m))
-		for _, w := range wants {
+		got := installedMessage(mode(m), true)
+		for _, w := range append(wants, "Create the DNS records above") {
 			if !strings.Contains(got, w) {
 				t.Errorf("%s: message lacks %q:\n%s", m, w, got)
 			}
 		}
+	}
+	// Hosts under an OpenShift router's wildcard need no records.
+	if got := installedMessage(mode("external"), false); strings.Contains(got, "DNS") || !strings.HasPrefix(got, "Installed. Sign in to this install's console at https://app.p.example.com.") {
+		t.Errorf("no DNS needed: message = %q", got)
+	}
+	if got := installedMessage(mode("hybrid"), false); got != "Installed. Finish the setup in the NeuralTrust console." {
+		t.Errorf("hybrid, no DNS needed: message = %q", got)
 	}
 }
 
