@@ -63,6 +63,9 @@ type opts struct {
 	output       string
 	// telemetry is --operational-telemetry; unset leaves the choice open.
 	telemetry optionalBool
+	// dataPlane is --data-plane-api, global.products.dataPlane; unset leaves
+	// the choice open.
+	dataPlane optionalBool
 	// ignoreCapacity turns a capacity failure into a warning.
 	ignoreCapacity bool
 	// extra are values from interactive answers, layered like explicit flags.
@@ -93,11 +96,12 @@ func newFlags(name, summary string, out io.Writer, o *opts, withValues bool) *fl
 		fs.StringVar(&o.domain, "domain", "", "base domain for the endpoints, e.g. platform.example.com")
 		fs.StringVar(&o.controlPlane, "control-plane", "", "hybrid: the domain of the control plane the data plane dials (global.controlPlane.domain), when it is not NeuralTrust's for the region; tokens are valid only at the control plane whose console issued them")
 		fs.StringVar(&o.platform, "platform", "", "aws, gcp, azure, openshift or kubernetes (default: detected from the cluster)")
-		productsUsage := "hybrid: comma-separated products, " + strings.Join(values.Products, ",") + " (external and saas installs run every product)"
+		productsUsage := "hybrid: comma-separated products, " + strings.Join(values.Products, ",") + " (default " + strings.Join(values.DefaultProducts, ",") + "; external and saas installs run TrustGate and TrustGuard, see --data-plane-api)"
 		if name == "upgrade" {
 			productsUsage = "comma-separated products to turn on: " + strings.Join(values.Products, ",") + "; the others keep their state (see --remove-products)"
 		}
 		fs.StringVar(&o.products, "products", "", productsUsage)
+		fs.Var(&o.dataPlane, "data-plane-api", "true or false: deploy data-plane-api, the TrustTest red-teaming and evaluation API (global.products.dataPlane), in any mode; opt-in, and TrustTest may change or be removed in a future release (default: off on install; upgrade keeps the install's setting)")
 		fs.BoolVar(&o.ignoreCapacity, "ignore-capacity", false, "treat too little cluster capacity as a warning, for test clusters (pods that do not fit stay Pending)")
 		fs.StringVar(&o.gateway, "gateway", "", "expose the endpoints as Gateway API HTTPRoutes on this existing Gateway, <namespace>/<name>[:<listener>], instead of Ingresses")
 		fs.Var(&o.telemetry, "operational-telemetry", "true or false: TrustGate and TrustGuard export their own traces and metrics (request rate, errors, latency); in hybrid installs to NeuralTrust, to help support diagnose your gateway, otherwise to your in-cluster collector (default: off on install; upgrade keeps the install's setting)")
@@ -186,6 +190,9 @@ func (o *opts) effectiveValues(defaults values.Inputs) (map[string]any, error) {
 		return nil, fmt.Errorf("--control-plane takes a bare domain such as cp.example.com, not %q", o.controlPlane)
 	}
 	vals = values.Merge(vals, values.Generate(values.Inputs{Mode: mode, ControlPlane: cp, Domain: o.domain, Platform: o.platform, Products: products, Gateway: gateway, OperationalTelemetry: o.telemetry.v}))
+	if o.dataPlane.v != nil {
+		vals = values.Merge(vals, map[string]any{"global": map[string]any{"products": map[string]any{"dataPlane": *o.dataPlane.v}}})
+	}
 	if o.extra != nil {
 		vals = values.Merge(vals, copyMap(o.extra))
 	}
