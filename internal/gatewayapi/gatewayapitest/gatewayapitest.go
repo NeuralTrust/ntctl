@@ -3,26 +3,34 @@
 package gatewayapitest
 
 import (
+	"strings"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	"github.com/NeuralTrust/ntctl/internal/gatewayapi"
+	"github.com/NeuralTrust/ntctl/internal/openshift"
 )
 
 // Client serves the objects through a fake dynamic client. Objects are added
 // under their real resource: the fake's own guess pluralises Gateway as
-// "gatewaies".
+// "gatewaies". OpenShift Routes (kind Route) are served too, so code that
+// lists both on one client can be tested.
 func Client(objs ...*unstructured.Unstructured) *dynamicfake.FakeDynamicClient {
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
 		gatewayapi.GatewaysGVR:   "GatewayList",
 		gatewayapi.HTTPRoutesGVR: "HTTPRouteList",
+		openshift.RoutesGVR:      "RouteList",
 	})
 	for _, o := range objs {
 		gvr := gatewayapi.HTTPRoutesGVR
-		if o.GetKind() == "Gateway" {
+		switch o.GetKind() {
+		case "Gateway":
 			gvr = gatewayapi.GatewaysGVR
+		case "Route":
+			gvr = openshift.RoutesGVR
 		}
 		if err := dyn.Tracker().Create(gvr, o, o.GetNamespace()); err != nil {
 			panic(err)
@@ -96,4 +104,23 @@ func ParentStatus(parent map[string]any, condType, status, reason string) map[st
 			"type": condType, "status": status, "reason": reason, "message": reason + " message",
 		}},
 	}
+}
+
+// OpenShiftRoute is an OpenShift Route for host. admitted is the status of
+// its Admitted condition from the default router; "" leaves it unreported.
+func OpenShiftRoute(ns, name, host, admitted, reason string) *unstructured.Unstructured {
+	obj := map[string]any{
+		"apiVersion": "route.openshift.io/v1",
+		"kind":       "Route",
+		"metadata":   map[string]any{"namespace": ns, "name": name},
+		"spec":       map[string]any{"host": host},
+	}
+	if admitted != "" {
+		_, domain, _ := strings.Cut(host, ".")
+		obj["status"] = map[string]any{"ingress": []any{map[string]any{
+			"host": host, "routerName": "default", "routerCanonicalHostname": "router-default." + domain,
+			"conditions": []any{map[string]any{"type": "Admitted", "status": admitted, "reason": reason}},
+		}}}
+	}
+	return &unstructured.Unstructured{Object: obj}
 }

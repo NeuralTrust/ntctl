@@ -99,3 +99,15 @@ func TestWatchStopsOnALastingCrashLoop(t *testing.T) {
 		t.Fatalf("findings without stopEarly: %v", found)
 	}
 }
+
+func TestAnnounceAdmissionRefusalsOnce(t *testing.T) {
+	refused := preflight.Result{Code: "NT-DR-016", Severity: preflight.Fail, Message: "job gen cannot create its pods"}
+	crash := preflight.Result{Code: "NT-DR-012", Severity: preflight.Fail, Message: "api keeps crashing"}
+	seen := map[string]bool{}
+	if got := announce([]preflight.Result{crash, refused}, seen); len(got) != 1 || got[0].Code != "NT-DR-016" {
+		t.Fatalf("first sight of a refusal should be announced, and only it: %v", got)
+	}
+	if got := announce([]preflight.Result{refused}, seen); len(got) != 0 {
+		t.Fatalf("a refusal is announced once: %v", got)
+	}
+}

@@ -259,12 +259,22 @@ func Namespace(ctx context.Context, cs kubernetes.Interface, ns string) (bool, e
 	return true, nil
 }
 
+// managedBy is the app.kubernetes.io/managed-by value of every Secret ntctl
+// creates.
+const managedBy = "ntctl"
+
 func meta(ns, name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:      name,
 		Namespace: ns,
-		Labels:    map[string]string{"app.kubernetes.io/managed-by": "ntctl"},
+		Labels:    map[string]string{"app.kubernetes.io/managed-by": managedBy},
 	}
+}
+
+// CreatedByNtctl reports whether ntctl created s, as opposed to a Secret the
+// operator made under a name ntctl also uses.
+func CreatedByNtctl(s *corev1.Secret) bool {
+	return s != nil && s.Labels["app.kubernetes.io/managed-by"] == managedBy
 }
 
 func sameData(a, b map[string][]byte) bool {

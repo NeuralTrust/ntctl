@@ -79,12 +79,17 @@ Then `ntctl install`:
 2. Shows the cluster and the choices it is about to apply, and asks for
    confirmation.
 3. Creates the Secrets, installs the chart, waits until every workload is
-   ready, and prints the DNS records to create. While it waits it says what is
-   ready and what it still waits for. A failure that waiting does not fix (an
-   image that cannot be pulled, a missing Secret, a crash loop, a config-sync
-   token another control plane issued) stops the wait once it has lasted four
-   minutes, instead of running to the timeout; `--stop-early=false` waits the
-   full `--timeout`. When an install or upgrade does not become ready, what
+   ready, and prints the DNS records to create. On OpenShift, hosts under the
+   cluster's ingress domain are listed as covered by its wildcard DNS instead,
+   and the Routes are shown with whether the router admitted them. While it
+   waits it says what is ready and what it still waits for. Pods that admission
+   refuses (an OpenShift SecurityContextConstraint, or the namespace's Pod
+   Security level) are reported as soon as they are seen, with the fix. A
+   failure that waiting does not fix (an image that cannot be pulled, a missing
+   Secret, a crash loop, pods admission refuses, a config-sync token another
+   control plane issued) stops the wait once it has lasted four minutes,
+   instead of running to the timeout; `--stop-early=false` waits the full
+   `--timeout`. When an install or upgrade does not become ready, what
    `ntctl doctor` finds wrong is printed with it.
 4. Writes the values it used to `neuraltrust-values.yaml`. The file holds no
    credentials. Pass it to `helm` or your GitOps tool if you move away from
@@ -161,11 +166,16 @@ From chart 4.0.0, TrustGuard uses the NeuralTrust-hosted firewall unless the
 values say otherwise, and the hosted firewall needs this install's
 `FIREWALL_JWT`. When TrustGuard is installed and the values leave the firewall
 open, install asks whether to run it in this cluster (the default) or use the
-hosted one. Hosted takes the JWT from `NT_FIREWALL_JWT` or asks for it with
-input hidden, and stores it in the Secret `trustguard-firewall`
-(`FIREWALL_JWT`). With `--yes`, `NT_FIREWALL_JWT` picks the hosted firewall;
-without it the firewall runs in the cluster. Charts before 4.0.0 always run it
-in the cluster.
+hosted one. Hosted takes the JWT from `NT_FIREWALL_JWT`, from a
+`trustguard-firewall` Secret already in the namespace (key `FIREWALL_JWT`), or
+asks for it with input hidden, and stores a new one in that Secret. Either
+`NT_FIREWALL_JWT` or the existing Secret picks the hosted firewall without
+asking. Every JWT is checked before anything changes: a truncated or wrong
+paste is refused with the reason, and the token is never printed. With `--yes`
+and neither, the firewall runs in the cluster and install prints a warning;
+pass `--firewall in-cluster` to choose that explicitly. `ntctl preflight`
+settles the firewall the same way and takes the same `--firewall`. Charts
+before 4.0.0 always run it in the cluster.
 
 The PostgreSQL and Redis questions apply to hybrid installs, which share one
 database user and one Redis. In external mode every service has its own
@@ -295,7 +305,7 @@ one. The mode of an install cannot change in place.
 | `ntctl status` | Workload readiness, pods that need attention, and DNS records |
 | `ntctl doctor` | Says what is wrong with an install and how to fix it (`--output json`) |
 | `ntctl support-bundle` | Writes a redacted `.tar.gz` for NeuralTrust support |
-| `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`) |
+| `ntctl preflight` | Runs the install or upgrade checks without changing anything (`--for upgrade`, `--output json`, `--firewall`) |
 | `ntctl render` | Prints the manifests an install would apply, as `helm template` does; `--output-dir` also writes the values. Apply them with a tool that runs Helm hooks, or the secrets generator does not run |
 | `ntctl secrets create` / `print` | Creates, or prints with their values, the Secrets the chart's secrets generator would make: for GitOps tools that skip hooks, and vaults (see [Generated credentials](#generated-credentials)) |
 | `ntctl version` | The `ntctl` version, the latest chart version, and whether a newer `ntctl` is out |
@@ -518,12 +528,14 @@ and a fix for each finding:
 | `NT-DR-013` | Pods cannot be scheduled, with the scheduler's reason |
 | `NT-DR-014` | A container was killed for exceeding its memory limit |
 | `NT-DR-015` | A container runs but never becomes ready; the probe's failures and the container's last errors are shown, with a fix for causes it recognises (a config-sync token from another control plane, refused database credentials, an untrusted certificate) |
+| `NT-DR-016` | A Job, ReplicaSet, StatefulSet or DaemonSet cannot create its pods because admission refuses them: an OpenShift SecurityContextConstraint (with the service account and the `oc adm policy` command that unblocks it) or the namespace's Pod Security level |
 | `NT-DR-020` | A volume is not bound |
 | `NT-DR-021` | A Job failed, such as a database bootstrap hook; its last log lines are shown |
 | `NT-DR-022` | Ingresses have no address yet |
 | `NT-DR-023` | HTTPRoutes are not accepted by their Gateway, with the controller's reason |
 | `NT-DR-024` | Information: Secrets earlier chart versions left that nothing reads any more, with the command that deletes them. Upgrades keep them on purpose; deleting them is optional |
 | `NT-DR-025` | `platform-secrets` is rendered by the chart and applied by Argo CD (or another tool that renders without reading the cluster), so every hard refresh generates new signing and encryption keys. It gives the fix for the install's shape and points at the recovery steps |
+| `NT-DR-026` | OpenShift Routes are not admitted by a router, with the router's reason |
 | `NT-PF-*` | The preflight checks, against what is deployed. `NT-PF-009` warns about LoadBalancer Services that get a public address on AWS, Azure or GCP, and `NT-PF-011` about a console admin password set in the values, which Helm keeps in the release history |
 
 If you need help, send NeuralTrust support a bundle:

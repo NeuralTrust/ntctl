@@ -94,10 +94,11 @@ func runRender(ctx context.Context, args []string, out io.Writer) error {
 
 func runPreflight(ctx context.Context, args []string, out io.Writer) error {
 	var o opts
-	var mode string
+	var mode, fw string
 	fs := newFlags("preflight", "Check a cluster against what an install or upgrade needs. Changes nothing.", out, &o, true)
 	fs.StringVar(&mode, "for", "install", "install or upgrade")
 	fs.StringVar(&o.output, "output", "text", "text or json")
+	fs.StringVar(&fw, "firewall", "", "chart 4.x with TrustGuard, as for install: in-cluster or hosted (default: hosted when NT_FIREWALL_JWT is set or the Secret "+values.FirewallJWTSecret+" exists)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -105,7 +106,17 @@ func runPreflight(ctx context.Context, args []string, out io.Writer) error {
 	if m != preflight.ForInstall && m != preflight.ForUpgrade {
 		return fmt.Errorf("--for must be install or upgrade")
 	}
-	p, err := o.prepare(ctx, m, nil)
+	if fw != "" && fw != firewallInCluster && fw != firewallHosted {
+		return fmt.Errorf("--firewall must be %s or %s, not %q", firewallInCluster, firewallHosted, fw)
+	}
+	var willCreate map[string][]string
+	if m == preflight.ForInstall {
+		var err error
+		if willCreate, err = o.preflightFirewall(ctx, fw); err != nil {
+			return err
+		}
+	}
+	p, err := o.prepare(ctx, m, willCreate)
 	if err != nil {
 		return err
 	}
@@ -116,6 +127,43 @@ func runPreflight(ctx context.Context, args []string, out io.Writer) error {
 		return errPreflight
 	}
 	return nil
+}
+
+// preflightFirewall settles TrustGuard's firewall for an install preflight the
+// way install does without a terminal, so that NT_FIREWALL_JWT, an existing
+// trustguard-firewall Secret or --firewall count. It returns the Secrets the
+// install would create, the firewall's included, or nil to let prepare work
+// them out; an install the firewall leaves open fails in prepare with how to
+// settle it.
+func (o *opts) preflightFirewall(ctx context.Context, choice string) (map[string][]string, error) {
+	ch, err := o.loadChart()
+	if err != nil {
+		return nil, err
+	}
+	vals, err := o.effectiveValues(installDefaults(""))
+	if err != nil {
+		return nil, err
+	}
+	if !values.NeedsFirewallChoice(ch.Version, vals) {
+		return nil, nil
+	}
+	cs, _, err := o.clients()
+	if err != nil {
+		return nil, err
+	}
+	fw, err := settleFirewall(ctx, cs, o.kube.Namespace, choice, os.Getenv("NT_FIREWALL_JWT"), false)
+	if err != nil || !fw.settled {
+		return nil, err
+	}
+	o.extra = values.Merge(orEmpty(o.extra), fw.vals)
+	if vals, err = o.effectiveValues(installDefaults("")); err != nil {
+		return nil, err
+	}
+	willCreate := managedSecrets(vals)
+	if fw.secret != nil {
+		willCreate[values.FirewallJWTSecret] = []string{values.FirewallJWTKey}
+	}
+	return willCreate, nil
 }
 
 func runStatus(ctx context.Context, args []string, out io.Writer) error {
@@ -262,7 +310,7 @@ func (o *opts) prepare(ctx context.Context, mode preflight.Mode, willCreate map[
 		}
 	}
 	if mode == preflight.ForInstall && values.NeedsFirewallChoice(ch.Version, renderVals) {
-		return nil, fmt.Errorf("chart %s sends TrustGuard to the NeuralTrust-hosted firewall, which needs this install's FIREWALL_JWT: set NT_FIREWALL_JWT (ntctl stores it in the Secret %s), or run the firewall in this cluster with --firewall in-cluster (global.firewall.deploy: true)", ch.Version, values.FirewallJWTSecret)
+		return nil, fmt.Errorf("chart %s sends TrustGuard to the NeuralTrust-hosted firewall, which needs this install's FIREWALL_JWT: set NT_FIREWALL_JWT (ntctl stores it in the Secret %s), or create that Secret with the key %s yourself, or run the firewall in this cluster with --firewall in-cluster (global.firewall.deploy: true)", ch.Version, values.FirewallJWTSecret, values.FirewallJWTKey)
 	}
 	if willCreate == nil && mode == preflight.ForInstall {
 		willCreate = managedSecrets(renderVals)
